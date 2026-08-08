@@ -1,7 +1,7 @@
 """common/dbfactory.py —— 存储后端开关。
 
-    DB_BACKEND=sqlite  （默认，未设置时也是它）-> common.database.Database
-    DB_BACKEND=postgres                        -> common.pgdb.Database
+    DB_BACKEND=postgres（默认，未设置时也是它）-> common.pgdb.Database
+    DB_BACKEND=sqlite                          -> common.database.Database
 
 用法：
 
@@ -9,11 +9,18 @@
     db = create_database()
     await db.connect()
 
+**迁移已完成，PostgreSQL 是正式后端。** 默认值因此从 sqlite 改成了 postgres：
+不配 ``DB_BACKEND`` 的部署应该落在正式后端上，而不是悄悄退回一个已经退场的
+存储实现——那种"默认值和事实不一致"正是最难查的一类事故。
+
+SQLite 那条路径**暂时保留**作为回滚兜底（切换刚完成，先别把退路拆了），
+但它不再是默认、也不再是新部署的选项。等生产稳定后整条删除，届时
+``common/database.py``、本文件的分支、以及 ``tests/pgdb`` 里那批拿 SQLite
+当参照实现的等价性用例会一起退役。
+
 设计约束：
-* **未设置或设为 sqlite 时，行为与移植前逐字节相同**：走的是同一个
-  ``common.database.Database`` 类、同一个构造调用，连 import 都不会碰 asyncpg。
-* pgdb 是**惰性** import 的。只有真的选了 postgres 才会加载 asyncpg，
-  所以 SQLite 部署不需要装 asyncpg。
+* pgdb 是**惰性** import 的；同样，选 postgres 时不会 import
+  ``common.database``，反之亦然。哪条路径都不用为另一条付出 import 代价。
 * 两个后端共享的纯 Python 符号（LOCK_STATS / ASIN_DATA_FIELDS / 比较器等）
   真源在 ``common/core/``——两边都从那里再导出，分叉一份副本就等于制造两个
   真源。见 common/core/__init__.py 与 common/pgdb/_shared.py 的说明。
@@ -36,7 +43,7 @@ _ALIASES = {
 
 def get_backend() -> str:
     """当前后端名（每次读环境变量，测试可以随时改）。"""
-    raw = (os.environ.get("DB_BACKEND") or SQLITE).strip().lower()
+    raw = (os.environ.get("DB_BACKEND") or POSTGRES).strip().lower()
     try:
         return _ALIASES[raw]
     except KeyError:

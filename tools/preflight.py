@@ -38,11 +38,11 @@ def check_python():
 
 def check_imports():
     need = {
-        "asyncpg": "PG 驱动，DB_BACKEND=postgres 必需",
+        "asyncpg": "PG 驱动 —— 正式后端，必需",
         "fastapi": "服务端",
         "uvicorn": "服务端",
         "openpyxl": "导出",
-        "aiosqlite": "SQLite 后端（迁移期两个后端都要能起）",
+        "aiosqlite": "SQLite 回滚兜底路径（DB_BACKEND=sqlite）",
     }
     prod_parser = {
         "selectolax": "**生产解析引擎**。不装它 worker 会走 lxml 回退路径，"
@@ -68,7 +68,9 @@ def check_imports():
 def check_env():
     for var, why, hard in (
         ("PG_DSN", "PostgreSQL 连接串", True),
-        ("DB_BACKEND", "切到 postgres 才走新存储层", True),
+        # DB_BACKEND 不设 = postgres（正式后端），所以「未设置」是正常的，
+        # 不该报硬失败。只有显式设成别的值才值得提醒（见下面那条）。
+        ("DB_BACKEND", "不设即 postgres（正式后端）", False),
         ("EXPORT_TOKEN", "增量导出鉴权。**不配就是无鉴权对公网开放**", False),
         ("SCRAPER_INSTANCE_ID", "实例标识。不配则两个克隆部署无法区分", False),
     ):
@@ -81,9 +83,13 @@ def check_env():
         else:
             warn(f"env {var}", f"未设置 —— {why}")
 
-    if os.environ.get("DB_BACKEND", "").strip() not in ("postgres", ""):
+    _backend = os.environ.get("DB_BACKEND", "").strip()
+    if _backend == "sqlite":
         warn("env DB_BACKEND",
-             f"值是 {os.environ['DB_BACKEND']!r}，切换后应为 'postgres'")
+             "显式设成了 'sqlite' —— 那是回滚兜底路径，不是正式后端。"
+             "新部署请留空或设 'postgres'。")
+    elif _backend not in ("postgres", ""):
+        fail("env DB_BACKEND", f"值是 {_backend!r}，只认 'postgres' / 'sqlite'")
 
 
 def check_disk():

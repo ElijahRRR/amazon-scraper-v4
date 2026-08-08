@@ -4,8 +4,15 @@ uvicorn[standard]>=0.24.0
 jinja2>=3.1.2
 python-multipart>=0.0.6
 aiofiles>=23.2.1
-aiosqlite>=0.19.0
 openpyxl>=3.1.2
+
+# 存储后端：PostgreSQL 是正式后端（DB_BACKEND 不配时就是它），
+# 所以 asyncpg 属于**生产**依赖，不能只留在 requirements-dev.txt 里
+# —— 那样按 README 走 `pip install -r requirements.txt` 的部署会起不来。
+asyncpg>=0.29.0
+# aiosqlite 只服务 DB_BACKEND=sqlite 这条回滚兜底路径。等 SQLite 整条删除时
+# 它一起走。
+aiosqlite>=0.19.0
 
 # Worker
 curl_cffi>=0.7.0

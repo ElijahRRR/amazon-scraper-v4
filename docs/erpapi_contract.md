@@ -173,7 +173,7 @@ status.status == "completed"
 - **路径、HTTP 方法、成功响应的字段名与类型**：不许改。
 - **参数的边界值**（`limit` 的 `le=` / `ge=`）：它们会渲染进 `/openapi.json`
   的 `maximum` / `minimum`，而 `/openapi.json` 是黄金基线**逐字节钉死**的一步
-  （`tests/golden/samples/sqlite_baseline.json` 的 `openapi_schema`）。
+  （`tests/golden/samples/baseline.json` 的 `openapi_schema`）。
   所以**改一个 `le=` 就是改契约**，不是改实现细节 ——
   这一条明确写在 `server/api/results.py:42-48`。
 - **错误码**：`error` 字段的字面量值不许改（§1.3 的封闭集）。

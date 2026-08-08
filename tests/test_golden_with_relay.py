@@ -25,7 +25,7 @@ from common.dbfactory import is_postgres
 
 def _load_baseline():
     path = os.path.join(os.path.dirname(__file__), "golden", "samples",
-                        "sqlite_baseline.json")
+                        "baseline.json")
     with open(path, encoding="utf-8") as fh:
         return json.load(fh)["steps"]
 

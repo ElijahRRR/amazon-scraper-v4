@@ -25,12 +25,15 @@ PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(PROJECT_DIR, "data", "scraper.db")
 
 # ============================================================
-# 存储后端（PG 迁移 Phase 1）
+# 存储后端
 # ============================================================
-# "sqlite"（默认，未设置时也是它）-> common.database.Database
-# "postgres"                      -> common.pgdb.Database
-# 选择逻辑在 common/dbfactory.py。未设置时 SQLite 路径逐字节不变。
-DB_BACKEND = os.environ.get("DB_BACKEND", "sqlite").strip().lower()
+# "postgres"（默认，未设置时也是它）-> common.pgdb.Database
+# "sqlite"                          -> common.database.Database
+#
+# 迁移已完成，PostgreSQL 是**正式后端**，所以未设置时走它。
+# SQLite 那条路径暂时保留作为回滚兜底，但不再是默认，也不再是新部署的选项。
+# 选择逻辑在 common/dbfactory.py。
+DB_BACKEND = os.environ.get("DB_BACKEND", "postgres").strip().lower()
 
 # PostgreSQL 连接串。仅在 DB_BACKEND=postgres 时使用。
 PG_DSN = os.environ.get("PG_DSN", "postgresql://scraper:scraper@127.0.0.1/scraper_dev")
