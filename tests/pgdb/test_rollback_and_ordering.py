@@ -2,8 +2,6 @@
 
 黄金夹具**结构性**看不到这一整组问题：
   * 64 步场景里没有任何一步让事务中途失败，所以"块里少一个 ROLLBACK"永远不发作；
-  * ``errors_batch_a`` 那一步的 ``error_summary`` / ``failed_tasks`` 都是空数组，
-    并列排序无从体现；
   * ``get_pending_screenshots`` 和 ``create_batch(None)`` 一步都没覆盖。
 
 所以这些不变式只能靠本文件守。
@@ -14,9 +12,11 @@
       BEGIN 都撞"嵌套 BEGIN"，**整条写路径永久焊死**，而读还是 200，
       健康检查全绿。SQLite 侧同样会 wedge（cannot start a transaction within a
       transaction），只是那些语句在 SQLite 下基本不会失败。
-  D4  ``/api/batches/{name}/errors`` 的 ``ORDER BY updated_at DESC LIMIT 200``
-      没有 tiebreaker，而 updated_at 是秒级精度、accept_results_batch 又给整次
-      提交盖同一个时间戳：260 个任务一起失败时，返回的**行集合**两个后端差 60 行。
+  D4  ``get_batch_failures``（`/api/batches/{batch_id}/failures` 背后那个函数，
+      旧接口 `/api/batches/{batch_name}/errors` 已删除）的
+      ``ORDER BY updated_at DESC LIMIT 200`` 没有 tiebreaker 的话，而
+      updated_at 是秒级精度、accept_results_batch 又给整次提交盖同一个时间戳：
+      260 个任务一起失败时，返回的**行集合**两个后端差 60 行。
   D5  ``get_pending_screenshots`` 是 LIMIT 没有 ORDER BY：20 行里 churn 掉 8 行、
       limit=5 → sqlite [S001..S005] / pg [S009..S013]。
   D6  ``create_batch(None)``：sqlite 返回 0（INSERT OR IGNORE 吞掉 NOT NULL），
@@ -140,12 +140,17 @@ async def test_release_tasks_rolls_back_on_cancellation(pgdb):
 # --------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_batch_errors_order_is_a_total_order(pgdb):
-    """server/app.py:1385 的那条 SQL（逐字），LIMIT 必须落在确定的 200 行上。
+async def test_batch_failures_order_is_a_total_order(pgdb):
+    """``get_batch_failures``（`/api/batches/{batch_id}/failures` 背后那个函数）的
+    ``ORDER BY updated_at DESC NULLS LAST, id DESC`` 必须落在确定的行集合上。
 
     updated_at 全部相同 → 只有 ``, id DESC`` 能把它变成全序。
+
+    历史：这条不变式原来在 ``/api/batches/{batch_name}/errors``（旧接口，已删除）
+    的一份重复内联 SQL 上单独测过一遍——那份 SQL 现在不存在了，直接测
+    ``get_batch_failures`` 本身。
     """
-    bid = await pgdb.create_batch("d4_errors")
+    bid = await pgdb.create_batch("d4_failures")
     n = 30
     await pgdb.create_tasks(bid, [f"B0TIE{i:05d}" for i in range(1, n + 1)])
     tasks = await pgdb.pull_tasks("W1", count=n)
@@ -159,59 +164,11 @@ async def test_batch_errors_order_is_a_total_order(pgdb):
     ])
     assert res["failed"] == n
 
-    sql = ("SELECT asin, error_type, error_detail, retry_count, worker_id, updated_at "
-           "FROM tasks WHERE batch_id=? AND status='failed' "
-           "ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT 200")
-    assert _app_has("ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT 200"), \
-        "server/app.py 的 /api/batches/{name}/errors 丢了 tiebreaker"
-    async with pgdb.read() as rc, rc.execute(sql, (bid,)) as c:
-        rows = [r["asin"] for r in await c.fetchall()]
+    failures = await pgdb.get_batch_failures(bid, limit=200)
+    rows = [r["asin"] for r in failures]
 
     # 一次提交盖同一个秒级时间戳 → 全部并列 → 顺序完全由 id DESC 决定
     assert rows == [f"B0TIE{i:05d}" for i in range(n, 0, -1)]
-
-    # 同样的数据换成没有 tiebreaker 的老写法：行集合不再有保证。
-    # 这里只断言"新写法与 get_batch_failures 一致"——后者本来就是 id DESC。
-    failures = await pgdb.get_batch_failures(bid, limit=200)
-    assert [r["asin"] for r in failures] == rows
-
-
-@pytest.mark.asyncio
-async def test_error_summary_tie_is_broken_by_error_type(pgdb):
-    """server/app.py:1378：cnt 并列时用 error_type 兜底，NULL 排最前（对齐 SQLite 的 ASC）。"""
-    bid = await pgdb.create_batch("d4_summary")
-    types = ["zeta", "alpha", None, "Mid", "beta"]
-    asins = [f"B0SUM{i:05d}" for i in range(len(types) * 2)]
-    await pgdb.create_tasks(bid, asins)
-    tasks = await pgdb.pull_tasks("W1", count=len(asins))
-    for i, t in enumerate(tasks):
-        await pgdb.accept_failed_result(t["id"], "W1", t["lease_epoch"],
-                                        error_type=types[i % len(types)],
-                                        error_detail="d")
-    async with pgdb._write_lock:
-        await pgdb._db.execute("BEGIN")
-        try:
-            await pgdb._db.execute(
-                "UPDATE tasks SET status='failed' WHERE batch_id=?", (bid,))
-            await pgdb._db.execute("COMMIT")
-        except BaseException:
-            try:
-                await pgdb._db.execute("ROLLBACK")
-            except BaseException:
-                pass
-            raise
-
-    sql = ("SELECT error_type, COUNT(*) as cnt FROM tasks "
-           "WHERE batch_id=? AND status='failed' "
-           "GROUP BY error_type ORDER BY cnt DESC, error_type NULLS FIRST")
-    assert _app_has("GROUP BY error_type ORDER BY cnt DESC, error_type NULLS FIRST"), \
-        "server/app.py 的 error_summary 丢了 tiebreaker"
-    async with pgdb.read() as rc, rc.execute(sql, (bid,)) as c:
-        got = [(r["error_type"], r["cnt"]) for r in await c.fetchall()]
-
-    # 全部 cnt 相同 → 顺序全由 error_type 决定：NULL 最前，其余按**字节序**
-    # （PG 侧靠 COLLATE "C"，'Mid' 的 'M'=0x4D 排在 'alpha' 的 'a'=0x61 前面）
-    assert got == [(None, 2), ("Mid", 2), ("alpha", 2), ("beta", 2), ("zeta", 2)]
 
 
 @pytest.mark.asyncio

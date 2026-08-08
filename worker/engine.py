@@ -25,6 +25,7 @@ import aiofiles
 import httpx
 
 from common import config
+from common.core import error_types
 from common.slowhash import SLOW_HASH_FIELDS
 from worker.proxy import get_proxy_manager
 from worker.session import AmazonSession
@@ -1310,7 +1311,7 @@ class Worker:
         zip_code = task.get("zip_code", self.zip_code)
         max_retries = self._max_retries
         resp_bytes = 0
-        last_error_type = "network"
+        last_error_type = error_types.NETWORK
         last_error_detail = ""
         attempt = 0
         zip_repost_tries = 0  # on_fetch 邮编未生效时的同 session 重发计数（冷轮换后清零）
@@ -1334,7 +1335,7 @@ class Worker:
                 target_zip = (zip_code or "").strip() or self.zip_code
                 if not await slot.ensure_zip(target_zip):
                     # 切换失败：跳过此任务，由 server 超时回收重试（其他协程/其他 session）
-                    last_error_type = "zip_switch_failed"
+                    last_error_type = error_types.ZIP_SWITCH_FAILED
                     last_error_detail = f"current={session.zip_code} target={target_zip}"
                     attempt = max_retries  # 直接放弃，避免本地卡死
                     break
@@ -1380,7 +1381,7 @@ class Worker:
                     self._controller.record_result(req_elapsed, False, True, resp_bytes)
                     attempt += 1
                     self._stats["blocked"] += 1
-                    last_error_type = "blocked"
+                    last_error_type = error_types.BLOCKED
                     last_error_detail = f"HTTP {resp.status_code}"
                     logger.warning(f"ASIN {asin} 被封 HTTP {resp.status_code} (尝试 {attempt}/{max_retries})")
                     await slot.rotate(reason="被封锁")
@@ -1458,7 +1459,7 @@ class Worker:
                     self._controller.record_result(req_elapsed, False, True, resp_bytes)
                     attempt += 1
                     self._stats["blocked"] += 1
-                    last_error_type = "captcha"
+                    last_error_type = error_types.CAPTCHA
                     last_error_detail = "validateCaptcha / Robot Check"
                     logger.warning(f"ASIN {asin} {title} (尝试 {attempt}/{max_retries})")
                     await slot.rotate(reason="页面拦截")
@@ -1468,7 +1469,7 @@ class Worker:
                     self._controller.record_result(req_elapsed, False, True, resp_bytes)
                     attempt += 1
                     self._stats["blocked"] += 1
-                    last_error_type = "blocked"
+                    last_error_type = error_types.BLOCKED
                     last_error_detail = "api-services-support@amazon.com"
                     logger.warning(f"ASIN {asin} {title} (尝试 {attempt}/{max_retries})")
                     await slot.rotate(reason="页面拦截")
@@ -1477,7 +1478,7 @@ class Worker:
                 if title in ["[页面为空]", "[HTML解析失败]"]:
                     self._controller.record_result(req_elapsed, False, False, resp_bytes)
                     attempt += 1
-                    last_error_type = "parse_error"
+                    last_error_type = error_types.PARSE_ERROR
                     last_error_detail = title
                     logger.warning(f"ASIN {asin} {title} (尝试 {attempt}/{max_retries})")
                     await slot.rotate_on_empty(asin, reason=title)
@@ -1487,7 +1488,7 @@ class Worker:
                 if not title or title == "N/A":
                     self._controller.record_result(req_elapsed, False, False, resp_bytes)
                     attempt += 1
-                    last_error_type = "parse_error"
+                    last_error_type = error_types.PARSE_ERROR
                     last_error_detail = "标题为空"
                     logger.warning(f"ASIN {asin} 标题为空 (尝试 {attempt}/{max_retries})")
                     await slot.rotate_on_empty(asin, reason="标题为空")
@@ -1508,7 +1509,7 @@ class Worker:
                 page_asin = result_data.get("_page_asin")
                 if page_asin and page_asin.upper() != asin.upper():
                     self._controller.record_result(req_elapsed, False, False, resp_bytes)
-                    last_error_type = "variant_offset"
+                    last_error_type = error_types.VARIANT_OFFSET
                     last_error_detail = f"page={page_asin} requested={asin}"
                     logger.warning(
                         f"⚠️ ASIN {asin} variant 偏移：页面实际是 {page_asin}（不轮换不重试，直接终态失败）"
@@ -1524,7 +1525,7 @@ class Worker:
                     if "[非USD]" in price or any(c in price for c in ["¥", "€", "£", "CNY"]) or ("$" not in price and price.replace(",","").replace(".","").strip().isdigit()):
                         self._controller.record_result(req_elapsed, False, True, resp_bytes)
                         attempt += 1
-                        last_error_type = "parse_error"
+                        last_error_type = error_types.PARSE_ERROR
                         last_error_detail = f"非美国价格: {price}"
                         logger.warning(f"ASIN {asin} 非美国价格 '{price}' (尝试 {attempt}/{max_retries})")
                         await slot.rotate(reason="非美国区域数据")
@@ -1541,7 +1542,7 @@ class Worker:
                 if _is_degraded:
                     self._controller.record_result(req_elapsed, False, False, resp_bytes)
                     attempt += 1
-                    last_error_type = "parse_error"
+                    last_error_type = error_types.PARSE_ERROR
                     last_error_detail = "解析不完整（核心字段全部缺失）"
                     logger.warning(f"ASIN {asin} 核心字段全部缺失，疑似降级页面 (尝试 {attempt}/{max_retries})")
                     await slot.rotate_on_empty(asin, reason="核心字段缺失")
@@ -1560,7 +1561,7 @@ class Worker:
                         self._zip_onfetch["mismatch"] += 1
                         self._controller.record_result(req_elapsed, False, False, resp_bytes)
                         attempt += 1
-                        last_error_type = "zip_not_effective"
+                        last_error_type = error_types.ZIP_NOT_EFFECTIVE
                         last_error_detail = f"商品页邮编未生效: target={target_zip}"
                         # 先在同一 session 上重发一次邮编 POST（代价远小于冷轮换）；
                         # 重发预算用尽或重发失败才回退到冷轮换换 IP（冷轮换后清零预算）。
@@ -1672,11 +1673,11 @@ class Worker:
                 attempt += 1
                 err_name = type(e).__name__
                 if "timeout" in err_name.lower() or "Timeout" in str(e):
-                    last_error_type = "timeout"
+                    last_error_type = error_types.TIMEOUT
                 elif "connect" in err_name.lower() or "ConnectionError" in err_name:
-                    last_error_type = "network"
+                    last_error_type = error_types.NETWORK
                 else:
-                    last_error_type = "network"
+                    last_error_type = error_types.NETWORK
                 last_error_detail = f"{err_name}: {str(e)[:200]}"
                 logger.error(f"ASIN {asin} 异常 (尝试 {attempt}/{max_retries}): {e}")
                 await asyncio.sleep(2)
@@ -1715,7 +1716,7 @@ class Worker:
         seen_asins = set()
         pages_scanned = 0
         truncated = False
-        last_error_type = "network"
+        last_error_type = error_types.NETWORK
         last_error_detail = ""
 
         page = 1
@@ -1726,7 +1727,7 @@ class Worker:
                 if not await slot.ensure_ready():
                     attempt += 1
                     if attempt >= max_retries:
-                        last_error_type = "session_not_ready"
+                        last_error_type = error_types.SESSION_NOT_READY
                         break
                     await asyncio.sleep(2)
                     continue
@@ -1751,7 +1752,7 @@ class Worker:
                     self._controller.record_result(req_elapsed, False, False, 0)
                     attempt += 1
                     if attempt >= max_retries:
-                        last_error_type = "timeout"
+                        last_error_type = error_types.TIMEOUT
                         last_error_detail = f"page={page} 多次超时"
                         break
                     await asyncio.sleep(2)
@@ -1764,7 +1765,7 @@ class Worker:
                     self._controller.record_result(req_elapsed, False, True, resp_bytes)
                     attempt += 1
                     self._stats["blocked"] += 1
-                    last_error_type = "blocked"
+                    last_error_type = error_types.BLOCKED
                     last_error_detail = f"page={page} HTTP {resp.status_code}"
                     await slot.rotate(reason="卖家列表被封")
                     if attempt >= max_retries:
@@ -1782,7 +1783,7 @@ class Worker:
                     self._controller.record_result(req_elapsed, False, True, resp_bytes)
                     attempt += 1
                     self._stats["blocked"] += 1
-                    last_error_type = "blocked"
+                    last_error_type = error_types.BLOCKED
                     last_error_detail = f"page={page} parse:{page_info}"
                     await slot.rotate(reason=f"列表页 {page_info}")
                     if attempt >= max_retries:
@@ -1816,7 +1817,7 @@ class Worker:
             except Exception as e:
                 attempt += 1
                 err_name = type(e).__name__
-                last_error_type = "timeout" if "timeout" in err_name.lower() else "network"
+                last_error_type = error_types.TIMEOUT if "timeout" in err_name.lower() else error_types.NETWORK
                 last_error_detail = f"page={page} {err_name}: {str(e)[:200]}"
                 logger.error(f"seller={seller_id} page={page} 异常 (尝试 {attempt}/{max_retries}): {e}")
                 if attempt >= max_retries:
@@ -1831,7 +1832,7 @@ class Worker:
             logger.error(f"seller={seller_id} 全部失败，标记失败 [{last_error_type}]")
             await self._submit_result(
                 task_id, None, success=False,
-                error_type=last_error_type or "discover_failed",
+                error_type=last_error_type or error_types.DISCOVER_FAILED,
                 error_detail=last_error_detail or "no page scanned",
                 batch_id=batch_id, lease_epoch=lease_epoch,
             )

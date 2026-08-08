@@ -54,6 +54,7 @@ from typing import Optional
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
 
 from common import config
+from common.core import error_types
 
 
 def _srv():
@@ -167,6 +168,7 @@ async def api_submit_result(request: Request):
     batch_id = data.pop("batch_id", None)
     worker_id = data.get("worker_id", "")
     lease_epoch = data.pop("lease_epoch", 0)
+    error_types.normalize_fields(data)
 
     if task_id:
         if data.get("success", True):
@@ -200,6 +202,7 @@ async def api_submit_batch(request: Request):
         worker_id = item.get("worker_id", "")
         lease_epoch = item.pop("lease_epoch", 0)
         is_success = item.pop("success", True)
+        error_types.normalize_fields(item)
         worker_id_set.add(worker_id)
         batch_items.append({
             "task_id": task_id,

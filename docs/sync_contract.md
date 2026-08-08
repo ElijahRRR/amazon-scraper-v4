@@ -1,6 +1,6 @@
 # catalog_sync 拉取契约 v1
 
-> 采集侧（amazon-scraper-v3）→ 沃尔玛侧（catalog_sync）的**唯一**数据出口。
+> 采集侧（amazon-scraper-v4）→ 沃尔玛侧（catalog_sync）的**唯一**数据出口。
 > 实现：`server/api/sync.py` + `common/pgdb/retention.py`。
 > 规格来源：`.agent/pg_migration_plan.md` §4 / §5 / §Phase 6。
 > 契约测试：`tests/pgdb/test_sync_api.py` 与 `tests/pgdb/test_retention.py`
@@ -291,7 +291,7 @@ X = r.next_after_seq
   "forced_prune_log": [],
   "db_size_bytes": 18273615872,
   "free_disk_bytes": 41203105792,
-  "free_disk_path": "/opt/amazon-scraper-v3",
+  "free_disk_path": "/opt/amazon-scraper-v4",
   "observed_daily_insert_rate": 103882,
   "partitions": [{"name": "scrape_events_p1", "lo": 20000000, "hi": 40000000}],
   "future_partitions": 2,

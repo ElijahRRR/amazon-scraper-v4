@@ -249,7 +249,7 @@ async def lifespan(app):
     logger.info("服务器关闭")
 
 
-app = FastAPI(title="Amazon Scraper v3", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="Amazon Scraper v4", version="4.0.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=config.STATIC_DIR), name="static")
 
 
@@ -740,7 +740,7 @@ async def _send_one_callback(client: httpx.AsyncClient, batch_id: int):
     headers = {
         "X-Scraper-Event-Id": event_id,
         "X-Scraper-Delivery-Attempt": str(attempts),
-        "User-Agent": "amazon-scraper-v3/callback",
+        "User-Agent": "amazon-scraper-v4/callback",
         "Content-Type": "application/json",
     }
 
@@ -1428,65 +1428,6 @@ async def api_delete_batches_bulk(request: Request):
     _remove_screenshot_files(screenshot_files)
     logger.info(f"批量删除批次: {len(batch_ids)} 个 (ids={batch_ids[:20]}{'...' if len(batch_ids) > 20 else ''})")
     return {"ok": True, "deleted": len(batch_ids)}
-
-
-# ⚠ 下面这个端点是**旧接口**，新接入方一律用 /api/batches/{batch_id}/failures。
-#
-# 指向 /failures 这件事只写进 docstring（= /openapi.json 的 description），
-# **没有**往响应体里加 deprecation 提示字段。理由是实测出来的，不是口味：
-#   * `errors_batch_a` 是黄金 78 步里的一步（body 录着
-#     {"error_summary": [], "failed_tasks": []}），加字段当场改基线，
-#     而这一步与本轮要改的撞名行为毫无关系；
-#   * 更要紧的是它是**线上格式变更**：今天在跑的调用方拿到一个没见过的键，
-#     严格反序列化的那种会直接崩。为了一句提示去冒这个险不划算。
-# docstring 走的是 /openapi.json（那**也**是黄金的一步），但它只动
-# description 字符串、不动任何响应形状，对在跑的调用方是零风险。
-# 「docstring 里必须指得出 /failures」由
-# tests/test_errors_endpoint_points_at_failures.py 钉住。
-@app.get("/api/batches/{batch_name}/errors")
-async def api_batch_errors(batch_name: str):
-    """获取批次错误详情（**旧接口，请改用 `/api/batches/{batch_id}/failures`**）。
-
-    本端点有两条硬限制，都是设计如此、调大参数也没用：
-
-    - `failed_tasks` **最多 200 条**，超出的部分直接看不见；
-    - 排序是 `updated_at DESC, id DESC` —— 一次批量提交里的失败任务共享同一个
-      秒级 `updated_at`，所以「最近 200 条」在同一批内部并不是一个有业务含义的切片。
-
-    需要**完整**失败明细请用 `GET /api/batches/{batch_id}/failures`：按 batch_id
-    取（不依赖批次名）、`limit` 上限 100000、不截断到 200 条，还支持
-    `error_type` 过滤。
-
-    保留本端点只是为了不打断已在使用它的调用方，不再接受新接入。
-    """
-    batch = await db.get_batch_by_name(batch_name)
-    if not batch:
-        raise HTTPException(404, f"批次不存在: {batch_name}")
-    batch_id = batch["id"]
-    async with db.read() as rc:
-        # cnt 并列时顺序原本不定 → 用 error_type 兜底成全序。
-        # NULLS FIRST 是 SQLite ASC 的默认行为（实测），PG 的 ASC 默认 NULLS LAST，
-        # 所以必须显式写；error_type 在两边都是二进制序（PG 侧 COLLATE "C"）。
-        async with rc.execute(
-            "SELECT error_type, COUNT(*) as cnt FROM tasks "
-            "WHERE batch_id=? AND status='failed' "
-            "GROUP BY error_type ORDER BY cnt DESC, error_type NULLS FIRST",
-            (batch_id,)
-        ) as c:
-            error_summary = [dict(r) for r in await c.fetchall()]
-        # 这一条原来是 ORDER BY updated_at DESC LIMIT 200，没有 tiebreaker。
-        # updated_at 是秒级精度，而 accept_results_batch 会把**整次提交**盖上同一个
-        # 时间戳：一批 260 个任务一起失败时，200 行的**行集合**在两个后端不一样
-        # （实测 60 行不同），同一个后端换一次表重组也可能变。补 id DESC 后与
-        # /api/batches/{id}/failures（get_batch_failures，本来就是这个写法）一致。
-        async with rc.execute(
-            "SELECT asin, error_type, error_detail, retry_count, worker_id, updated_at "
-            "FROM tasks WHERE batch_id=? AND status='failed' "
-            "ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT 200",
-            (batch_id,)
-        ) as c:
-            failed_tasks = [dict(r) for r in await c.fetchall()]
-    return {"error_summary": error_summary, "failed_tasks": failed_tasks}
 
 
 @app.get("/api/batches/{batch_id}/failures")

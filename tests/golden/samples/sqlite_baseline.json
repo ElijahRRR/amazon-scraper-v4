@@ -529,8 +529,8 @@
             }
           },
           "info": {
-            "title": "Amazon Scraper v3",
-            "version": "3.0.0"
+            "title": "Amazon Scraper v4",
+            "version": "4.0.0"
           },
           "openapi": "3.1.0",
           "paths": {
@@ -901,44 +901,6 @@
                   }
                 },
                 "summary": "Api Batch Callback Retry"
-              }
-            },
-            "/api/batches/{batch_name}/errors": {
-              "get": {
-                "description": "获取批次错误详情（**旧接口，请改用 `/api/batches/{batch_id}/failures`**）。\n\n本端点有两条硬限制，都是设计如此、调大参数也没用：\n\n- `failed_tasks` **最多 200 条**，超出的部分直接看不见；\n- 排序是 `updated_at DESC, id DESC` —— 一次批量提交里的失败任务共享同一个\n  秒级 `updated_at`，所以「最近 200 条」在同一批内部并不是一个有业务含义的切片。\n\n需要**完整**失败明细请用 `GET /api/batches/{batch_id}/failures`：按 batch_id\n取（不依赖批次名）、`limit` 上限 100000、不截断到 200 条，还支持\n`error_type` 过滤。\n\n保留本端点只是为了不打断已在使用它的调用方，不再接受新接入。",
-                "operationId": "api_batch_errors_api_batches__batch_name__errors_get",
-                "parameters": [
-                  {
-                    "in": "path",
-                    "name": "batch_name",
-                    "required": true,
-                    "schema": {
-                      "title": "Batch Name",
-                      "type": "string"
-                    }
-                  }
-                ],
-                "responses": {
-                  "200": {
-                    "content": {
-                      "application/json": {
-                        "schema": {}
-                      }
-                    },
-                    "description": "Successful Response"
-                  },
-                  "422": {
-                    "content": {
-                      "application/json": {
-                        "schema": {
-                          "$ref": "#/components/schemas/HTTPValidationError"
-                        }
-                      }
-                    },
-                    "description": "Validation Error"
-                  }
-                },
-                "summary": "Api Batch Errors"
               }
             },
             "/api/batches/{batch_name}/retry": {
@@ -2958,7 +2920,7 @@
         "json": {
           "batch_id": 3,
           "error_detail": "golden synthetic failure",
-          "error_type": "TIMEOUT",
+          "error_type": "timeout",
           "lease_epoch": 0,
           "success": false,
           "task_id": 5,
@@ -4614,18 +4576,19 @@
       }
     },
     {
-      "name": "errors_batch_a",
+      "name": "failures_batch_a",
       "request": {
         "data": null,
         "files": null,
         "json": null,
         "method": "GET",
         "params": null,
-        "path": "/api/batches/golden_batch_a/errors"
+        "path": "/api/batches/1/failures"
       },
       "response": {
         "body": {
-          "error_summary": [],
+          "batch_id": 1,
+          "count": 0,
           "failed_tasks": []
         },
         "content_type": "application/json",
@@ -5382,7 +5345,7 @@
           "__html__": {
             "has_jinja_error": false,
             "has_traceback": false,
-            "size_bucket": 31
+            "size_bucket": 32
           }
         },
         "content_type": "text/html",
