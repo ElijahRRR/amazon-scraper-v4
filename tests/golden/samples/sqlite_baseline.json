@@ -2958,7 +2958,7 @@
         "json": {
           "batch_id": 3,
           "error_detail": "golden synthetic failure",
-          "error_type": "TIMEOUT",
+          "error_type": "timeout",
           "lease_epoch": 0,
           "success": false,
           "task_id": 5,

@@ -129,6 +129,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import asyncpg
 
 from common import config
+from common.core.error_types import BLOCKED, CAPTCHA
 from common.core.zipcode import _zfill_short_numeric
 from common.pgdb.pool import translate_sql
 from common.pgdb.schema import (
@@ -220,8 +221,8 @@ _PARSE_FAIL_TITLES = frozenset({
 #: outcome 是封闭集，原始 error_type 在自己的列里无损保留；加第六个值会打断
 #: 每一个消费者的 ``outcomes=`` 过滤，那是契约版本升级，不是 Phase 2 的决定。
 _OUTCOME_BY_ERROR_TYPE: Dict[str, str] = {
-    "blocked": "blocked",
-    "captcha": "blocked",
+    BLOCKED: "blocked",
+    CAPTCHA: "blocked",
 }
 _OUTCOME_DEFAULT = "parse_failed"
 

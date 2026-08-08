@@ -446,6 +446,30 @@ while True:
 > 所以「拿到空数组」有两种含义：批次没有失败任务，或者批次根本不存在。
 > 需要区分请先打 `GET /api/batches/{batch_name}/status`（它会 404）。
 
+#### `error_type` 取值表
+
+**唯一真源**：`common/core/error_types.py`。以下清单与该文件的 `DESCRIPTIONS`
+字典逐字一致，改了那边这里也要跟着改。
+
+| `error_type` | 含义 |
+|---|---|
+| `network` | 网络请求失败（连接错误、DNS 解析失败、连接被重置等） |
+| `timeout` | 请求超时 |
+| `blocked` | 被 Amazon 判定为异常流量并拦截（403/503，非验证码） |
+| `captcha` | 遇到验证码页面 |
+| `parse_error` | 页面拿到了，但解析不出预期字段（HTML 结构变化、空页面等） |
+| `zip_switch_failed` | 切换配送邮编失败 |
+| `variant_offset` | Amazon 把请求重定向到了兄弟 variant 页面（不是目标 ASIN 本身）。不自动重试（见 §2.x 重试策略：`LIMITED_RETRY_ERROR_TYPES` cap=1） |
+| `zip_not_effective` | 邮编设置多次重发仍未生效（页面仍显示默认配送地区） |
+| `session_not_ready` | worker 本地 session 迟迟未就绪（冷启动/轮换中超时） |
+| `discover_failed` | 卖家店铺发现阶段失败（找不到任何在售 ASIN） |
+| `server_reject` | server 端二次校验判定这条结果本身不合法，直接判失败——**不是** worker 上报的原始类型，是 server 改写的 |
+| `unknown` | worker 上报的 `error_type` 不在此表中，server 入口已改写成 `unknown`；原始值会被保留在 `error_detail` 开头（形如 `[unrecognized_type:xxx] 原始 detail`），不丢信息 |
+
+> `error_type` 只是短代码；`error_detail` 才是给人看的具体信息（HTTP 状态码、
+> 异常消息等，截断到 500 字符）。两者总是成对出现，别指望单独一个字段
+> 就能读懂失败原因。
+
 #### 错误响应
 
 | 状态码 | 触发 |

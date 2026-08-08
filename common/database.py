@@ -19,6 +19,7 @@ from datetime import timedelta
 
 from common import config
 from common.core.timeutil import now_ts, ts_from, utc_now
+from common.core.error_types import SERVER_REJECT
 
 # ============================================================
 # 与 PG 后端共享的纯 Python 符号 —— 定义在 common/core/（Phase 4.1）。
@@ -1686,9 +1687,9 @@ class Database:
                     logger.warning(f"server_reject: {asin} 解析失败数据")
                     # 降级为 failed（不回 pending 重试，Worker 已重试过）
                     await self._db.execute(
-                        "UPDATE tasks SET status='failed', error_type='server_reject', "
-                        "error_detail='parse_failure_on_server' WHERE id=?",
-                        (task_id,)
+                        "UPDATE tasks SET status='failed', error_type=?, "
+                        "error_detail=? WHERE id=?",
+                        (SERVER_REJECT, "parse_failure_on_server", task_id)
                     )
                     await self._db.execute("COMMIT")
                     return {"accepted": True, "saved": False, "server_reject": True}

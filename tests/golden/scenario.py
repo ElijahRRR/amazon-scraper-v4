@@ -198,7 +198,7 @@ def run(rec: Recorder) -> None:
         "task_id": fail_task["id"], "batch_id": fail_task["batch_id"],
         "worker_id": WORKER_ID, "lease_epoch": fail_task["lease_epoch"],
         "success": False,
-        "error_type": "TIMEOUT", "error_detail": "golden synthetic failure",
+        "error_type": "timeout", "error_detail": "golden synthetic failure",
     })
 
     # lease 门的双向断言，两步缺一不可：
