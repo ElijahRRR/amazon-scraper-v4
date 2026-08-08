@@ -268,8 +268,10 @@ def run(rec: Recorder) -> None:
                  f"/api/results/{tasks2[0]['asin']}", expect=200)
 
     # ---------------- 批次状态 / 错误 ----------------
-    rec.call("status_batch_a_after", "GET", f"/api/batches/{BATCH_A}/status", expect=200)
-    rec.call("errors_batch_a", "GET", f"/api/batches/{BATCH_A}/errors", expect=200)
+    status_a_after = rec.call("status_batch_a_after", "GET",
+                               f"/api/batches/{BATCH_A}/status", expect=200)
+    rec.call("failures_batch_a", "GET",
+             f"/api/batches/{status_a_after['batch_id']}/failures", expect=200)
     rec.call("batches_after_results", "GET", "/api/batches", expect=200)
     rec.call("progress_after_results", "GET", "/api/progress", expect=200)
     rec.call("screenshots_progress", "GET",

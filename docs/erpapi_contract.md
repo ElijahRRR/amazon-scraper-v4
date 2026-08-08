@@ -21,9 +21,12 @@
 | 3 | `GET /api/batches/{batch_name}/status` | 轮询批次状态 | 保留，未改（§4.2） |
 | 4 | `GET /api/results` | 拉结果，游标翻页 | **单页上限 200 → 1000**（§4.3） |
 | 5 | `GET /api/batches/{batch_id}/failures` | 完整失败明细 | 保留，旧坑在我们这边本来就不存在（§4.4） |
-| 6 | `GET /api/batches/{batch_name}/errors` | 失败明细（旧） | **废弃**，改用 #5（§4.5） |
-| 7 | `POST /api/batches/{batch_id}/prioritize` | 插队 | 保留，但 `ok:true` 不代表批次存在（§4.6） |
-| 8 | `GET /static/screenshots/...` | 取截图 | 保留，未改（§4.7） |
+| 6 | `POST /api/batches/{batch_id}/prioritize` | 插队 | 保留，但 `ok:true` 不代表批次存在（§4.6） |
+| 7 | `GET /static/screenshots/...` | 取截图 | 保留，未改（§4.7） |
+
+> 曾经的第 6 个端点 `GET /api/batches/{batch_name}/errors`（失败明细旧接口）
+> 已经**删除**，不是废弃——`失败明细`统一走 `GET /api/batches/{batch_id}/failures`
+> （§4.4）。历史细节见 §5.4。
 
 七个端点在本仓库**全部存在**，路由声明位置：
 
@@ -32,8 +35,7 @@
 | `POST /api/upload` | `server/app.py:1053` |
 | `GET /api/batches/{batch_name}/status` | `server/app.py:1266` |
 | `POST /api/batches/{batch_id}/prioritize` | `server/app.py:1354` |
-| `GET /api/batches/{batch_name}/errors` | `server/app.py:1446` |
-| `GET /api/batches/{batch_id}/failures` | `server/app.py:1492` |
+| `GET /api/batches/{batch_id}/failures` | `server/app.py:1433` |
 | `GET /api/results` | `server/api/results.py:151` |
 | `GET /api/export/incremental` | `server/api/export_incremental.py:375` |
 | `/static/**`（截图） | `server/app.py:253`（`StaticFiles` 挂载） |
@@ -414,7 +416,7 @@ while True:
 
 ### 4.4 `GET /api/batches/{batch_id}/failures` —— 完整失败明细（**推荐**）
 
-**声明**：`server/app.py:1492`。路径参数是 **batch_id（int）**，不依赖批次名。
+**声明**：`server/app.py:1433`。路径参数是 **batch_id（int）**，不依赖批次名。
 
 #### 参数
 
@@ -475,41 +477,6 @@ while True:
 | 状态码 | 触发 |
 |---|---|
 | 422 | `limit` 越界（`> 100000` 或 `< 1`），或 `batch_id` 不是整数 |
-
----
-
-### 4.5 `GET /api/batches/{batch_name}/errors` —— **废弃，请勿新接入**
-
-**声明**：`server/app.py:1446`
-
-保留只是为了不打断已在使用它的调用方。它有两条硬限制，**设计如此，调大参数没用**：
-
-1. `failed_tasks` **最多 200 条**（SQL 里写死 `LIMIT 200`，`server/app.py:1485`），
-   超出的部分直接看不见；
-2. 排序是 `updated_at DESC, id DESC`，而 `updated_at` 是**秒精度**且
-   `accept_results_batch` 会把整次提交盖上同一个时间戳 ——
-   所以「最近 200 条」在同一批内部**不是一个有业务含义的切片**。
-
-响应形状也与 `/failures` 不同：
-
-```json
-{"error_summary": [{"error_type": "variant_offset", "cnt": 2}],
- "failed_tasks": [{"asin": ..., "error_type": ..., "error_detail": ...,
-                   "retry_count": ..., "worker_id": ..., "updated_at": ...}]}
-```
-
-⚠ `/errors` 的 `failed_tasks[]` 有 **6 个键**，`/failures` 的有 **7 个**
-（多一个 `status`）—— 实测确认。切换时注意。
-
-**迁移**：`GET /api/batches/{batch_id}/failures`（§4.4）。
-唯一的代价是要先有 `batch_id` 而不是批次名 —— `POST /api/upload` 的
-200 和 409 都给了 `batch_id`，`/status` 也给。
-
-> 采集侧**没有**往 `/errors` 的响应体里加 deprecation 字段，这是有意的：
-> 那是线上格式变更，严格反序列化的在跑调用方会直接崩。
-> 废弃提示只写进 docstring（= `/openapi.json` 的 `description`）。
-> 「docstring 必须指得出 `/failures`」由
-> `tests/test_errors_endpoint_points_at_failures.py` 钉住。
 
 ---
 
@@ -698,18 +665,29 @@ POST 才是可安全重试的。**
 守卫：`tests/test_upload_batch_name_conflict.py::test_200_echoes_what_was_actually_stored`
 （用 200 字符的 `external_id` 验回显的是截断后的 120 字符）。
 
-### 5.4 旧坑：`/errors` 只返回最近 200 条 —— **在我们这边已经解决**
+### 5.4 旧坑：`/errors` 只返回最近 200 条 —— **端点本身已删除**
 
-**结论：`/api/batches/{batch_id}/failures` 本来就没有这个限制。**
+`GET /api/batches/{batch_name}/errors` 曾经是失败明细的旧接口，有两条
+设计如此、调参数也没用的限制：`failed_tasks` 硬截断到 200 条
+（SQL 里写死 `LIMIT 200`）；排序是 `updated_at DESC, id DESC`，而
+`updated_at` 是秒精度、`accept_results_batch` 又会把整次提交盖上同一个
+时间戳——所以「最近 200 条」在同一批内部不是一个有业务含义的切片。
 
-- `limit` 上限是 **100000**（`server/app.py:1496`：`Query(100000, ge=1, le=100000)`）；
-- docstring 明写「不依赖批次名，且不截断到 200 条」（`server/app.py:1498`）；
-- 支持 `error_type` 逗号分隔过滤；
-- 排序带 `id` tiebreaker，是全序，两个后端一致。
+`GET /api/batches/{batch_id}/failures`（§4.4）本来就没有这两个问题：
+`limit` 上限 **100000**（`server/app.py:1437`：
+`Query(100000, ge=1, le=100000)`）、docstring 明写「不依赖批次名，且不
+截断到 200 条」（`server/app.py:1439`）、支持 `error_type` 逗号分隔过滤、
+排序带 `id` tiebreaker 是全序，两个后端一致。`/errors` 从一开始就是多余
+的重复实现，所以**直接删除**，不再保留兼容层：
 
-**但旧的 `/api/batches/{batch_name}/errors` 那 200 条限制是真的**
-（`server/app.py:1485` 里 `LIMIT 200` 写死），而且它的排序在同一批提交内部
-没有业务含义（§4.5）。**所以：不要用 `/errors`，用 `/failures`。**
+- 端点：从 `server/app.py` 移除。
+- Web 控制台的"查看错误详情"改成调 `/failures` 并在前端本地把
+  `failed_tasks` 按 `error_type` 聚合出摘要（`server/templates/tasks.html`
+  的 `showErrors()`）——旧接口的 `error_summary` 聚合字段没有对应替身，
+  这是唯一的响应形状差异，其余字段 `/failures` 全都有（还多一个 `status`）。
+- **仍在调用 `/errors` 的外部方**（如果有）需要迁移到 `/failures`：
+  路径参数从批次名换成 `batch_id`——`POST /api/upload` 的 200 和 409
+  响应都给了 `batch_id`，`/status` 也给。
 
 ### 5.5 旧坑：单页上限 200 是硬约束调大无效 —— **重估后是 1000**
 
@@ -893,7 +871,7 @@ if r["status"] == "completed":      # ✅ 权威判据
 | 游标严格单调 + 翻页必然终止 | `tests/test_results_cursor_liveness.py` |
 | 单页上限是**拒绝**（422）不是截断 | `…::test_page_size_ceiling_rejects_not_truncates` |
 | 单页上限值 = 1000，且与 `/openapi.json` 的 `maximum` 一致 | `…::test_page_size_ceiling_is_1000` |
-| `/errors` 的 docstring 必须指得出 `/failures` | `tests/test_errors_endpoint_points_at_failures.py` |
+| `/failures` 的 `limit` 上限（100000）与 `error_type` 过滤不能被削弱 | `tests/test_batch_failures_endpoint.py` |
 | 错误码封闭集不漂移（含 `batch_name_conflict`） | `tests/test_error_codes.py` |
 | 增量导出契约 v1 逐句 | `tests/test_incremental_export.py` |
 | 两个后端行为逐字节一致 | `python -m tests.golden.run verify` / `DB_BACKEND=postgres … verify` |
