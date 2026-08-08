@@ -17,7 +17,7 @@ class BatchFailuresEndpointContractTests(unittest.TestCase):
 
     def test_limit_ceiling_stays_far_above_the_old_200_cap(self):
         """/failures 存在的意义就是不再硬截断到 200 条，limit 上限必须远大于它。"""
-        from server.app import api_batch_failures
+        from server.api.batches import api_batch_failures
 
         params = inspect.signature(api_batch_failures).parameters
         # pydantic v2 下 `Query(..., le=N)` 的上限落在 `.metadata` 里的 `Le(le=N)`
@@ -28,7 +28,7 @@ class BatchFailuresEndpointContractTests(unittest.TestCase):
 
     def test_supports_error_type_filter(self):
         """error_type 过滤是 /failures 相对旧接口的另一个关键能力，不能丢。"""
-        from server.app import api_batch_failures
+        from server.api.batches import api_batch_failures
 
         params = inspect.signature(api_batch_failures).parameters
         self.assertIn("error_type", params)

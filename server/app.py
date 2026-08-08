@@ -15,12 +15,12 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from typing import Optional, Dict, List, Any, Set
+from typing import Optional, Dict, Set
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import FastAPI, Request, UploadFile, File, Form, Query, HTTPException
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 import openpyxl
 
@@ -297,6 +297,16 @@ class _RequestIDMiddleware:
 
 
 app.add_middleware(_RequestIDMiddleware)
+
+
+# ==================== 破坏性端点的可选管理员鉴权 ====================
+#
+# 与 EXPORT_TOKEN 同一套 opt-in 语义：配了 ADMIN_TOKEN 才校验，没配则完全
+# 透明放行（首次命中打一条 WARNING）。默认不改变任何现有部署的行为。
+# 受保护清单、以及"为什么是 ASGI 中间件而不是 Depends"见 server/authz.py。
+from server.authz import AdminTokenMiddleware  # noqa: E402
+
+app.add_middleware(AdminTokenMiddleware)
 
 
 @app.exception_handler(Exception)
@@ -1050,183 +1060,6 @@ def _safe_fs_component(name: str) -> Optional[str]:
     return name
 
 
-@app.post("/api/upload")
-async def api_upload(request: Request,
-                     file: UploadFile = File(...),
-                     batch_name: str = Form(None),
-                     zip_code: str = Form(None),
-                     needs_screenshot: bool = Form(False),
-                     callback_url: str = Form(None),
-                     external_id: str = Form(None),
-                     expand_variants: bool = Form(False)):
-    """上传 ASIN 文件创建批次。
-
-    支持 xlsx / csv / txt 三种格式：
-    - **xlsx / csv**：A 列 = ASIN，B 列（可选）= 该 ASIN 单独的采集邮编（5 位数字）
-      B 列为空 → 用本次上传指定的 batch zip（或服务端默认）
-    - **txt**：每行一个 ASIN（无邮编列）
-
-    可选 callback：
-    - `callback_url`：批次完成时（含截图）POST 到此 URL 通知调用方
-    - `external_id`：调用方自己的批次 ID，原样回传，便于追踪
-
-    批次名冲突 → **409 Conflict**，绝不静默合并进已有批次。409 的响应体里带
-    `detail.batch_id` / `detail.batch_name` / `detail.status_url`，调用方可以
-    直接拿去接着轮询。
-
-    由此得到的三条性质（调用方可以依赖）：
-    - **本端点可以安全重试**：网络超时后重发，若上一次其实成功了，拿到的是
-      409 + 那个既有 batch_id，而不是又建一个批次、也不会悄悄并进去。
-    - 批次名不需要毫秒精度去躲开合并。
-    - **200 恒等于「新建了一个批次」**，`inserted` 因此不再有歧义。
-
-    200 响应里的 `external_id` / `callback_url` 回显的是**批次实际存下来的**值
-    （读回后再回显），不是请求里的值。
-    """
-    content = await file.read()
-    if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(413, f"文件过大：{len(content)//1024//1024}MB，上限 {MAX_UPLOAD_BYTES//1024//1024}MB")
-    filename = file.filename or ""
-
-    asins: List[str] = []                # 顺序、可重复（去重在后面）
-    per_asin_zip: Dict[str, str] = {}    # 仅记录 B 列指定的邮编
-    invalid_zip_count = 0
-
-    def add_pair(asin_val, zip_val):
-        nonlocal invalid_zip_count
-        asin = _normalize_asin(asin_val)
-        if not asin:
-            return
-        asins.append(asin)
-        if zip_val is not None and str(zip_val).strip():
-            zip_norm = _normalize_zip(zip_val)
-            if zip_norm:
-                # 同一 ASIN 在多行重复时，以第一次出现的非空 zip 为准
-                per_asin_zip.setdefault(asin, zip_norm)
-            else:
-                invalid_zip_count += 1
-
-    if filename.endswith(".xlsx"):
-        wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True)
-        try:
-            ws = wb.active
-            for row in ws.iter_rows(min_row=1, values_only=True):
-                if not row:
-                    continue
-                a = row[0] if len(row) > 0 else None
-                b = row[1] if len(row) > 1 else None
-                # 兼容旧上传：当 A 列不是 ASIN 时，扫描该行所有列找 ASIN（不带 zip）
-                if _normalize_asin(a):
-                    add_pair(a, b)
-                else:
-                    for cell in row:
-                        if _normalize_asin(cell):
-                            add_pair(cell, None)
-        finally:
-            wb.close()
-    elif filename.endswith(".csv"):
-        text = content.decode("utf-8", errors="ignore")
-        reader = csv.reader(io.StringIO(text))
-        for row in reader:
-            if not row:
-                continue
-            a = row[0] if len(row) > 0 else None
-            b = row[1] if len(row) > 1 else None
-            if _normalize_asin(a):
-                add_pair(a, b)
-            else:
-                for cell in row:
-                    if _normalize_asin(cell):
-                        add_pair(cell, None)
-    else:
-        text = content.decode("utf-8", errors="ignore")
-        for line in text.splitlines():
-            add_pair(line, None)
-
-    if not asins:
-        raise HTTPException(400, "未找到有效 ASIN")
-
-    # 去重（保持顺序）
-    seen = set()
-    unique_asins = []
-    for a in asins:
-        if a not in seen:
-            unique_asins.append(a)
-            seen.add(a)
-
-    if not batch_name:
-        batch_name = _batch_name("batch")     # P4.7：精度不变（本来就是秒）
-
-    # callback_url 校验（防 SSRF + 格式）
-    cb_url = (callback_url or "").strip() or None
-    if cb_url:
-        ok, reason = await _is_safe_callback_url(cb_url)
-        if not ok:
-            raise HTTPException(400, f"非法 callback_url（{reason}）。仅接受 http(s)://公网域名/IP")
-
-    ext_id = (external_id or "").strip()[:120] or None  # 上限 120 字符防滥用
-
-    zc = zip_code or _runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE)
-
-    # 构造 status URL（调用方可以轮询）。409 也要带上它，所以在建批次之前先算好。
-    base = str(request.base_url).rstrip("/")
-    status_url = f"{base}/api/batches/{batch_name}/status"
-
-    batch_id, created = await db.create_batch_if_absent(
-        batch_name, needs_screenshot,
-        external_id=ext_id, callback_url=cb_url,
-        expand_variants=expand_variants,
-    )
-    if not created:
-        # 撞名 -> 409，**绝不静默合并**。
-        #
-        # 以前这里是 200 + 既有 batch_id，实测后果（Phase 4.7 已证明撞名不是
-        # no-op，本轮修的就是它）：
-        #   * 本次的新 ASIN 被悄悄塞进上一个批次，「一次采集」的语义破掉；
-        #   * `inserted` 在部分重叠时是非零，看起来像成功新建；
-        #   * **本次的 external_id / callback_url 被静默丢弃**（INSERT OR IGNORE
-        #     整行不插，既有行一个字段都不更新），而响应回显的是**请求**里的值 ——
-        #     调用方以为回调注册好了，回调永远不会触发。
-        #
-        # 为什么是 409，而不是「自动加后缀」或「200 加个 merged 标志」：只有让
-        # 撞名变成一个**可识别的失败**，POST /api/upload 才是可安全重试的 ——
-        # 网络超时后重发，上一次若其实成功了，这里回的是 409 + 那个 batch_id。
-        # 自动加后缀会让重试造出第二个批次，200+标志则要求每个调用方都记得读那个
-        # 标志，漏读的代价与今天一模一样。
-        #
-        # 注意 batch_id 是**既有批次**的 id（create_batch_if_absent 撞名时照样把它
-        # SELECT 回来），调用方可以直接拿 status_url 接着轮询，不必再查一次。
-        raise HTTPException(409, {
-            "error": _BATCH_NAME_CONFLICT_CODE,
-            "message": f"批次名已存在: {batch_name}（未合并，也未改动既有批次）",
-            "batch_id": batch_id,
-            "batch_name": batch_name,
-            "status_url": status_url,
-        })
-
-    inserted = await db.create_tasks(
-        batch_id, unique_asins, zc, needs_screenshot,
-        per_asin_zip=per_asin_zip,
-    )
-
-    # 回显**存下来的**值，不是请求里的值。
-    # 撞名已经在上面 409 掉了，所以走到这里两者必然相等——但「回显请求值」这个
-    # 写法本身就是上面那个回调撒谎 bug 的载体，留着它等于把地雷埋回去。
-    # 读回一行的代价（一次主键级 SELECT）远小于「回调注册成功了吗」这种问题。
-    stored = await db.get_batch_by_name(batch_name)
-    return {
-        "batch_id": batch_id,
-        "batch_name": batch_name,
-        "external_id": stored.get("external_id") if stored else ext_id,
-        "total_asins": len(unique_asins),
-        "inserted": inserted,
-        "per_asin_zip_count": len(per_asin_zip),
-        "invalid_zip_rows": invalid_zip_count,
-        "callback_url": stored.get("callback_url") if stored else cb_url,
-        "status_url": status_url,
-    }
-
-
 # ==================== F-009: 卖家店铺采集 ====================
 #
 # 4 个端点搬到 server/api/sellers.py（Phase 3.4）：upload-sellers、
@@ -1244,204 +1077,23 @@ from server.api import sellers as _sellers_api  # noqa: E402
 app.include_router(_sellers_api.router)
 
 
-@app.get("/api/batches")
-async def api_batches():
-    batches = await db.get_batches()
-    return {"batches": batches}
+# 11 个端点搬到 server/api/batches.py：POST /api/upload、GET /api/batches、
+# GET /api/progress、批次 status / screenshots-progress / callback-retry /
+# prioritize / retry / delete / delete-bulk / failures。
+#
+# db / _callback_send_queue / _runtime_settings / _normalize_asin /
+# _normalize_zip / _batch_name / _is_safe_callback_url /
+# _remove_screenshot_files / _BATCH_NAME_CONFLICT_CODE / MAX_UPLOAD_BYTES
+# 全部留在本文件（后台协程与其它模块也在用，且夹具按名字打补丁），
+# batches.py 一律走 _srv()。
+#
+# 注册次序：本 include 落在原来那一段批次路由的位置上，而 /api/upload 原先
+# 排在 sellers router 之前 —— 两者都是静态路径且互不前缀包含
+# （/api/upload vs /api/upload-sellers 是两条独立的静态 path，
+# Starlette 全等匹配 path，不做前缀匹配），换到这里不改变任何一条的匹配结果。
+from server.api import batches as _batches_api  # noqa: E402
 
-
-@app.get("/api/progress")
-async def api_progress(batch_id: int = None):
-    return await db.get_progress(batch_id)
-
-
-@app.get("/api/batches/{batch_name}/screenshots/progress")
-async def api_screenshot_progress(batch_name: str):
-    batch = await db.get_batch_by_name(batch_name)
-    if not batch:
-        raise HTTPException(404, f"批次不存在: {batch_name}")
-    return await db.get_screenshot_progress(batch["id"])
-
-
-@app.get("/api/batches/{batch_name}/status")
-async def api_batch_status(batch_name: str):
-    """轮询批次完成状态（兼容旧调用方 + 给纯轮询模式用）。
-
-    返回结构：
-        {
-          "batch_name": ...,
-          "batch_id": ...,
-          "external_id": ...,
-          "status": "running"|"completed"|"failed",
-          "stats": {total, done, failed, success_rate, duration_seconds},
-          "screenshots": {total, done, failed},
-          "completed_at": null|"2026-...",
-          "callback": {url, status, attempts, last_error, sent_at}
-        }
-    """
-    batch = await db.get_batch_by_name(batch_name)
-    if not batch:
-        raise HTTPException(404, f"批次不存在: {batch_name}")
-    snap = await db.get_batch_completion_status(batch["id"])
-    t = snap["tasks"]
-    s = snap["screenshots"]
-    total = t["total"] or 0
-    success_rate = (t["done"] / total) if total > 0 else 0.0
-
-    # 持续时长（创建到完成；未完成则到当前时间）
-    duration = None
-    try:
-        created_at = batch.get("created_at")
-        end_at = batch.get("completed_at") or now_ts()
-        if created_at:
-            start = datetime.strptime(created_at[:19], '%Y-%m-%d %H:%M:%S')
-            stop = datetime.strptime(end_at[:19], '%Y-%m-%d %H:%M:%S')
-            duration = int((stop - start).total_seconds())
-    except Exception:
-        logger.debug("计算批次耗时失败（duration 置空）", exc_info=True)
-
-    return {
-        "batch_name": batch_name,
-        "batch_id": batch["id"],
-        "external_id": batch.get("external_id"),
-        "status": batch.get("status") or "running",
-        "stats": {
-            "total": total,
-            "done": t["done"] or 0,
-            "failed": t["failed"] or 0,
-            "open": t["open"] or 0,
-            "success_rate": round(success_rate, 4),
-            "duration_seconds": duration,
-        },
-        "screenshots": {
-            "total": s["total"] or 0,
-            "done": s["done"] or 0,
-            "failed": s["failed"] or 0,
-            "open": s["open"] or 0,
-        },
-        "completed_at": batch.get("completed_at"),
-        "callback": {
-            "url": batch.get("callback_url"),
-            "status": batch.get("callback_status"),
-            "attempts": batch.get("callback_attempts") or 0,
-            "last_error": batch.get("callback_last_error"),
-            "sent_at": batch.get("callback_sent_at"),
-            "next_retry_at": batch.get("callback_next_retry_at"),
-        },
-    }
-
-
-@app.post("/api/batches/{batch_name}/callback/retry")
-async def api_batch_callback_retry(batch_name: str):
-    """运维手动触发：重置该批次的 callback 状态，立即重新发送。
-    可用于：webhook 失败 5 次后；或调用方端点恢复后想重新接收一次通知。
-    """
-    batch = await db.get_batch_by_name(batch_name)
-    if not batch:
-        raise HTTPException(404, f"批次不存在: {batch_name}")
-    if not batch.get("callback_url"):
-        raise HTTPException(400, "该批次没有配置 callback_url")
-    changed = await db.reset_callback_for_retry(batch["id"])
-    # 入队让 dispatcher 立刻处理
-    if _callback_send_queue is not None:
-        try:
-            _callback_send_queue.put_nowait(batch["id"])
-        except Exception:
-            logger.warning(f"callback 重发入队失败（忽略）: batch_id={batch['id']}", exc_info=True)
-    return {"ok": changed, "batch_id": batch["id"]}
-
-
-@app.post("/api/batches/{batch_id}/prioritize")
-async def api_prioritize(batch_id: int):
-    await db.prioritize_batch(batch_id)
-    return {"ok": True}
-
-
-@app.post("/api/batches/{batch_name}/retry")
-async def api_retry_batch(batch_name: str, force: bool = False):
-    """重试失败任务
-
-    始终跳过 NO_AUTO_RETRY_ERROR_TYPES（如 variant_offset），因为这些类型
-    是 Amazon 侧返回兄弟变体页的稳定问题，不再重试。
-    返回 retried/skipped_no_retry 数量，前端可展示。
-    """
-    from common.core import NO_AUTO_RETRY_ERROR_TYPES
-    batch = await db.get_batch_by_name(batch_name)
-    if not batch:
-        raise HTTPException(404, f"批次不存在: {batch_name}")
-    batch_id = batch["id"]
-
-    # 排除清单在**这里**算好再传下去：它是本端点的策略（"始终跳过
-    # variant_offset"），而且要原样回显在响应体里。db 层只负责按清单执行。
-    no_retry_list = sorted(NO_AUTO_RETRY_ERROR_TYPES)
-
-    # force 参数保留兼容旧调用，但不覆盖 NO_AUTO_RETRY_ERROR_TYPES。
-    res = await db.retry_failed_tasks(batch_id, no_retry_list)
-    return {
-        "ok": True,
-        "retried": res["retried"],
-        "skipped_no_retry": res["skipped"],
-        "no_retry_types": no_retry_list,
-        "forced": force,
-    }
-
-
-@app.delete("/api/batches/{batch_name}")
-async def api_delete_batch(batch_name: str):
-    """删除批次及其任务"""
-    batch = await db.get_batch_by_name(batch_name)
-    if not batch:
-        raise HTTPException(404, f"批次不存在: {batch_name}")
-    batch_id = batch["id"]
-    screenshot_files = await db.delete_batches([batch_id])
-
-    # 删除物理截图文件
-    _remove_screenshot_files(screenshot_files)
-    return {"ok": True}
-
-
-@app.post("/api/batches/delete-bulk")
-async def api_delete_batches_bulk(request: Request):
-    """批量删除多个批次（按 batch_id）及其全部关联数据 + 截图文件。
-    入参 JSON：{"batch_ids": [1,2,3]}。一次事务删除，原子性。"""
-    body = await request.json()
-    raw = body.get("batch_ids", [])
-    if not isinstance(raw, list):
-        raise HTTPException(400, "batch_ids 必须是数组")
-    # 仅接受整数 id，去重，上限保护（防超大 IN 子句）
-    seen = set()
-    batch_ids = []
-    for x in raw:
-        try:
-            i = int(x)
-        except (ValueError, TypeError):
-            continue
-        if i not in seen:
-            seen.add(i)
-            batch_ids.append(i)
-    batch_ids = batch_ids[:500]
-    if not batch_ids:
-        raise HTTPException(400, "batch_ids 为空或无效")
-
-    screenshot_files = await db.delete_batches(batch_ids)
-
-    _remove_screenshot_files(screenshot_files)
-    logger.info(f"批量删除批次: {len(batch_ids)} 个 (ids={batch_ids[:20]}{'...' if len(batch_ids) > 20 else ''})")
-    return {"ok": True, "deleted": len(batch_ids)}
-
-
-@app.get("/api/batches/{batch_id}/failures")
-async def api_batch_failures(
-    batch_id: int,
-    error_type: Optional[str] = Query(None, description="逗号分隔的 error_type 过滤"),
-    limit: int = Query(100000, ge=1, le=100000),
-):
-    """按 batch_id 获取失败任务明细；不依赖批次名，且不截断到 200 条。"""
-    error_types = None
-    if error_type:
-        error_types = [t.strip() for t in error_type.split(",") if t.strip()]
-    failed_tasks = await db.get_batch_failures(batch_id, error_types=error_types, limit=limit)
-    return {"batch_id": batch_id, "failed_tasks": failed_tasks, "count": len(failed_tasks)}
+app.include_router(_batches_api.router)
 
 
 # ==================== API: Worker 机群（注册表 / 心跳 / 配额）====================
@@ -1454,16 +1106,6 @@ async def api_batch_failures(
 from server.api import fleet as _fleet_api  # noqa: E402
 
 app.include_router(_fleet_api.router)
-
-
-@app.post("/api/settings/reset")
-async def api_reset_settings():
-    """恢复默认设置"""
-    global _runtime_settings, _settings_version
-    _runtime_settings = _default_settings()
-    _settings_version += 1
-    _save_settings()
-    return {"ok": True, "settings": _runtime_settings}
 
 
 # ==================== API: Worker 任务拉取和提交 ====================
@@ -1506,24 +1148,15 @@ app.include_router(_results_api.router)
 
 
 # ==================== API: 设置 ====================
+#
+# 3 个端点（GET/PUT /api/settings、POST /api/settings/reset）搬到
+# server/api/settings.py。_runtime_settings / _settings_version /
+# _default_settings / _save_settings 全部留在本文件（后台协程也在用，
+# 且夹具按名字打补丁），settings.py 一律走 _srv() 属性访问与属性赋值。
+# 三条全是静态路径，/api/settings 下没有 catch-all，注册次序不影响匹配。
+from server.api import settings as _settings_api  # noqa: E402
 
-@app.get("/api/settings")
-async def api_get_settings():
-    return {"settings": _runtime_settings, "version": _settings_version}
-
-
-@app.put("/api/settings")
-async def api_update_settings(request: Request):
-    global _settings_version
-    body = await request.json()
-
-    for key, value in body.items():
-        if key in _runtime_settings:
-            _runtime_settings[key] = value
-
-    _settings_version += 1
-    _save_settings()
-    return {"ok": True, "version": _settings_version, "settings": _runtime_settings}
+app.include_router(_settings_api.router)
 
 
 # ==================== API: 导出 ====================
@@ -1558,18 +1191,21 @@ from server.api import debug as _debug_api  # noqa: E402
 app.include_router(_debug_api.router)
 
 
+# ==================== API: Worker 安装包下载 ====================
+#
+# GET /api/worker/download —— 前端 settings.html / workers.html 里那三个
+# "下载 Worker" 链接的落点。它们从模板加进来那天起就指向一个**不存在的
+# 路由**（404），本轮才补上后端实现。router 光秃，不带 tags/prefix。
+# 路径是静态的，`/api/worker/*` 下没有 catch-all（`/api/worker/sync` 也是
+# 静态的，在 fleet.py），注册次序不影响匹配。
+from server.api import worker_package as _worker_package_api  # noqa: E402
+
+app.include_router(_worker_package_api.router)
+
+
 # ==================== 定时采集管理 ====================
 
 _SCHEDULES_DIR = os.path.join(config.PROJECT_DIR, "data", "schedules")
-
-
-def _get_schedules() -> list:
-    return _runtime_settings.get("auto_scrape_schedules", [])
-
-
-def _save_schedules(schedules: list):
-    _runtime_settings["auto_scrape_schedules"] = schedules
-    _save_settings()
 
 
 def _extract_asins_from_file(filepath: str) -> list:
@@ -1613,220 +1249,34 @@ def _extract_asins_from_file(filepath: str) -> list:
     return asins
 
 
-@app.get("/api/schedules")
-async def api_list_schedules():
-    return {"schedules": _get_schedules()}
+# 5 个端点（GET/POST /api/schedules、PUT/DELETE /api/schedules/{sched_id}、
+# POST /api/schedules/{sched_id}/run）搬到 server/api/schedules.py，
+# 连同只有它们在用的 _get_schedules / _save_schedules。
+#
+# _SCHEDULES_DIR 与 _extract_asins_from_file **留在本文件**：前者 lifespan 要
+# makedirs，后者 _auto_scrape_scheduler 也在调 —— 搬走就得让本文件反向 import
+# schedules.py，绕成环。schedules.py 走 _srv() 拿它们。
+from server.api import schedules as _schedules_api  # noqa: E402
+
+app.include_router(_schedules_api.router)
 
 
-@app.post("/api/schedules")
-async def api_create_schedule(request: Request,
-                              file: UploadFile = File(...),
-                              name: str = Form(""),
-                              time_str: str = Form(..., alias="time"),
-                              interval_days: int = Form(1),
-                              needs_screenshot: bool = Form(False)):
-    """创建定时采集任务"""
-    # 验证时间格式
-    try:
-        h, m = map(int, time_str.split(":"))
-        if not (0 <= h <= 23 and 0 <= m <= 59):
-            raise ValueError
-    except ValueError:
-        raise HTTPException(400, "时间格式错误，应为 HH:MM")
-
-    if interval_days < 1:
-        raise HTTPException(400, "间隔天数至少为 1")
-
-    # 保存 ASIN 文件
-    os.makedirs(_SCHEDULES_DIR, exist_ok=True)
-    import uuid
-    sched_id = f"sched_{uuid.uuid4().hex[:8]}"
-    ext = os.path.splitext(file.filename or "")[1] or ".txt"
-    source_file = os.path.join(_SCHEDULES_DIR, f"{sched_id}{ext}")
-    content = await file.read()
-    if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(413, f"文件过大：{len(content)//1024//1024}MB，上限 {MAX_UPLOAD_BYTES//1024//1024}MB")
-    with open(source_file, "wb") as f:
-        f.write(content)
-
-    # 验证文件中有 ASIN
-    asin_list = _extract_asins_from_file(source_file)
-    if not asin_list:
-        os.remove(source_file)
-        raise HTTPException(400, "文件中未找到有效 ASIN")
-
-    # 首次创建：last_run_date 设为昨天，确保首次检查时立即触发
-    from datetime import timedelta
-    yesterday = (_cn_now() - timedelta(days=interval_days)).strftime("%Y-%m-%d")
-
-    sched = {
-        "id": sched_id,
-        "name": name or f"定时任务-{time_str}",
-        "time": time_str,
-        "interval_days": interval_days,
-        "source_file": source_file,
-        "asin_count": len(asin_list),
-        "needs_screenshot": needs_screenshot,
-        "enabled": True,
-        "last_run_date": yesterday,
-        "created_at": now_ts(),
-    }
-
-    schedules = _get_schedules()
-    schedules.append(sched)
-    _save_schedules(schedules)
-
-    return {"ok": True, "schedule": sched, "schedules": schedules}
-
-
-@app.put("/api/schedules/{sched_id}")
-async def api_update_schedule(sched_id: str, request: Request):
-    """修改定时任务（enabled/time/interval_days/name）"""
-    body = await request.json()
-    schedules = _get_schedules()
-    target = None
-    for s in schedules:
-        if s.get("id") == sched_id:
-            target = s
-            break
-    if target is None:
-        raise HTTPException(404, "定时任务不存在")
-
-    if "enabled" in body:
-        target["enabled"] = bool(body["enabled"])
-    if "name" in body:
-        target["name"] = body["name"]
-    if "time" in body:
-        try:
-            h, m = map(int, body["time"].split(":"))
-            if 0 <= h <= 23 and 0 <= m <= 59:
-                target["time"] = body["time"]
-        except (ValueError, AttributeError):
-            pass
-    if "interval_days" in body:
-        val = int(body["interval_days"])
-        if val >= 1:
-            target["interval_days"] = val
-
-    _save_schedules(schedules)
-    return {"ok": True, "schedules": schedules}
-
-
-@app.delete("/api/schedules/{sched_id}")
-async def api_delete_schedule(sched_id: str):
-    """删除定时任务 + ASIN 文件"""
-    schedules = _get_schedules()
-    target = None
-    new_schedules = []
-    for s in schedules:
-        if s.get("id") == sched_id:
-            target = s
-        else:
-            new_schedules.append(s)
-    if target is None:
-        raise HTTPException(404, "定时任务不存在")
-
-    # 删除 ASIN 文件
-    source_file = target.get("source_file", "")
-    if source_file and os.path.isfile(source_file):
-        os.remove(source_file)
-
-    _save_schedules(new_schedules)
-    return {"ok": True, "schedules": new_schedules}
-
-
-@app.post("/api/schedules/{sched_id}/run")
-async def api_run_schedule_now(sched_id: str):
-    """手动立即执行一次定时任务"""
-    schedules = _get_schedules()
-    target = None
-    for s in schedules:
-        if s.get("id") == sched_id:
-            target = s
-            break
-    if target is None:
-        raise HTTPException(404, "定时任务不存在")
-
-    source_file = target.get("source_file", "")
-    asin_list = _extract_asins_from_file(source_file)
-    if not asin_list:
-        raise HTTPException(400, "ASIN 文件为空或不存在")
-
-    now = _cn_now()  # last_run 用中国时间
-    # P4.7：**分钟 -> 秒**（有意的行为改动，见 _batch_name 的 docstring）。
-    # 这一处和 _auto_scrape_scheduler 那一处正是会互相撞名的两个。
-    batch_name = _batch_name(f"auto_{target.get('name', 'task')}")
-    zc = _runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE)
-    ns = target.get("needs_screenshot", False)
-    batch_id = await db.create_batch(batch_name, ns, is_auto=True)
-    await db.create_tasks(batch_id, asin_list, zc, ns)
-
-    target["last_run_date"] = now.strftime("%Y-%m-%d")
-    _save_schedules(schedules)
-    logger.info(f"手动执行定时任务: {batch_name}, {len(asin_list)} ASINs")
-
-    return {"ok": True, "batch_id": batch_id, "batch_name": batch_name, "asin_count": len(asin_list)}
-
-
-# ==================== 兼容旧 schedule API（settings.html 旧 UI 调用） ====================
-
-@app.get("/api/auto-scrape/schedules")
-async def api_legacy_list_schedules():
-    return {"schedules": _get_schedules()}
-
-
-@app.post("/api/auto-scrape/schedules")
-async def api_legacy_add_schedule(request: Request):
-    """旧式简单定时（无文件，使用全库 ASIN）"""
-    body = await request.json()
-    time_str = body.get("time", "")
-    try:
-        h, m = map(int, time_str.split(":"))
-        if not (0 <= h <= 23 and 0 <= m <= 59):
-            raise ValueError
-    except ValueError:
-        raise HTTPException(400, "时间格式错误")
-
-    import uuid
-    sched = {
-        "id": f"sched_{uuid.uuid4().hex[:8]}",
-        "name": f"全库采集-{time_str}",
-        "time": time_str,
-        "interval_days": 1,
-        "source_file": "",  # 空=全库 ASIN
-        "asin_count": 0,
-        "needs_screenshot": False,
-        "enabled": True,
-        "last_run_date": "",
-        "created_at": now_ts(),
-    }
-    schedules = _get_schedules()
-    schedules.append(sched)
-    _save_schedules(schedules)
-    return {"ok": True, "schedules": schedules}
-
-
-@app.put("/api/auto-scrape/schedules/{index}")
-async def api_legacy_toggle_schedule(index: int, request: Request):
-    body = await request.json()
-    schedules = _get_schedules()
-    if 0 <= index < len(schedules):
-        if "enabled" in body:
-            schedules[index]["enabled"] = bool(body["enabled"])
-        _save_schedules(schedules)
-    return {"ok": True, "schedules": schedules}
-
-
-@app.delete("/api/auto-scrape/schedules/{index}")
-async def api_legacy_delete_schedule(index: int):
-    schedules = _get_schedules()
-    if 0 <= index < len(schedules):
-        removed = schedules.pop(index)
-        sf = removed.get("source_file", "")
-        if sf and os.path.isfile(sf):
-            os.remove(sf)
-        _save_schedules(schedules)
-    return {"ok": True, "schedules": schedules}
+# ==================== 旧 schedule API 已删除 ====================
+#
+# 这里曾有 4 条 `/api/auto-scrape/schedules*`（`api_legacy_*`），与上面那族
+# `/api/schedules*` **读写同一份** `_runtime_settings["auto_scrape_schedules"]`，
+# 只是按数组下标寻址而不是按 `id`：
+#
+#     GET    /api/auto-scrape/schedules          与 GET /api/schedules 逐字节相同
+#     POST   /api/auto-scrape/schedules          无文件=全库，但不收 name/interval
+#     PUT    /api/auto-scrape/schedules/{index}  只能改 enabled
+#     DELETE /api/auto-scrape/schedules/{index}
+#
+# 下标寻址本身就是个隐患：列表是共享可变状态，两个客户端之间删一条，另一边
+# 的下标就整体错位，PUT 会改到**别的**定时任务上。
+#
+# 全部删除，能力并进 `/api/schedules`：POST 的 `file` 改成可选，不传即全库模式
+# （原样保留旧端点唯一的独有能力），其余按 `id` 走既有的 PUT / DELETE。
 
 
 # ==================== Recon 侦查端点（锁竞争 / 阶段耗时）====================

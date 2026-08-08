@@ -293,14 +293,14 @@
       }
     },
     {
-      "name": "autoscrape_empty",
+      "name": "schedules_empty_again",
       "request": {
         "data": null,
         "files": null,
         "json": null,
         "method": "GET",
         "params": null,
-        "path": "/api/auto-scrape/schedules"
+        "path": "/api/schedules"
       },
       "response": {
         "body": {
@@ -327,9 +327,16 @@
               "Body_api_create_schedule_api_schedules_post": {
                 "properties": {
                   "file": {
-                    "contentMediaType": "application/octet-stream",
-                    "title": "File",
-                    "type": "string"
+                    "anyOf": [
+                      {
+                        "contentMediaType": "application/octet-stream",
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "File"
                   },
                   "interval_days": {
                     "default": 1,
@@ -352,7 +359,6 @@
                   }
                 },
                 "required": [
-                  "file",
                   "time"
                 ],
                 "title": "Body_api_create_schedule_api_schedules_post",
@@ -584,109 +590,6 @@
                   }
                 },
                 "summary": "Api Debug Lock Stats Reset"
-              }
-            },
-            "/api/auto-scrape/schedules": {
-              "get": {
-                "operationId": "api_legacy_list_schedules_api_auto_scrape_schedules_get",
-                "responses": {
-                  "200": {
-                    "content": {
-                      "application/json": {
-                        "schema": {}
-                      }
-                    },
-                    "description": "Successful Response"
-                  }
-                },
-                "summary": "Api Legacy List Schedules"
-              },
-              "post": {
-                "description": "旧式简单定时（无文件，使用全库 ASIN）",
-                "operationId": "api_legacy_add_schedule_api_auto_scrape_schedules_post",
-                "responses": {
-                  "200": {
-                    "content": {
-                      "application/json": {
-                        "schema": {}
-                      }
-                    },
-                    "description": "Successful Response"
-                  }
-                },
-                "summary": "Api Legacy Add Schedule"
-              }
-            },
-            "/api/auto-scrape/schedules/{index}": {
-              "delete": {
-                "operationId": "api_legacy_delete_schedule_api_auto_scrape_schedules__index__delete",
-                "parameters": [
-                  {
-                    "in": "path",
-                    "name": "index",
-                    "required": true,
-                    "schema": {
-                      "title": "Index",
-                      "type": "integer"
-                    }
-                  }
-                ],
-                "responses": {
-                  "200": {
-                    "content": {
-                      "application/json": {
-                        "schema": {}
-                      }
-                    },
-                    "description": "Successful Response"
-                  },
-                  "422": {
-                    "content": {
-                      "application/json": {
-                        "schema": {
-                          "$ref": "#/components/schemas/HTTPValidationError"
-                        }
-                      }
-                    },
-                    "description": "Validation Error"
-                  }
-                },
-                "summary": "Api Legacy Delete Schedule"
-              },
-              "put": {
-                "operationId": "api_legacy_toggle_schedule_api_auto_scrape_schedules__index__put",
-                "parameters": [
-                  {
-                    "in": "path",
-                    "name": "index",
-                    "required": true,
-                    "schema": {
-                      "title": "Index",
-                      "type": "integer"
-                    }
-                  }
-                ],
-                "responses": {
-                  "200": {
-                    "content": {
-                      "application/json": {
-                        "schema": {}
-                      }
-                    },
-                    "description": "Successful Response"
-                  },
-                  "422": {
-                    "content": {
-                      "application/json": {
-                        "schema": {
-                          "$ref": "#/components/schemas/HTTPValidationError"
-                        }
-                      }
-                    },
-                    "description": "Validation Error"
-                  }
-                },
-                "summary": "Api Legacy Toggle Schedule"
               }
             },
             "/api/batches": {
@@ -1518,7 +1421,7 @@
                 "summary": "Api List Schedules"
               },
               "post": {
-                "description": "创建定时采集任务",
+                "description": "创建定时采集任务。\n\n`file` 可选：\n  * **带文件** —— 定时采集文件里的那批 ASIN；\n  * **不带文件** —— 定时采集**全库** ASIN（`source_file` 存空串，\n    调度时现取 `db.get_all_asins()`）。\n\n不带文件这条路以前是另一个端点 `POST /api/auto-scrape/schedules`\n（`api_legacy_add_schedule`）。那个端点与本端点写的是同一份\n`_runtime_settings[\"auto_scrape_schedules\"]`，只是不收 `name` /\n`interval_days` / `needs_screenshot`，于是前端被迫先 POST 旧端点、\n再立刻 PUT 本端点把这几个字段补回去。现在合成一个，旧端点已删除。",
                 "operationId": "api_create_schedule_api_schedules_post",
                 "requestBody": {
                   "content": {
@@ -2112,6 +2015,45 @@
                   }
                 },
                 "summary": "Api Upload Sellers"
+              }
+            },
+            "/api/worker/download": {
+              "get": {
+                "description": "下载 Worker 安装包（`mode=full` 完整包 / `mode=update` 仅 .py 代码更新包）。\n\n`full` 含 `run_worker.py`、`worker/`、`common/`、`requirements.txt` 与\n自动生成的 `start.sh` / `start.bat` / `README.txt`，服务器地址已烘进\n启动脚本；`update` 只含 .py 文件，解压覆盖即可，不动虚拟环境。",
+                "operationId": "api_worker_download_api_worker_download_get",
+                "parameters": [
+                  {
+                    "in": "query",
+                    "name": "mode",
+                    "required": false,
+                    "schema": {
+                      "default": "full",
+                      "title": "Mode",
+                      "type": "string"
+                    }
+                  }
+                ],
+                "responses": {
+                  "200": {
+                    "content": {
+                      "application/json": {
+                        "schema": {}
+                      }
+                    },
+                    "description": "Successful Response"
+                  },
+                  "422": {
+                    "content": {
+                      "application/json": {
+                        "schema": {
+                          "$ref": "#/components/schemas/HTTPValidationError"
+                        }
+                      }
+                    },
+                    "description": "Validation Error"
+                  }
+                },
+                "summary": "Api Worker Download"
               }
             },
             "/api/worker/sync": {
@@ -5411,7 +5353,7 @@
           "__html__": {
             "has_jinja_error": false,
             "has_traceback": false,
-            "size_bucket": 40
+            "size_bucket": 41
           }
         },
         "content_type": "text/html",

@@ -218,6 +218,25 @@
         </div>
 
         <div class="card mt-3">
+            <div class="card-header"><i class="bi bi-shield-lock"></i> 管理员令牌</div>
+            <div class="card-body">
+                <small class="text-secondary d-block mb-2">
+                    服务端设置了环境变量 <code>ADMIN_TOKEN</code> 时，删批次、删结果、
+                    清空数据库、重启 worker 这类操作需要令牌。在这里填一次，之后本浏览器
+                    的所有请求都会自动带上（存为同源 <code>SameSite=Strict</code> cookie，
+                    不会发给第三方站点）。服务端没设 <code>ADMIN_TOKEN</code> 时留空即可。
+                </small>
+                <div class="input-group input-group-sm">
+                    <input type="password" class="form-control" id="adminTokenInput"
+                           placeholder="粘贴 ADMIN_TOKEN" autocomplete="off">
+                    <button class="btn btn-outline-accent" onclick="saveAdminToken()">保存</button>
+                    <button class="btn btn-outline-secondary" onclick="clearAdminToken()">清除</button>
+                </div>
+                <div id="adminTokenMsg" class="small mt-2"></div>
+            </div>
+        </div>
+
+        <div class="card mt-3">
             <div class="card-header"><i class="bi bi-terminal"></i> Worker 部署</div>
             <div class="card-body">
                 <a href="/api/worker/download" class="btn btn-accent w-100 mb-3">
@@ -439,6 +458,45 @@ function renderSchedules() {
     }).join('');
 }
 
+// ---------- 管理员令牌 ----------
+// 存成同源 cookie 而不是 localStorage：cookie 会被浏览器**自动**附带在同源
+// 请求上，所以五个模板里几十处 fetch 一个都不用改。SameSite=Strict 保证它
+// 不会跟着跨站请求走。
+const ADMIN_TOKEN_COOKIE = 'admin_token';
+
+function getCookie(name) {
+    const hit = document.cookie.split(';')
+        .map(s => s.trim())
+        .find(s => s.startsWith(name + '='));
+    return hit ? decodeURIComponent(hit.slice(name.length + 1)) : '';
+}
+
+function showAdminTokenMsg(kind, text) {
+    const el = document.getElementById('adminTokenMsg');
+    el.className = `small mt-2 text-${kind}`;
+    el.textContent = text;
+}
+
+function saveAdminToken() {
+    const val = document.getElementById('adminTokenInput').value.trim();
+    if (!val) { showAdminTokenMsg('danger', '令牌为空'); return; }
+    // 不设 Expires -> 会话 cookie，关掉浏览器即失效
+    document.cookie = `${ADMIN_TOKEN_COOKIE}=${encodeURIComponent(val)}; path=/; SameSite=Strict`;
+    document.getElementById('adminTokenInput').value = '';
+    showAdminTokenMsg('success', '已保存到本浏览器（关闭浏览器后失效）');
+}
+
+function clearAdminToken() {
+    document.cookie = `${ADMIN_TOKEN_COOKIE}=; path=/; Max-Age=0; SameSite=Strict`;
+    showAdminTokenMsg('secondary', '已清除');
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    if (getCookie(ADMIN_TOKEN_COOKIE)) {
+        showAdminTokenMsg('secondary', '本浏览器已存有令牌');
+    }
+});
+
 function showNewScheduleForm() {
     document.getElementById('scheduleNewForm').style.display = '';
 }
@@ -457,60 +515,36 @@ async function submitNewSchedule() {
 
     const timeStr = `${h}:${m}`;
 
-    if (fileInput.files.length > 0) {
-        // 有文件：用 multipart 调新 API
-        const fd = new FormData();
-        fd.append('name', name || `定时任务-${timeStr}`);
-        fd.append('time', timeStr);
-        fd.append('interval_days', interval);
-        fd.append('needs_screenshot', screenshot ? 'true' : 'false');
-        fd.append('file', fileInput.files[0]);
-        try {
-            const resp = await fetch('/api/schedules', { method: 'POST', body: fd });
-            const data = await resp.json();
-            if (resp.ok) {
-                _schedules = data.schedules;
-                renderSchedules();
-                hideNewScheduleForm();
-                showScheduleMsg('success', `已创建：${data.schedule.asin_count} 个 ASIN`);
-            } else {
-                showScheduleMsg('danger', data.detail || '创建失败');
-            }
-        } catch(e) {
-            showScheduleMsg('danger', '网络错误: ' + e.message);
+    // 有没有文件都走同一个端点：POST /api/schedules 的 file 是可选的，
+    // 不带文件即"全库 ASIN"模式。
+    //
+    // 这里以前是两条分支：无文件那条先 POST /api/auto-scrape/schedules
+    // （旧端点不收 name/interval_days），再立刻 PUT /api/schedules/{id} 把这两个
+    // 字段补回去 —— 两次请求之间定时任务是以错误的名字和间隔存在的，而且第二次
+    // 请求失败就没人管了。旧端点已删除，这里合并成一次请求。
+    const hasFile = fileInput.files.length > 0;
+    const fd = new FormData();
+    fd.append('name', name);          // 留空由后端按有无文件选默认名
+    fd.append('time', timeStr);
+    fd.append('interval_days', interval);
+    fd.append('needs_screenshot', screenshot ? 'true' : 'false');
+    if (hasFile) fd.append('file', fileInput.files[0]);
+
+    try {
+        const resp = await fetch('/api/schedules', { method: 'POST', body: fd });
+        const data = await resp.json();
+        if (resp.ok) {
+            _schedules = data.schedules;
+            renderSchedules();
+            hideNewScheduleForm();
+            showScheduleMsg('success', hasFile
+                ? `已创建：${data.schedule.asin_count} 个 ASIN`
+                : '已创建（全库 ASIN）');
+        } else {
+            showScheduleMsg('danger', data.detail || '创建失败');
         }
-    } else {
-        // 无文件：全库 ASIN 模式
-        try {
-            const resp = await fetch('/api/auto-scrape/schedules', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ time: timeStr }),
-            });
-            const data = await resp.json();
-            if (resp.ok) {
-                // 补充 interval_days 和 name
-                const schedules = data.schedules;
-                const last = schedules[schedules.length - 1];
-                if (last) {
-                    last.name = name || last.name;
-                    last.interval_days = parseInt(interval) || 1;
-                    // 用 PUT 更新
-                    await fetch(`/api/schedules/${last.id}`, {
-                        method: 'PUT',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ name: last.name, interval_days: last.interval_days }),
-                    });
-                }
-                await loadSchedules();
-                hideNewScheduleForm();
-                showScheduleMsg('success', '已创建（全库 ASIN）');
-            } else {
-                showScheduleMsg('danger', data.detail || '创建失败');
-            }
-        } catch(e) {
-            showScheduleMsg('danger', '网络错误: ' + e.message);
-        }
+    } catch(e) {
+        showScheduleMsg('danger', '网络错误: ' + e.message);
     }
 }
 

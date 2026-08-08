@@ -157,6 +157,21 @@ journalctl -u amazon-scraper -f
 
 后两者是 PostgreSQL-only：SQLite 部署下这些端点统一返回结构化 `503`（不是 404——404 容易被消费方误读成"暂无数据"，导致游标停滞）。
 
+### 鉴权
+
+**默认没有鉴权**——这套系统的默认假设是跑在内网。两个可选的令牌开关，都是 opt-in（不配就是原来的行为）：
+
+| 环境变量 | 保护范围 | 传令牌的方式 |
+|---|---|---|
+| `EXPORT_TOKEN` | `GET /api/export/incremental` | `X-Export-Token` 请求头。配 `EXPORT_REQUIRE_TOKEN=1` 可让"没配令牌"直接关闭该端点，而不是放行 |
+| `ADMIN_TOKEN` | 破坏性操作：`DELETE /api/database`（清空全库 + 全部截图）、删批次、`POST /api/batches/delete-bulk`、删结果、`POST /api/settings/reset`、worker 的删除/重启 | `X-Admin-Token` 请求头，**或**同源 cookie `admin_token`。控制台「设置」页有个输入框，填一次即写 cookie，之后网页上的操作自动带上 |
+
+两者都只在**配置了**对应变量时才校验；没配则放行，并在日志里持续告警（`ADMIN_TOKEN` 是进程内首次命中受保护端点时警告一次）。`ADMIN_TOKEN` 刻意只锁破坏性操作，不锁日常读写（上传批次、改设置、建定时任务）——全锁的结果通常是运维图省事把整个开关关掉。
+
+实现见 [`server/authz.py`](server/authz.py)。它是**纯 ASGI 中间件**而不是 FastAPI 依赖，因为 `/openapi.json` 是黄金基线里逐字节钉死的一步，`Depends(...)` 会把安全方案渲染进 schema。
+
+> ⚠ 如果这台服务器能从不受信网络访问，`ADMIN_TOKEN` 和 `EXPORT_TOKEN` 都应该配上。上面那张表里的"破坏性操作"在未配置时是**任何人发一个 HTTP 请求就能触发**的。
+
 ### 定时自动采集
 
 在 **系统设置** 页面的"定时自动采集"区域：
@@ -270,10 +285,18 @@ amazon-scraper-v4/
       retention.py          # 事件流保留期裁剪 + ack 机制
       OWNERSHIP.md          # 迁移期的文件归属/决策台账
   server/
-    app.py              # FastAPI 入口：生命周期、上传、批次管理、设置、定时任务、后台协程
+    app.py              # FastAPI 入口：生命周期、中间件、4 条后台协程、
+                        # callback 基础设施、以及被多方共用的私有助手
+                        #（_normalize_asin/_batch_name/_is_safe_callback_url…）
+                        # 路由本身已全部搬进 api/
+    authz.py            # 破坏性端点的可选 ADMIN_TOKEN 鉴权（纯 ASGI 中间件）
     api/                # 从 app.py 拆出的路由模块
       pages.py              # 5 个页面路由（仪表盘/任务/结果/Worker/设置）
+      batches.py            # 上传建批次 + 批次生命周期（状态/重试/删除/失败明细）
+      schedules.py          # 定时采集任务（增删改查 + 立即执行）
+      settings.py           # 运行时设置读写与恢复默认
       worker_queue.py       # Worker 拉任务 / 提交结果 / 提交截图
+      worker_package.py     # Worker 安装包下载（完整包 / 代码更新包）
       fleet.py              # Worker 注册、心跳、软重启、并发配额
       sellers.py            # 卖家店铺采集（发现 + 详情派生）
       results.py            # 结果查询/搜索/删除
@@ -294,8 +317,13 @@ amazon-scraper-v4/
     ziputil.py            # 邮编（不是压缩包）校验工具：判断配送控件里是否命中目标邮编
   tools/
     smoke_local.py        # 端到端冒烟测试（上传→拉取→提交→查询→契约校验），面向操作者
-    phase5_preflight.py   # PostgreSQL 迁移目标机体检（迁移期工具）
-    phase5_compare.py     # 新旧系统内容比对（迁移期工具）
+    phase5_preflight.py   # 环境体检：PG 连通性/建表/排序规则 + 路由顺序守卫
+                          # （名字带 phase5 是历史遗留，工具本身仍在用：
+                          #   check_route_order 是「增量导出端点必须排在
+                          #   /api/export/{batch_name} 之前」这条不变量的
+                          #   第二道守卫，见 server/api/export_incremental.py）
+    phase5_compare.py     # 两套系统同一批 ASIN 的采集内容比对
+                          # （tests/test_phase5_compare.py 等在用它的 classify/compare）
     desc_glue_check.py    # 单个解析 bug（<br> 不产生分隔符）的修复验证工具
   docs/
     erpapi_contract.md            # erpAPI 侧业务端点契约
