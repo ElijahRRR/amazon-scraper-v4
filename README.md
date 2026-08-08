@@ -1,6 +1,6 @@
 # Amazon Scraper v4
 
-高性能分布式 Amazon 商品数据采集系统。Server/Worker 分离架构，支持百万级 ASIN 采集、变动检测、定时任务、截图存证、webhook 回调通知、第三方卖家店铺采集；存储后端可在 SQLite（默认）与 PostgreSQL 之间切换，PostgreSQL 模式下额外提供面向下游 catalog_sync 的事件流与增量导出契约。
+高性能分布式 Amazon 商品数据采集系统。Server/Worker 分离架构，支持百万级 ASIN 采集、变动检测、定时任务、截图存证、webhook 回调通知、第三方卖家店铺采集；存储后端是 **PostgreSQL**，并提供面向下游 catalog_sync 的事件流与增量导出契约。
 
 ## 架构
 
@@ -9,32 +9,41 @@ Server (FastAPI)                          Worker (可部署多台)
   - Web 管理控制台（仪表盘/任务/结果/           - curl_cffi TLS 指纹模拟
     Worker 监控/设置，5 个页面）               - AIMD 自适应并发控制
   - 任务分发 & 结果收集                        - 每采集协程独立 Session（冷轮换，
-  - 存储后端可选（DB_BACKEND）：                  无全局热备）
-      sqlite（默认，WAL + FTS5 trigram）       - 双解析引擎：selectolax 优先，
-      postgres（asyncpg，opt-in）               lxml 为进程级回退
+  - 存储：PostgreSQL（asyncpg，                   无全局热备）
+      pg_trgm GIN 索引）                       - 双解析引擎：selectolax 优先，
+                                                lxml 为进程级回退
   - 定时任务调度                               - Playwright 截图（可选）
   - 全局并发配额协调                           - lease_epoch 防重复提交
   - Webhook 完成回调（SSRF 防御）              - variant_offset 检测
   - 卖家店铺采集（发现 ASIN → 详情采集）        - 多属性变体提取（twister）
                                               - 邮编校验 + 配送降级页重试
 
-仅 PostgreSQL 后端可用：
+下游数据出口（PostgreSQL 后端提供）：
   - catalog_sync 事件流：写入 outbox → 单例 relay → 按 seq 分区的事件表
   - 三条对外契约：/api/export/*（UI 导出）、/api/export/incremental（下游增量导出）、
     /api/v1/sync/*（下游运维/对账：游标拉取、状态、计数、ack、保留期）
 ```
 
-SQLite 与 PostgreSQL 两套存储层由同一份公开方法签名驱动（`common/pgdb/` 对 `common/database.py` 做了逐方法契约比对），已用字节级 HTTP 行为基线（`tests/golden/`）与近 700 条 pytest 交叉验证过等价性，但**生产环境目前仍运行在 SQLite 上**——PostgreSQL 是已就绪、可选启用的后端，尚未完成生产切换。除非你需要 catalog_sync 事件流，否则不需要碰任何 PostgreSQL 相关配置。
+### 关于存储后端
+
+**PostgreSQL 是正式后端**，`DB_BACKEND` 不配时就是它。迁移已完成。
+
+仓库里还留着一条 SQLite 实现（`common/database.py`），**仅作为切换后的回滚兜底**，
+不是新部署的选项。两套存储层由同一份公开方法签名驱动（`common/pgdb/` 对
+`common/database.py` 做逐方法契约比对），等价性由字节级 HTTP 行为基线
+（`tests/golden/`，同一份基线两个后端都要过）与 800 条 pytest 交叉验证。
+等生产稳定后这条路径会整条删除，届时那批以 SQLite 为参照的等价性用例一并退役。
 
 ## 快速开始
 
 ### 1. 环境要求
 
-- Python 3.10+（若要启用 PostgreSQL 后端，本地开发建议锁定 Python 3.12——3.13/3.14 上 `curl_cffi`/`lxml`/`selectolax`/`asyncpg` 常没有预编译 wheel，会掉进源码编译）
+- Python 3.10+（本地开发建议锁定 Python 3.12——3.13/3.14 上 `curl_cffi`/`lxml`/`selectolax`/`asyncpg` 常没有预编译 wheel，会掉进源码编译）
+- PostgreSQL 16+，**建库时必须带 `LC_COLLATE=C LC_CTYPE=C`**（见下）
 - TPS 代理（帐密认证，每次请求自动换 IP）
-- 服务器最低 1C / 2GB / 20GB SSD（SQLite 模式；PostgreSQL 模式需要单独部署一个 PG 实例）
+- 服务器最低 1C / 2GB / 20GB SSD，外加一个 PostgreSQL 实例（可同机）
 
-### 2. Server 部署（SQLite，默认，多数场景选这个）
+### 2. Server 部署
 
 ```bash
 git clone https://github.com/ElijahRRR/amazon-scraper-v4.git
@@ -42,14 +51,25 @@ cd amazon-scraper-v4
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 
-# 配置代理等
+# 建库：LC_COLLATE=C 不是可选项 —— PG 的默认排序规则会让分页/搜索/导出
+# 的顺序与预期不一致，而且是建库时定死的，事后只能重建库
+createdb -T template0 --lc-collate=C --lc-ctype=C -E UTF8 scraper
+
+# 配置
 cp .env.example .env
-# 至少填一下 PROXY_URL；DB_BACKEND 留空/sqlite 即走默认后端，其余变量都可不填
+# 至少填 PG_DSN 与 PROXY_URL；DB_BACKEND 留空即走 PostgreSQL
 
 python3 run_server.py
 ```
 
-Server 默认监听 `0.0.0.0:8899`，浏览器访问 `http://<IP>:8899`。首次启动自动建表 + FTS5 全文索引 + 完成数据库迁移（`ALTER TABLE` 幂等，重复启动无副作用）。
+首次启动前建议先跑一遍环境体检，它会实测 PG 连通性、建表、分区、排序规则、
+磁盘与依赖，比直接起服务看日志报错快得多：
+
+```bash
+python tools/preflight.py
+```
+
+Server 默认监听 `0.0.0.0:8899`，浏览器访问 `http://<IP>:8899`。首次启动自动建 `public` 与 `scraper` 两个 schema 的表、`pg_trgm` GIN 索引、事件流分区，并完成幂等的结构迁移（重复启动无副作用）。
 
 ### 3. Worker 启动
 
@@ -91,17 +111,15 @@ journalctl -u amazon-scraper -f
 
 **目前的局限**（如实说明，按需自行调整）：
 - 这个脚本只打包 Server（`rsync` 时显式排除了 `worker/`），Worker 需要自己在目标机器上单独 clone + 建 venv + 跑 `run_worker.py`，仓库里没有配套的 worker 部署脚本。
-- 只装 `requirements.txt`，不装 `requirements-dev.txt`，所以这条部署路径目前只覆盖 SQLite 后端；要用 PostgreSQL 后端得自己补 `pip install asyncpg` 并在 `.env` 里配好 `DB_BACKEND=postgres` / `PG_DSN`。
+- 脚本自己不建库、不装 PostgreSQL：`PG_DSN` 指向的库要提前建好（记得 `LC_COLLATE=C`）。
 
-### 5. 本地开发 / 可选启用 PostgreSQL 后端
+### 5. 本地开发环境
 
-不需要 PostgreSQL 的话跳过这一节——`python3 run_server.py` 默认就是完整可用的 SQLite 部署。
-
-要在本机（含 macOS）搭一套带 PostgreSQL 后端 + catalog_sync 事件流的开发环境，完整步骤见 [`docs/local_macos_setup.md`](docs/local_macos_setup.md)：装 PostgreSQL 16、**建库时必须带 `LC_COLLATE=C LC_CTYPE=C`**（PG 默认排序规则和 SQLite 的 `BINARY` 不同，会导致分页/搜索/导出顺序对不上）、Python 3.12 虚拟环境、`pip install -r requirements-dev.txt`、设好 `DB_BACKEND=postgres` / `PG_DSN` / `SCRAPER_INSTANCE_ID` 等环境变量、跑一遍 `tools/phase5_preflight.py` 体检、两个后端各跑一遍 golden 基线和 pytest。
+在本机（含 macOS）搭开发环境的完整步骤见 [`docs/local_macos_setup.md`](docs/local_macos_setup.md)：装 PostgreSQL 16、**建库时必须带 `LC_COLLATE=C LC_CTYPE=C`**（PG 的默认排序规则会导致分页/搜索/导出顺序与预期不一致，且建库时定死、事后只能重建库）、Python 3.12 虚拟环境、`pip install -r requirements-dev.txt`、设好 `PG_DSN` / `SCRAPER_INSTANCE_ID`、跑一遍 `tools/preflight.py` 体检，然后 golden 基线与 pytest 各跑一遍。
 
 > 该文档开头有一步"先 `git checkout` 到某迁移分支"已经过时——相关代码目前都已经在 `main` 分支上，不需要切分支。
 
-`requirements.txt` 只含 SQLite 运行所需依赖（`aiosqlite`，不含任何 Postgres 驱动）；`requirements-dev.txt` 在此基础上加了 `asyncpg`（PostgreSQL 驱动）、`pytest`/`pytest-asyncio`/`httpx`（测试），以及显式重复声明的 `selectolax`/`lxml`/`dateparser`（这三个其实已经在 `requirements.txt` 里，重复声明是因为真的出过"venv 没装全导致解析器回归测试大批量静默 skip、变异测试全部放行"的事故，见该文件内注释）。
+`requirements.txt` 是运行所需（含 `asyncpg`；`aiosqlite` 只服务 SQLite 回滚兜底那条路径）；`requirements-dev.txt` 在此基础上加了 `pytest`/`pytest-asyncio`/`httpx`（测试），以及显式重复声明的 `selectolax`/`lxml`/`dateparser`（这三个其实已经在 `requirements.txt` 里，重复声明是因为真的出过"venv 没装全导致解析器回归测试大批量静默 skip、变异测试全部放行"的事故，见该文件内注释）。
 
 ## 功能说明
 
@@ -138,7 +156,7 @@ journalctl -u amazon-scraper -f
 - **批次筛选**：下拉选择特定批次
 - **变动筛选**：全部 / 价格库存变动 / 标题描述变动 / 新增 ASIN
 - **搜索**：支持 ASIN、标题、品牌模糊搜索，多个关键词用换行或逗号分隔
-  - SQLite 后端走 FTS5 trigram 索引，PostgreSQL 后端走 `pg_trgm` GIN 索引，百万级数据下都是 5-50ms 量级（比 LIKE 全表扫快 ~1000 倍）
+  - 走 `pg_trgm` GIN 表达式索引，百万级数据下 5-50ms 量级（比 LIKE 全表扫快 ~1000 倍）
   - 短查询（<3 字符）自动 fallback 到 LIKE 路径保证正确性
 - **分页**：keyset cursor 分页，单页上限 1000（近期从 200 上调）
 - **选中删除**：勾选行 checkbox，点击"删除选中"（同时删除关联截图文件）
@@ -155,7 +173,54 @@ journalctl -u amazon-scraper -f
 2. **增量导出契约**（`server/api/export_incremental.py`，`GET /api/export/incremental`，**仅 PostgreSQL 后端**）：面向下游 catalog_sync（沃尔玛侧）的固定契约 v1，cursor+limit 分页，可选 `X-Export-Token` 请求头鉴权（`EXPORT_TOKEN`/`EXPORT_REQUIRE_TOKEN` 控制是否强制）。完整字段定义与不变量见 [`docs/incremental_export_contract.md`](docs/incremental_export_contract.md)。
 3. **同步运维 API**（`server/api/sync.py`，`/api/v1/sync/*`，**仅 PostgreSQL 后端**）：读的是同一份事件流，但给的是内部原始事件形状 + 运维可观测性（relay 延迟、outbox 深度、保留期水位、`ack` 游标、强制裁剪通知）。完整契约见 [`docs/sync_contract.md`](docs/sync_contract.md)；面向 erpAPI 侧的业务端点（上传/状态/结果/失败明细）契约见 [`docs/erpapi_contract.md`](docs/erpapi_contract.md)。
 
-后两者是 PostgreSQL-only：SQLite 部署下这些端点统一返回结构化 `503`（不是 404——404 容易被消费方误读成"暂无数据"，导致游标停滞）。
+后两者依赖事件流，只有 PostgreSQL 后端提供；万一跑在 SQLite 回滚路径上，它们统一返回结构化 `503`（不是 404——404 容易被消费方误读成"暂无数据"，导致游标停滞）。
+
+### 首次部署 PostgreSQL 后端的验证清单
+
+新机器上把 PG 后端跑起来之后，按顺序验这几步，每一步不过就别往下走：
+
+```bash
+# 1. 环境体检（实测，不是读配置：PG 版本/扩展/编码、asyncpg 能否连、
+#    DDL 能否建、分区能否创、磁盘、依赖）
+python tools/preflight.py
+
+# 2. 起服务
+DB_BACKEND=postgres PG_DSN=postgresql://... python run_server.py
+
+# 3. 事件流活着：relay_state 应为 running，outbox_depth 不应单调增长
+curl -s localhost:8899/api/_debug/event-stream
+
+# 4. 对账：counts 与直查一致
+curl -s "localhost:8899/api/v1/sync/counts?from_seq=0&to_seq=100000000"
+psql -c "SELECT count(*) FROM scraper.scrape_events"
+
+# 5. 契约端到端：分页拉到底
+curl -s -H "X-Export-Token: $EXPORT_TOKEN" \
+     "localhost:8899/api/export/incremental?cursor=0&limit=500"
+```
+
+第 5 步要核对的不变量（完整定义见 [`docs/incremental_export_contract.md`](docs/incremental_export_contract.md)）：
+
+- `source_id` 全局唯一（拉完全量后 `sort | uniq -d` 应为空）
+- `cursor` 严格升序，`next_cursor` 等于最后一条的 cursor
+- 空页返回 **200** 且 `next_cursor` **不推进**（不是 404）
+- `scraped_at` 形如 `2026-08-05T10:00:00Z`（精确到秒、带 Z）
+- `outcome != 'ok'` 的记录 `slow`/`fast` 基本为空——这类只进 snapshots
+
+### 鉴权
+
+**默认没有鉴权**——这套系统的默认假设是跑在内网。两个可选的令牌开关，都是 opt-in（不配就是原来的行为）：
+
+| 环境变量 | 保护范围 | 传令牌的方式 |
+|---|---|---|
+| `EXPORT_TOKEN` | `GET /api/export/incremental` | `X-Export-Token` 请求头。配 `EXPORT_REQUIRE_TOKEN=1` 可让"没配令牌"直接关闭该端点，而不是放行 |
+| `ADMIN_TOKEN` | 破坏性操作：`DELETE /api/database`（清空全库 + 全部截图）、删批次、`POST /api/batches/delete-bulk`、删结果、`POST /api/settings/reset`、worker 的删除/重启 | `X-Admin-Token` 请求头，**或**同源 cookie `admin_token`。控制台「设置」页有个输入框，填一次即写 cookie，之后网页上的操作自动带上 |
+
+两者都只在**配置了**对应变量时才校验；没配则放行，并在日志里持续告警（`ADMIN_TOKEN` 是进程内首次命中受保护端点时警告一次）。`ADMIN_TOKEN` 刻意只锁破坏性操作，不锁日常读写（上传批次、改设置、建定时任务）——全锁的结果通常是运维图省事把整个开关关掉。
+
+实现见 [`server/authz.py`](server/authz.py)。它是**纯 ASGI 中间件**而不是 FastAPI 依赖，因为 `/openapi.json` 是黄金基线里逐字节钉死的一步，`Depends(...)` 会把安全方案渲染进 schema。
+
+> ⚠ 如果这台服务器能从不受信网络访问，`ADMIN_TOKEN` 和 `EXPORT_TOKEN` 都应该配上。上面那张表里的"破坏性操作"在未配置时是**任何人发一个 HTTP 请求就能触发**的。
 
 ### 定时自动采集
 
@@ -248,8 +313,8 @@ journalctl -u amazon-scraper -f
 amazon-scraper-v4/
   common/
     config.py          # 共享配置（含 DB_BACKEND 开关、各类阈值）
-    dbfactory.py        # 存储后端开关：按 DB_BACKEND 惰性 import sqlite/postgres 实现
-    database.py          # SQLite 实现（WAL + FTS5 + lease_epoch + 重试机制），PG 迁移未改动它一个字节
+    dbfactory.py        # 存储后端开关：默认 postgres，按 DB_BACKEND 惰性 import
+    database.py          # SQLite 实现（WAL + FTS5），**仅回滚兜底**，待生产稳定后整条删除
     models.py            # 数据类定义（AsinData / Batch / 可导出字段集合）
     slowhash.py          # 变更检测哈希（review_hash/slow_hash），纯 stdlib、零 common.* 依赖
     core/                # 真源工具层：SQLite 与 PostgreSQL 两个后端共用的纯逻辑
@@ -270,10 +335,18 @@ amazon-scraper-v4/
       retention.py          # 事件流保留期裁剪 + ack 机制
       OWNERSHIP.md          # 迁移期的文件归属/决策台账
   server/
-    app.py              # FastAPI 入口：生命周期、上传、批次管理、设置、定时任务、后台协程
+    app.py              # FastAPI 入口：生命周期、中间件、4 条后台协程、
+                        # callback 基础设施、以及被多方共用的私有助手
+                        #（_normalize_asin/_batch_name/_is_safe_callback_url…）
+                        # 路由本身已全部搬进 api/
+    authz.py            # 破坏性端点的可选 ADMIN_TOKEN 鉴权（纯 ASGI 中间件）
     api/                # 从 app.py 拆出的路由模块
       pages.py              # 5 个页面路由（仪表盘/任务/结果/Worker/设置）
+      batches.py            # 上传建批次 + 批次生命周期（状态/重试/删除/失败明细）
+      schedules.py          # 定时采集任务（增删改查 + 立即执行）
+      settings.py           # 运行时设置读写与恢复默认
       worker_queue.py       # Worker 拉任务 / 提交结果 / 提交截图
+      worker_package.py     # Worker 安装包下载（完整包 / 代码更新包）
       fleet.py              # Worker 注册、心跳、软重启、并发配额
       sellers.py            # 卖家店铺采集（发现 + 详情派生）
       results.py            # 结果查询/搜索/删除
@@ -294,26 +367,26 @@ amazon-scraper-v4/
     ziputil.py            # 邮编（不是压缩包）校验工具：判断配送控件里是否命中目标邮编
   tools/
     smoke_local.py        # 端到端冒烟测试（上传→拉取→提交→查询→契约校验），面向操作者
-    phase5_preflight.py   # PostgreSQL 迁移目标机体检（迁移期工具）
-    phase5_compare.py     # 新旧系统内容比对（迁移期工具）
+    preflight.py          # 上机环境体检：PG 连通性/建表/排序规则/磁盘/依赖，
+                          # 外加路由顺序一项（判定逻辑来自 server/routing.py，
+                          # 不是第二份实现）
     desc_glue_check.py    # 单个解析 bug（<br> 不产生分隔符）的修复验证工具
   docs/
     erpapi_contract.md            # erpAPI 侧业务端点契约
     incremental_export_contract.md # 增量导出契约 v1
     sync_contract.md               # /api/v1/sync/* 运维契约
     local_macos_setup.md           # 本机 macOS 开发环境搭建（含 PostgreSQL 后端）
-    phase5_runbook.md              # PostgreSQL 生产切换运行手册
   tests/
     test_*.py            # 单元/集成测试（解析质量、批次/结果 API、错误码、golden 相关守卫等）
     pgdb/                 # PostgreSQL 存储层测试
-    golden/                # 字节级 HTTP 行为回归基线（SQLite 迁移到 PostgreSQL 时用于防回归）
+    golden/                # 字节级 HTTP 行为回归基线（同一份基线两个后端都要过）
   data/
-    scraper.db            # SQLite 数据库文件（默认后端）
+    scraper.db            # SQLite 数据库文件（仅 DB_BACKEND=sqlite 回滚路径会用到）
     scraper.db-wal/-shm    # WAL 日志 + 共享内存
     exports/                # 导出文件 + 临时文件（自动清理）
     schedules/              # 定时任务 ASIN 文件
   deploy/
-    setup.sh              # Server 部署脚本（SQLite 后端，不含 worker）
+    setup.sh              # Server 部署脚本（不含 worker，也不建库）
     server.service         # systemd 服务配置
   run_server.py          # Server 启动入口
   run_worker.py          # Worker 启动入口
@@ -322,16 +395,15 @@ amazon-scraper-v4/
 
 ## 数据库
 
-存储后端由 `DB_BACKEND` 环境变量选择（`common/dbfactory.py`），未设置时为 `sqlite`；两个后端对外暴露的方法签名一一对应，行为等价性由 `tests/golden/` 的 64 步字节级基线 + 两个后端各约 700 条 pytest 用例持续验证。
+正式后端是 **PostgreSQL**（`DB_BACKEND` 未设置时即走它，见 `common/dbfactory.py`）。仓库里还保留一条 SQLite 实现作为回滚兜底；两个后端对外暴露的方法签名一一对应，行为等价性由 `tests/golden/` 的字节级基线（同一份基线两个后端都要过）+ 800 条 pytest 用例持续验证。
 
-### SQLite（默认后端）
+### `public` schema —— 业务表
 
 | 表 | 说明 |
 |---|---|
 | `batches` | 批次元数据 + callback 状态 + external_id |
 | `batch_asins` | 批次-ASIN 多对多映射 |
 | `asin_data` | ASIN 数据（UNIQUE，覆盖更新） |
-| `asin_data_fts` | FTS5 trigram 全文索引（external content） |
 | `asin_changes` | 变动检测历史（价格/库存/标题/新增） |
 | `tasks` | 采集任务队列（含 `lease_epoch` + `auto_retry_count` + 卖家发现任务的 `task_type`/`task_meta`） |
 | `screenshots` | 截图追踪 |
@@ -339,15 +411,13 @@ amazon-scraper-v4/
 
 `asin_data` 包含字段：ASIN / 标题 / 品牌 / 价格 / 库存 / 评分 / 评论数 / 卖家店铺 ID / 卖家名 / 父 ASIN / 变体属性 / 类目 / 尺寸 / 重量 / 制造商 / 排名 / ...
 
-**写连接 / 只读连接池物理隔离**：写连接只服务 worker 热路径（`pull_tasks`/`accept_results_batch`），仪表盘/导出/聚合查询走独立的只读连接池（默认 3 条，各自 `PRAGMA query_only=ON` + 私有 16MB cache），避免管理后台的重读把 worker 的写操作堵在锁上。
+**搜索索引**：`pg_trgm` GIN 表达式索引，三条 —— `idx_asin_data_asin_trgm` / `idx_asin_data_title_trgm` / `idx_asin_data_brand_trgm`。
 
-**关键 PRAGMA**：`journal_mode=WAL`、`synchronous=NORMAL`、`cache_size=-65536`（64MB）、`mmap_size=268435456`（256MB）、`temp_store=MEMORY`、`journal_size_limit=67108864`（64MB）。`PRAGMA optimize` 不在启动时同步跑（大库上会阻塞启动），改为监听端口后异步执行；后台每 120s 做一次 `wal_checkpoint(TRUNCATE)`。
+> ⚠ **建库必须 `LC_COLLATE=C LC_CTYPE=C`**。PG 的默认排序规则与代码里假定的字节序不同，会让分页游标、搜索结果、导出顺序都对不上；而排序规则是**建库时定死**的，事后只能重建库。
 
-### PostgreSQL（可选后端，`DB_BACKEND=postgres`）
+**写连接 / 只读连接池物理隔离**：写路径是**一条专用连接**（事务粘在连接上，见 `common/pgdb/pool.py` 的 D-2），只服务 worker 热路径（`pull_tasks`/`accept_results_batch`）；仪表盘/导出/聚合查询走独立的只读连接池（`PG_POOL_MIN`/`PG_POOL_MAX`，默认 2-10），避免管理后台的重读把 worker 的写堵住。
 
-`public` schema 里是与 SQLite 对应的同名表（`batches`/`batch_asins`/`asin_data`/`asin_changes`/`tasks`/`screenshots`/`seller_discoveries`），搜索用 `pg_trgm` GIN 表达式索引替代 FTS5。
-
-`scraper` schema 额外承载 catalog_sync 事件流：
+### `scraper` schema —— catalog_sync 事件流
 
 | 表 | 说明 |
 |---|---|
@@ -360,7 +430,7 @@ amazon-scraper-v4/
 
 **保留期（retention）**：只整分区 `DROP`，从最老分区往后推，遇到第一个不能删的分区就停手（不会在分区中间留洞）。可删除下界 = `max(硬下限, min(时间下限, ack 水位 − slack))`——`ack_seq` 是下游通过 `POST /api/v1/sync/ack` 确认的、已经落盘的最高 `seq`。磁盘紧张时硬下限可以越过 `ack` 强制裁剪未确认数据，这种情况会记进 `sync_meta` 的 `forced_prune_log`（持久闩锁），下游需要显式 `POST /ack-prune` 才能清掉这条记录——这条设计是为了不让"磁盘紧张时的数据丢失"被悄悄吞掉。
 
-**当前状态**：存储层与事件流已经过真机验证（含真实代理/真实 Amazon 页面采集、新旧系统同批 ASIN 内容比对），但生产切换尚未执行——目前仍是 SQLite 提供生产服务。
+**当前状态**：迁移已完成，PostgreSQL 提供生产服务。SQLite 那条路径仅作为回滚兜底保留，待生产稳定后整条删除。
 
 ## 核心机制
 
@@ -502,7 +572,7 @@ WAL 模式天然支持「多读 + 单写」并发，故把重读全部移到独�
 
 **覆盖索引** `idx_tasks(batch_id, status)`：`get_batches` 的「按 batch 统计各 status」走 index-only，不再为百万行逐行回表读 status。
 
-**FTS5 全文搜索**：`asin_data_fts` 虚拟表（trigram tokenizer + external content + detail=none），配套 3 个触发器（AI/AD/AU）自动同步主表变化；搜索查询走 `UNION` 形态让每个 LIKE 都命中 trigram L1 索引；短查询（<3 字符）fallback 到主表 LIKE。实测：原 LIKE 全表扫描 46 秒 → FTS UNION 5-50 毫秒（~1000× 加速）。
+**trigram 全文搜索**：`asin`/`title`/`brand` 三条 `pg_trgm` GIN 表达式索引；短查询（<3 字符）trigram 无法命中，fallback 到 LIKE 路径保证正确性。量级：全表扫 46 秒 → 5-50 毫秒（~1000× 加速；该数字来自 SQLite 侧 FTS5 时代的实测，PG 侧同量级但未逐条复测）。
 
 ### 心跳感知任务回收
 
@@ -614,7 +684,7 @@ pytest tests/ -q                              # 默认 SQLite 后端
 DB_BACKEND=postgres pytest tests/ -q          # PostgreSQL 后端（含 tests/pgdb/ 全量）
 ```
 
-- **`tests/golden/`**：字节级 HTTP 行为回归基线（`tests/golden/samples/sqlite_baseline.json`，64 步覆盖上传/拉任务/提交/分页/搜索/导出/删除等完整生命周期），用于保证存储层重写（SQLite ↔ PostgreSQL）不改变对外可观察行为。用法见 [`tests/golden/README.md`](tests/golden/README.md)：`python -m tests.golden.run {selfcheck|record|verify}`。
+- **`tests/golden/`**：字节级 HTTP 行为回归基线（`tests/golden/samples/baseline.json`，64 步覆盖上传/拉任务/提交/分页/搜索/导出/删除等完整生命周期），用于保证存储层重写（SQLite ↔ PostgreSQL）不改变对外可观察行为。用法见 [`tests/golden/README.md`](tests/golden/README.md)：`python -m tests.golden.run {selfcheck|record|verify}`。
 - **`tests/pgdb/`**：PostgreSQL 存储层专项测试（批次/任务/结果读写、并发、保留期、relay/事件流接线等）。
 - 其余测试覆盖解析质量、批次名冲突语义、搜索转义、游标分页活性、错误码闭集、卖家 API 等具体行为契约。
 - `tools/smoke_local.py` 是一个不依赖真实代理/Amazon 的端到端冒烟脚本（上传 → 拉任务 → 提交结果 → 查询 → 事件流契约校验），适合部署后快速验证：`python3 tools/smoke_local.py`。
@@ -634,7 +704,7 @@ DB_BACKEND=postgres pytest tests/ -q          # PostgreSQL 后端（含 tests/pg
 | `/api/results` 搜索（10 万行）| 5-50 ms |
 | `/api/batches` 仪表盘加载 | 35-100 ms |
 | 数据库主表 | ~1.8 GB / 29 万 ASIN（VACUUM 后）|
-| FTS5 索引开销 | ~90 MB / 29 万 ASIN |
+| 搜索索引开销 | ~90 MB / 29 万 ASIN（SQLite FTS5 时代实测）|
 
 **读写解耦前后**（导出风暴下：3 路全量 CSV 导出 + 仪表盘轮询并发打）：
 

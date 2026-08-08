@@ -97,7 +97,9 @@ def run(rec: Recorder) -> None:
     rec.call("coordinator_empty", "GET", "/api/coordinator", expect=200)
     rec.call("workers_empty", "GET", "/api/workers", expect=200)
     rec.call("schedules_empty", "GET", "/api/schedules", expect=200)
-    rec.call("autoscrape_empty", "GET", "/api/auto-scrape/schedules", expect=200)
+    # 旧的 /api/auto-scrape/schedules 已删除（与 /api/schedules 读写同一份状态、
+    # 只是按下标寻址），这一步改钉合并后的唯一入口。
+    rec.call("schedules_empty_again", "GET", "/api/schedules", expect=200)
     rec.call("openapi_schema", "GET", "/openapi.json", expect=200)
 
     # ---------------- 上传批次 A（xlsx，含 per-ASIN 邮编列） ----------------

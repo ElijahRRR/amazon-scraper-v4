@@ -1,5 +1,5 @@
 """
-Amazon ASIN 采集系统 v3 - 数据库模块
+Amazon ASIN 采集系统 v4 - 数据库模块
 重新设计的 Schema，针对百万级 ASIN 优化：
 - keyset 分页替代 OFFSET
 - batch_asins 直接 JOIN 替代 EXISTS 子查询

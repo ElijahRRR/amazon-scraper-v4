@@ -1,5 +1,5 @@
 """
-Amazon ASIN 采集系统 v3 - 代理管理模块
+Amazon ASIN 采集系统 v4 - 代理管理模块
 
 TPS 模式（每次请求换 IP）：
 - 固定代理地址（帐密认证），如 http://user:pwd@host:port

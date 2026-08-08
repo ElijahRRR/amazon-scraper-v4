@@ -26,27 +26,13 @@ except ImportError:  # pragma: no cover
 TOKEN = "test-export-token-12345"
 
 
-def _flatten_routes(routes):
-    """把 ``app.routes`` 展平成与 Starlette 匹配顺序一致的扁平列表。
-
-    FastAPI ≥ 0.141 的 ``include_router`` 不再把子路由摊平进父容器，而是插入
-    一个惰性的 ``_IncludedRouter`` 包装对象（``path`` 是 ``None``、
-    ``original_router`` 指向被包含的那个 ``APIRouter``）。Phase 3.7 之后
-    ``/api/export/incremental`` 与 ``/api/export/{batch_name}`` **两条都在
-    包装对象里面**（前者还多套一层：app → export.router → _incr.router），
-    只扫顶层一定两个都找不到 —— 而"找不到"必须是红，不能是绿。
-
-    包含是递归的，展开也必须是递归的；展开顺序就是注册顺序，也就是
-    Starlette 的匹配顺序。
-    """
-    flat = []
-    for r in routes:
-        sub = getattr(r, "original_router", None)
-        if sub is not None:
-            flat.extend(_flatten_routes(sub.routes))
-        else:
-            flat.append(r)
-    return flat
+# 展平逻辑的**唯一真源**在 server/routing.py。
+#
+# 这里以前是一份私有副本，tools/preflight.py 里还有第二份 —— 两份
+# 逻辑相同、注释各写各的，守的却是同一条承重不变量。副本会独立腐坏：
+# .agent/ARCH_PLAN.md 当年就记着「第二份副本今天是坏的」（catch 为 None
+# 时落到 else 报绿）。现在两边都 import 同一份。
+from server.routing import flatten_routes as _flatten_routes  # noqa: E402
 
 
 class RouteOrderTests(unittest.TestCase):

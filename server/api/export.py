@@ -36,7 +36,7 @@
        下一次 FastAPI 版本变化绕过，行为断言不会；
      * 源码断言（本文件里 `include_router(_incr.router)` 必须出现在第一个
        `@router.get` 之前）。
-   第二份副本在 `tools/phase5_preflight.py:check_route_order`。
+   第二份副本在 `tools/preflight.py:check_route_order`。
 
 2. **模块级可变全局一个都不搬。** `db` / `logger` 留在 `server/app.py`，
    这里一律 `_srv().xxx`，**禁止 from-import**（PG 夹具

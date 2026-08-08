@@ -1,5 +1,5 @@
 """
-Amazon ASIN 采集系统 v3 - 页面解析模块
+Amazon ASIN 采集系统 v4 - 页面解析模块
 v3 增强：
 - 多层 fallback 解析路径（JSON-LD → CSS → JS脚本数据 → meta/hidden）
 - 非标准页面兼容性提升

@@ -41,7 +41,7 @@
        而且 `_IncludedRouter` 没有 `.routes`，要走 `original_router.routes`）
      * 行为：`::test_endpoint_is_reachable_not_swallowed`（真打一次，响应体不含「批次不存在」）
      * 源码：`::test_export_module_includes_incremental_before_first_route`
-     * 上机：`tools/phase5_preflight.py` 的「路由顺序」一项
+     * 上机：`tools/preflight.py` 的「路由顺序」一项
 
 2. **鉴权：`X-Export-Token` 请求头，契约 v1 定为可选。**
    配了 `EXPORT_TOKEN` 就强制校验（`hmac.compare_digest`，不匹配即 401）；

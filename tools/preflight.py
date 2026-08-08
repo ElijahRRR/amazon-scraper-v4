@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Phase 5 上机前置检查：在**目标机器**上跑，确认环境真的能跑新系统。
+"""上机环境体检：在**目标机器**上跑，确认这台机器真的能跑起来。
 
-    python tools/phase5_preflight.py                 # 全套
-    python tools/phase5_preflight.py --skip-slow     # 跳过建库/建表那几项
+    python tools/preflight.py                 # 全套
+    python tools/preflight.py --skip-slow     # 跳过建库/建表那几项
 
-每一项都是**实测**，不是读配置。写这个工具的原因很直接：整条迁移的所有验证
-都在沙箱里完成，从没碰过真机——PostgreSQL 的版本/扩展/编码、asyncpg 能不能连、
-DDL 能不能建、分区能不能创、磁盘够不够，全是推断。上机第一件事应该是把这些
-推断变成实测，而不是直接起服务然后看日志报错。
+每一项都是**实测**，不是读配置：PostgreSQL 的版本/扩展/编码、asyncpg 能不能连、
+DDL 能不能建、分区能不能创、磁盘够不够、依赖装没装齐。部署第一件事应该是把这些
+假设变成实测，而不是直接起服务然后看日志报错。
 
 退出码：0 全过；1 有硬失败；2 只有警告。
 """
@@ -16,7 +15,6 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
-import subprocess
 import sys
 from typing import List, Tuple
 
@@ -40,11 +38,11 @@ def check_python():
 
 def check_imports():
     need = {
-        "asyncpg": "PG 驱动，DB_BACKEND=postgres 必需",
+        "asyncpg": "PG 驱动 —— 正式后端，必需",
         "fastapi": "服务端",
         "uvicorn": "服务端",
         "openpyxl": "导出",
-        "aiosqlite": "SQLite 后端（迁移期两个后端都要能起）",
+        "aiosqlite": "SQLite 回滚兜底路径（DB_BACKEND=sqlite）",
     }
     prod_parser = {
         "selectolax": "**生产解析引擎**。不装它 worker 会走 lxml 回退路径，"
@@ -70,7 +68,9 @@ def check_imports():
 def check_env():
     for var, why, hard in (
         ("PG_DSN", "PostgreSQL 连接串", True),
-        ("DB_BACKEND", "切到 postgres 才走新存储层", True),
+        # DB_BACKEND 不设 = postgres（正式后端），所以「未设置」是正常的，
+        # 不该报硬失败。只有显式设成别的值才值得提醒（见下面那条）。
+        ("DB_BACKEND", "不设即 postgres（正式后端）", False),
         ("EXPORT_TOKEN", "增量导出鉴权。**不配就是无鉴权对公网开放**", False),
         ("SCRAPER_INSTANCE_ID", "实例标识。不配则两个克隆部署无法区分", False),
     ):
@@ -83,9 +83,13 @@ def check_env():
         else:
             warn(f"env {var}", f"未设置 —— {why}")
 
-    if os.environ.get("DB_BACKEND", "").strip() not in ("postgres", ""):
+    _backend = os.environ.get("DB_BACKEND", "").strip()
+    if _backend == "sqlite":
         warn("env DB_BACKEND",
-             f"值是 {os.environ['DB_BACKEND']!r}，切换后应为 'postgres'")
+             "显式设成了 'sqlite' —— 那是回滚兜底路径，不是正式后端。"
+             "新部署请留空或设 'postgres'。")
+    elif _backend not in ("postgres", ""):
+        fail("env DB_BACKEND", f"值是 {_backend!r}，只认 'postgres' / 'sqlite'")
 
 
 def check_disk():
@@ -217,52 +221,26 @@ def check_pg(skip_slow: bool):
         fail("PG 连接", f"{type(e).__name__}: {e}")
 
 
-def _flatten_routes(routes):
-    """展平成与 Starlette 匹配顺序一致的扁平列表（递归展开 _IncludedRouter）。
-
-    FastAPI >= 0.141 的 include_router 不再摊平子路由，而是插进一个惰性的
-    ``_IncludedRouter``（``path`` 是 None、``original_router`` 指向子 router）。
-    Phase 3.7 之后 /api/export/incremental 与 /api/export/{batch_name} 两条
-    **都在包装对象里面**（前者还多套一层：app -> export.router -> _incr.router），
-    只扫顶层两个都找不到。包含是递归的，展开也必须递归。
-    """
-    flat = []
-    for r in routes:
-        sub = getattr(r, "original_router", None)
-        if sub is not None:
-            flat.extend(_flatten_routes(sub.routes))
-        else:
-            flat.append(r)
-    return flat
-
-
 def check_route_order():
-    """增量导出端点必须注册在 /api/export/{batch_name} 之前，否则静默 404。"""
+    """增量导出端点必须注册在 /api/export/{batch_name} 之前，否则静默 404。
+
+    判定逻辑的**唯一真源**是 `server/routing.py:route_order_ok`。这里以前是
+    一份独立实现（连 `_flatten_routes` 都自己抄了一遍），而 ARCH_PLAN 当年就
+    记着那份副本是坏的——`catch is None` 时落到 else 报绿，也就是查找逻辑失效
+    时它反而说「没问题」。副本会独立腐坏，所以现在只留一份。
+
+    注意本项只是**结构**层。完整守卫在
+    `tests/test_incremental_export.py::RouteOrderTests`（结构 + 行为 + 源码
+    三层），那才是 CI 里跑的那道；本项是上机时顺手再验一次。
+    """
     try:
         from server.app import app
+        from server.routing import route_order_ok
     except Exception as e:                                   # noqa: BLE001
-        fail("路由顺序", f"import server.app 失败: {type(e).__name__}: {e}")
+        fail("路由顺序", f"import server 失败: {type(e).__name__}: {e}")
         return
-    paths = [getattr(r, "path", None) for r in _flatten_routes(app.routes)]
-    incr = next((i for i, p in enumerate(paths)
-                 if p == "/api/export/incremental"), None)
-    catch = next((i for i, p in enumerate(paths)
-                  if p == "/api/export/{batch_name}"), None)
-    if incr is None:
-        fail("路由顺序", "/api/export/incremental 没挂上")
-    elif catch is None:
-        # 以前这里落到 else 报绿 —— 那是这份检查最坏的一种坏法：
-        # catch-all 找不到只可能是**查找逻辑本身失效了**（改名、换 FastAPI
-        # 形态、被包进新的 router 层），而不是"catch-all 没了所以安全"。
-        # 前提没了就没资格判定，必须 fail。
-        fail("路由顺序",
-             "找不到 /api/export/{batch_name} —— 本检查的前提失效了，"
-             "不是'安全'。先修查找逻辑（是不是又多包了一层 router？）")
-    elif incr > catch:
-        fail("路由顺序",
-             "被 /api/export/{batch_name} 吞掉了 —— 会静默返回 404「批次不存在」")
-    else:
-        ok("路由顺序", "/api/export/incremental 在 catch-all 之前")
+    ok_, msg = route_order_ok(app.routes)
+    (ok if ok_ else fail)("路由顺序", msg)
 
 
 # ---------------------------------------------------------------- main

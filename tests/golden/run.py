@@ -44,7 +44,7 @@ SAMPLE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "samples")
 #:    * 不比任何响应头（``harness.py`` 的 ``diff_steps`` 只比 status/content_type/body）。
 #:    * 样本值太干净（价格全 19.99/33.50/0.00、brand 恒 GoldenBrand、
 #:      搜索样本全是单一大小写 ASCII），哨兵语义与价格解析类改动改完这里逐字节不变。
-BASELINE = os.path.join(SAMPLE_DIR, "sqlite_baseline.json")
+BASELINE = os.path.join(SAMPLE_DIR, "baseline.json")
 
 
 def capture(strict: bool = True) -> List[dict]:

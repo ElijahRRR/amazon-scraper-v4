@@ -86,7 +86,7 @@ python -m venv .venv
 
 ## 移植期间怎么用
 
-1. 移植前：`record` 一次，把 `samples/sqlite_baseline.json` 提交进版本库。
+1. 移植前：`record` 一次，把 `samples/baseline.json` 提交进版本库。
 2. 移植中：每改一块跑 `verify`。**任何差异都要先解释清楚**，再决定是 bug 还是有意变更。
 3. 有意变更（例如已确认的 `crawl_time` 改带时区 UTC）：改完重录基线，
    并在提交信息里写明为什么这次基线变了。
