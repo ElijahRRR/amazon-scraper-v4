@@ -1,5 +1,5 @@
 """
-Amazon ASIN 采集系统 v3 - 数据模型
+Amazon ASIN 采集系统 v4 - 数据模型
 """
 from dataclasses import dataclass, field, asdict
 from typing import Optional

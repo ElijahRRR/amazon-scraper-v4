@@ -1,5 +1,5 @@
 """
-Amazon 产品采集系统 v3 - Session 管理模块
+Amazon 产品采集系统 v4 - Session 管理模块
 使用 curl_cffi 模拟浏览器 TLS 指纹
 正确实现邮编设置（POST 到 address-change.html）
 Cookie jar 管理

@@ -97,7 +97,7 @@ journalctl -u amazon-scraper -f
 
 不需要 PostgreSQL 的话跳过这一节——`python3 run_server.py` 默认就是完整可用的 SQLite 部署。
 
-要在本机（含 macOS）搭一套带 PostgreSQL 后端 + catalog_sync 事件流的开发环境，完整步骤见 [`docs/local_macos_setup.md`](docs/local_macos_setup.md)：装 PostgreSQL 16、**建库时必须带 `LC_COLLATE=C LC_CTYPE=C`**（PG 默认排序规则和 SQLite 的 `BINARY` 不同，会导致分页/搜索/导出顺序对不上）、Python 3.12 虚拟环境、`pip install -r requirements-dev.txt`、设好 `DB_BACKEND=postgres` / `PG_DSN` / `SCRAPER_INSTANCE_ID` 等环境变量、跑一遍 `tools/phase5_preflight.py` 体检、两个后端各跑一遍 golden 基线和 pytest。
+要在本机（含 macOS）搭一套带 PostgreSQL 后端 + catalog_sync 事件流的开发环境，完整步骤见 [`docs/local_macos_setup.md`](docs/local_macos_setup.md)：装 PostgreSQL 16、**建库时必须带 `LC_COLLATE=C LC_CTYPE=C`**（PG 默认排序规则和 SQLite 的 `BINARY` 不同，会导致分页/搜索/导出顺序对不上）、Python 3.12 虚拟环境、`pip install -r requirements-dev.txt`、设好 `DB_BACKEND=postgres` / `PG_DSN` / `SCRAPER_INSTANCE_ID` 等环境变量、跑一遍 `tools/preflight.py` 体检、两个后端各跑一遍 golden 基线和 pytest。
 
 > 该文档开头有一步"先 `git checkout` 到某迁移分支"已经过时——相关代码目前都已经在 `main` 分支上，不需要切分支。
 
@@ -156,6 +156,38 @@ journalctl -u amazon-scraper -f
 3. **同步运维 API**（`server/api/sync.py`，`/api/v1/sync/*`，**仅 PostgreSQL 后端**）：读的是同一份事件流，但给的是内部原始事件形状 + 运维可观测性（relay 延迟、outbox 深度、保留期水位、`ack` 游标、强制裁剪通知）。完整契约见 [`docs/sync_contract.md`](docs/sync_contract.md)；面向 erpAPI 侧的业务端点（上传/状态/结果/失败明细）契约见 [`docs/erpapi_contract.md`](docs/erpapi_contract.md)。
 
 后两者是 PostgreSQL-only：SQLite 部署下这些端点统一返回结构化 `503`（不是 404——404 容易被消费方误读成"暂无数据"，导致游标停滞）。
+
+### 首次部署 PostgreSQL 后端的验证清单
+
+新机器上把 PG 后端跑起来之后，按顺序验这几步，每一步不过就别往下走：
+
+```bash
+# 1. 环境体检（实测，不是读配置：PG 版本/扩展/编码、asyncpg 能否连、
+#    DDL 能否建、分区能否创、磁盘、依赖）
+python tools/preflight.py
+
+# 2. 起服务
+DB_BACKEND=postgres PG_DSN=postgresql://... python run_server.py
+
+# 3. 事件流活着：relay_state 应为 running，outbox_depth 不应单调增长
+curl -s localhost:8899/api/_debug/event-stream
+
+# 4. 对账：counts 与直查一致
+curl -s "localhost:8899/api/v1/sync/counts?from_seq=0&to_seq=100000000"
+psql -c "SELECT count(*) FROM scraper.scrape_events"
+
+# 5. 契约端到端：分页拉到底
+curl -s -H "X-Export-Token: $EXPORT_TOKEN" \
+     "localhost:8899/api/export/incremental?cursor=0&limit=500"
+```
+
+第 5 步要核对的不变量（完整定义见 [`docs/incremental_export_contract.md`](docs/incremental_export_contract.md)）：
+
+- `source_id` 全局唯一（拉完全量后 `sort | uniq -d` 应为空）
+- `cursor` 严格升序，`next_cursor` 等于最后一条的 cursor
+- 空页返回 **200** 且 `next_cursor` **不推进**（不是 404）
+- `scraped_at` 形如 `2026-08-05T10:00:00Z`（精确到秒、带 Z）
+- `outcome != 'ok'` 的记录 `slow`/`fast` 基本为空——这类只进 snapshots
 
 ### 鉴权
 
@@ -317,20 +349,15 @@ amazon-scraper-v4/
     ziputil.py            # 邮编（不是压缩包）校验工具：判断配送控件里是否命中目标邮编
   tools/
     smoke_local.py        # 端到端冒烟测试（上传→拉取→提交→查询→契约校验），面向操作者
-    phase5_preflight.py   # 环境体检：PG 连通性/建表/排序规则 + 路由顺序守卫
-                          # （名字带 phase5 是历史遗留，工具本身仍在用：
-                          #   check_route_order 是「增量导出端点必须排在
-                          #   /api/export/{batch_name} 之前」这条不变量的
-                          #   第二道守卫，见 server/api/export_incremental.py）
-    phase5_compare.py     # 两套系统同一批 ASIN 的采集内容比对
-                          # （tests/test_phase5_compare.py 等在用它的 classify/compare）
+    preflight.py          # 上机环境体检：PG 连通性/建表/排序规则/磁盘/依赖，
+                          # 外加路由顺序一项（判定逻辑来自 server/routing.py，
+                          # 不是第二份实现）
     desc_glue_check.py    # 单个解析 bug（<br> 不产生分隔符）的修复验证工具
   docs/
     erpapi_contract.md            # erpAPI 侧业务端点契约
     incremental_export_contract.md # 增量导出契约 v1
     sync_contract.md               # /api/v1/sync/* 运维契约
     local_macos_setup.md           # 本机 macOS 开发环境搭建（含 PostgreSQL 后端）
-    phase5_runbook.md              # PostgreSQL 生产切换运行手册
   tests/
     test_*.py            # 单元/集成测试（解析质量、批次/结果 API、错误码、golden 相关守卫等）
     pgdb/                 # PostgreSQL 存储层测试

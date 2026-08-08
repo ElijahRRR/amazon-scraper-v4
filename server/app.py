@@ -1,5 +1,5 @@
 """
-Amazon ASIN 采集系统 v3 - Server
+Amazon ASIN 采集系统 v4 - Server
 轻量级 FastAPI 服务器，适合 1C/2GB 低配部署
 """
 import os
@@ -1173,7 +1173,7 @@ app.include_router(_settings_api.router)
 #   所以「增量端点排在 catch-all 之前」这条不变量由单文件自上而下阅读保证，
 #   下面这份 include 列表怎么重排都打不破它。守卫见
 #   tests/test_incremental_export.py::RouteOrderTests（结构 + 行为 + 源码三层）
-#   与 tools/phase5_preflight.py:check_route_order。
+#   与 tools/preflight.py:check_route_order。
 from server.api import export as _export_api  # noqa: E402
 
 app.include_router(_export_api.router)

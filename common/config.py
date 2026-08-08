@@ -1,5 +1,5 @@
 """
-Amazon ASIN 采集系统 v3 - 配置
+Amazon ASIN 采集系统 v4 - 配置
 server 和 worker 共用的配置项
 """
 import os

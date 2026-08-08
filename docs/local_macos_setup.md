@@ -19,7 +19,7 @@ git fetch origin
 git checkout claude/walmart-api-db-refactor-7oergd
 
 # 确认（三个都要在）
-ls requirements-dev.txt tools/phase5_preflight.py docs/local_macos_setup.md
+ls requirements-dev.txt tools/preflight.py docs/local_macos_setup.md
 ```
 
 ---
@@ -107,7 +107,7 @@ export SERVER_PORT=8899
 ## 4. 上机体检（先跑这个，不过就别往下走）
 
 ```bash
-.venv/bin/python tools/phase5_preflight.py
+.venv/bin/python tools/preflight.py
 ```
 
 实测而非读配置：PG 版本/扩展/编码/**排序规则**、能否建分区表、advisory lock、
@@ -194,7 +194,7 @@ worker 跑起来后回到第 6 步，这次 `parse_engine` 应该是 `selectolax
 | 症状 | 原因 |
 |---|---|
 | `Could not open requirements file: 'requirements-dev.txt'` | 还在 `main` 上。回到第 0 步切分支 |
-| `can't open file '.../tools/phase5_preflight.py'` | 同上 |
+| `can't open file '.../tools/preflight.py'` | 同上 |
 | `pip install` 卡在编译 `lxml`/`curl_cffi` 然后报错 | venv 的 Python 太新（3.13/3.14）没有 wheel。按第 2 步用 3.12 重建 |
 | `ConnectionRefusedError: 5432` | PG 没起。`brew services start postgresql@16` |
 | `role "scraper" does not exist` | 第 1 步的 `createuser` 没跑 |

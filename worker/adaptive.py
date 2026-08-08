@@ -1,5 +1,5 @@
 """
-Amazon 产品采集系统 v3 - 自适应并发控制器
+Amazon 产品采集系统 v4 - 自适应并发控制器
 
 TPS 模式: 全局 AIMD（单信号量 + 单 Metrics）
 
