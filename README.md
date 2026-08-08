@@ -87,7 +87,7 @@ sudo systemctl status amazon-scraper
 journalctl -u amazon-scraper -f
 ```
 
-`deploy/setup.sh` 做的事：把项目 rsync 到 `/opt/amazon-scraper-v3`（脚本内部路径仍是旧版本命名，不影响功能）、建 `.venv`、`pip install -r requirements.txt`、创建 `data/`、`.env.example` 复制成 `.env`（已存在则跳过）、安装并 `enable`（不会自动 `start`）systemd 单元 `amazon-scraper.service`（对应 `deploy/server.service`）。
+`deploy/setup.sh` 做的事：把项目 rsync 到 `/opt/amazon-scraper-v4`、建 `.venv`、`pip install -r requirements.txt`、创建 `data/`、`.env.example` 复制成 `.env`（已存在则跳过）、安装并 `enable`（不会自动 `start`）systemd 单元 `amazon-scraper.service`（对应 `deploy/server.service`）。
 
 **目前的局限**（如实说明，按需自行调整）：
 - 这个脚本只打包 Server（`rsync` 时显式排除了 `worker/`），Worker 需要自己在目标机器上单独 clone + 建 venv + 跑 `run_worker.py`，仓库里没有配套的 worker 部署脚本。

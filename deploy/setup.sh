@@ -1,13 +1,13 @@
 #!/bin/bash
-# Amazon Scraper v3 - Server 部署脚本
+# Amazon Scraper v4 - Server 部署脚本
 # 用法: bash deploy/setup.sh
 
 set -e
 
-PROJECT_DIR="/opt/amazon-scraper-v3"
+PROJECT_DIR="/opt/amazon-scraper-v4"
 VENV_DIR="$PROJECT_DIR/.venv"
 
-echo "=== Amazon Scraper v3 Server Setup ==="
+echo "=== Amazon Scraper v4 Server Setup ==="
 
 # 1. 创建项目目录
 sudo mkdir -p "$PROJECT_DIR"

@@ -1,12 +1,12 @@
 [Unit]
-Description=Amazon Scraper v3 Server
+Description=Amazon Scraper v4 Server
 After=network.target
 
 [Service]
 Type=simple
 User=scraper
-WorkingDirectory=/opt/amazon-scraper-v3
-ExecStart=/opt/amazon-scraper-v3/.venv/bin/python run_server.py
+WorkingDirectory=/opt/amazon-scraper-v4
+ExecStart=/opt/amazon-scraper-v4/.venv/bin/python run_server.py
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1

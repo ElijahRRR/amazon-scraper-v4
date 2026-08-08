@@ -14,7 +14,7 @@
 没有 `common/pgdb/`、没有 `tests/golden/`。
 
 ```bash
-cd ~/你的路径/amazon-scraper-v3
+cd ~/你的路径/amazon-scraper-v4
 git fetch origin
 git checkout claude/walmart-api-db-refactor-7oergd
 
@@ -71,7 +71,7 @@ pip 会掉进源码编译，缺 `libxml2` / Rust 工具链就直接失败。3.12
 ```bash
 brew install python@3.12
 
-cd ~/你的路径/amazon-scraper-v3
+cd ~/你的路径/amazon-scraper-v4
 rm -rf .venv                  # 如果之前用别的版本建过，先删掉
 /opt/homebrew/opt/python@3.12/bin/python3.12 -m venv .venv
 .venv/bin/python -V           # 应显示 3.12.x
@@ -147,7 +147,7 @@ DB_BACKEND=postgres .venv/bin/python run_server.py
 **另开一个终端**（第一个跑着服务），把环境变量重设一遍再跑：
 
 ```bash
-cd ~/你的路径/amazon-scraper-v3
+cd ~/你的路径/amazon-scraper-v4
 export DB_BACKEND=postgres
 export EXPORT_TOKEN=<和起服务那个终端里同一个值>
 

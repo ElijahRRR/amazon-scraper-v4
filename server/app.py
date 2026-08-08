@@ -249,7 +249,7 @@ async def lifespan(app):
     logger.info("服务器关闭")
 
 
-app = FastAPI(title="Amazon Scraper v3", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="Amazon Scraper v4", version="4.0.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=config.STATIC_DIR), name="static")
 
 
@@ -740,7 +740,7 @@ async def _send_one_callback(client: httpx.AsyncClient, batch_id: int):
     headers = {
         "X-Scraper-Event-Id": event_id,
         "X-Scraper-Delivery-Attempt": str(attempts),
-        "User-Agent": "amazon-scraper-v3/callback",
+        "User-Agent": "amazon-scraper-v4/callback",
         "Content-Type": "application/json",
     }
 

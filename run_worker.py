@@ -14,7 +14,7 @@ logger = logging.getLogger("run_worker")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Amazon Scraper v3 Worker")
+    parser = argparse.ArgumentParser(description="Amazon Scraper v4 Worker")
     parser.add_argument("--server", required=True, help="Server URL (e.g., http://x.x.x.x:8899)")
     parser.add_argument("--worker-id", default=None, help="Worker ID (auto-generated if not set)")
     parser.add_argument("--concurrency", type=int, default=None, help="Initial concurrency")

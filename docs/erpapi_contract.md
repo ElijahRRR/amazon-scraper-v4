@@ -1,4 +1,4 @@
-# erpAPI 对接契约 —— 采集侧（amazon-scraper-v3）
+# erpAPI 对接契约 —— 采集侧（amazon-scraper-v4）
 
 > **读者**：erpAPI 的实现者。照这份文档改代码即可，不需要读采集侧源码。
 >
