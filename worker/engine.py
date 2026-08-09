@@ -2203,8 +2203,22 @@ class Worker:
             f"⏰ 自动重启已开启：{hours:.2f}h 后重启 (实际延迟含抖动={delay:.0f}s, "
             f"预计时间戳={restart_at:.0f})"
         )
+        # ⚠ 这里必须等 `_shutdown_event` 而不是裸 `asyncio.sleep(delay)`。
+        #
+        # `run()` 是 `await asyncio.gather(*coroutines)` —— **要等全部协程结束**。
+        # 裸 sleep 只认 CancelledError，不认关停信号，于是开了 --auto-restart-hours
+        # 的 worker 按 Ctrl+C 之后：其它协程几秒内退完并打日志，这一个还在睡
+        # 几小时，gather 永不返回，`_cleanup()` 不执行，「🛑 Worker 已停止」
+        # 永远不打印 —— 现象就是 Ctrl+C 之后进程挂在那里不动（实测复现）。
+        #
+        # 本文件里其它每个长等待（_settings_sync 的 30s 心跳、
+        # _screenshot_gate_monitor 的 2s 轮询、_startup_watchdog）用的都是
+        # 这个 wait_for(shutdown_event) 写法，只有这里当初漏了。
         try:
-            await asyncio.sleep(delay)
+            await asyncio.wait_for(self._shutdown_event.wait(), timeout=delay)
+            return          # 关停触发 -> 正常退出，**不**重启
+        except asyncio.TimeoutError:
+            pass            # 睡满了 -> 该重启了，往下走
         except asyncio.CancelledError:
             return
         if not self._running:
