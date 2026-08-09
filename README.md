@@ -48,7 +48,9 @@ Server (FastAPI)                          Worker (可部署多台)
 ```bash
 git clone https://github.com/ElijahRRR/amazon-scraper-v4.git
 cd amazon-scraper-v4
-python3 -m venv venv && source venv/bin/activate
+# 虚拟环境目录名用 .venv（带点）—— deploy/setup.sh 建的也是它，
+# .gitignore 忽略的也是它。叫 venv 的话满目录文件会变成 untracked。
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 # 建库：LC_COLLATE=C 不是可选项 —— PG 的默认排序规则会让分页/搜索/导出

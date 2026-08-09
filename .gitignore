@@ -14,6 +14,11 @@ worker/degraded_dump/
 runtime_settings.json
 *.egg-info/
 .venv/
+# 约定用 .venv（README 与 deploy/setup.sh 都是它）。这里连 venv/ 一起忽略，
+# 是因为不带点的写法太常见 —— 漏掉它意味着满目录文件变成 untracked，
+# 一个手滑的 `git add -A` 就能把整个虚拟环境提交进来。
+venv/
+env/
 .agent/runtime_logs/
 .agent/evidence/
 
