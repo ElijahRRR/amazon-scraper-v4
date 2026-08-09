@@ -22,6 +22,16 @@
 weight / dimensions / variant）与 `fast` 的可选字段（buybox_* / coupon / deal）；
 新增可选的 `raw`。鉴权由 fail-closed 改成**契约语义的可选**（见下）。
 
+**2026-08-09 追加**：`fast` 新增 `stock_count` 与 `delivery_days`（均 int 或
+null）。这是**纯追加**，按 `docs/erpapi_contract.md` §3.2「往成功响应里加字段
+可以单方面做」，因此 **`contract_version` 仍是 1**。
+
+两个值本来就在事件体里（`raw.stock_count` / `raw.delivery_time` 一直看得见），
+只是没提升到 `fast`，所以**存量事件也会拿到这两个字段，不需要回填、不需要重采**。
+对外命名用 `delivery_days` 而不是源字段名 `delivery_time`：采集侧存的是天数，
+而 "time" 读起来像时刻；`delivery_date`（"Tomorrow" / "August 12" 那种人读日期）
+是另一个字段，仍只在 `raw` 里。
+
 ### 5 处待确认项：沃尔玛侧已确认（2026-08-06），全部按采集侧实现
 
 | # | 结论 | 要点 |
@@ -29,6 +39,7 @@ weight / dimensions / variant）与 `fast` 的可选字段（buybox_* / coupon /
 | 1 | **`slow_hash` 当不透明值用** | 算法是采集侧那一套（NFKC + 空白折叠 + 哨兵值全等归一 + 列表排序 + 图片 URL 归约到 image ID + 排序键 JSON + SHA-256，取前 16 位十六进制），**与契约文字描述的「字段排序后 sha256」不是同一个算法**。⚠ **不要按收到的 `slow` 对象自己重算再比对——两边必然不等。** 它保证的是「同页面跨进程跨引擎稳定、慢变字段真变了才变」 |
 | 2 | `fast.currency` 恒 `"USD"` | 采集侧**不采币种**，这是适配器补的常量。要真实币种需先在采集侧加抓取 |
 | 3 | `fast.stock_state` 值域 = `in_stock` / `out_of_stock` / `unknown` | 三值封闭集 |
+| 3b | `fast.stock_count` / `fast.delivery_days` 的 `null` 与 `0` **不是一回事** | `null` = 这次没采到；`0` = 采到了且确实是 0（`stock_count=0` 即缺货）。适配器绝不用 0 表示「没取到」，与 `price` 同一条原则。消费侧请分开处理，别用 `or 0` 兜底 |
 | 4 | `slow.weight` / `slow.dimensions` = `{package, item}` 对象 | 采集侧两个值分别是包装与本体，不合并 |
 | 5 | 游标掉出保留窗口 → **409 `cursor_below_retention`** | 消费侧须实现「告警 + 全量对账 + 停」 |
 
@@ -150,6 +161,8 @@ X-Export-Token: <token>
     "price": 19.99,
     "currency": "USD",
     "stock_state": "in_stock",                   // in_stock|out_of_stock|unknown
+    "stock_count": 37,                           // int 或 null；**0 是合法值**
+    "delivery_days": 8,                          // int 或 null；预计送达天数
     "buybox_price": null,
     "buybox_seller": null,
     "buybox_seller_id": null,

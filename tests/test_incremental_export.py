@@ -268,12 +268,86 @@ class ContractTests(unittest.TestCase):
             for k in ("price", "currency", "stock_state"):
                 self.assertIn(k, rec["fast"])
             # 契约 v1 的可选快变字段
-            for k in ("buybox_price", "buybox_seller", "coupon", "deal"):
+            for k in ("buybox_price", "buybox_seller", "coupon", "deal",
+                      "stock_count", "delivery_days"):
                 self.assertIn(k, rec["fast"])
             self.assertIn("slow_hash", rec)
             self.assertIn("raw", rec)
             # scrape_params 的键名是 zipcode（契约 v1），不是 zip
             self.assertIn("zipcode", rec["scrape_params"])
+
+    def test_stock_count_and_delivery_days_are_ints(self):
+        """`_seed` 提交的是字符串 "5"，导出必须给 int 5 而不是 "5"。"""
+        with _server_with_relay() as (c, _):
+            _seed(c, n=1)
+            fast = c.get("/api/export/incremental",
+                         params={"cursor": 0}, headers=self._hdr()
+                         ).json()["records"][0]["fast"]
+
+        self.assertIsInstance(fast["stock_count"], int)
+        self.assertEqual(fast["stock_count"], 5)
+        self.assertNotIsInstance(fast["stock_count"], str)
+
+    def test_zero_stock_count_is_not_null(self):
+        """**这条是这两个字段最容易做错的地方。**
+
+        `stock_count=0` 是个合法值（缺货），绝不能被当成「没采到」变 null——
+        消费侧若拿 null 当 0 处理、或拿 0 当 null 处理，两种情况刚好互相掩盖。
+        与 `_price` 同一条原则：0 是数据，不是哨兵。
+        """
+        with _server_with_relay() as (c, _):
+            c.post("/api/upload",
+                   files={"file": ("z.txt", b"B0ZEROSTK1\n", "text/plain")},
+                   data={"batch_name": "zero_stock", "zip_code": "10001"})
+            t = c.get("/api/tasks/pull",
+                      params={"worker_id": "w-zero", "count": 1}).json()["tasks"][0]
+            c.post("/api/tasks/result", json={
+                "task_id": t["id"], "batch_id": t["batch_id"],
+                "worker_id": "w-zero", "lease_epoch": t["lease_epoch"],
+                "success": True, "asin": t["asin"], "title": "Zero Stock",
+                "current_price": "9.99", "stock_status": "Currently unavailable",
+                "stock_count": "0", "delivery_time": "0",
+                "crawl_time": "2026-08-05T10:00:00Z", "site": "US",
+                "zip_code": "10001"})
+            _drain(c)
+            recs = c.get("/api/export/incremental",
+                         params={"cursor": 0, "limit": 500}, headers=self._hdr()
+                         ).json()["records"]
+
+        hit = [r for r in recs if r["asin"] == "B0ZEROSTK1"]
+        self.assertTrue(hit, "样本没进事件流")
+        fast = hit[0]["fast"]
+        self.assertEqual(fast["stock_count"], 0)
+        self.assertIsNotNone(fast["stock_count"], "0 被当成「没采到」吞成了 null")
+        self.assertEqual(fast["delivery_days"], 0)
+
+    def test_missing_values_are_null_not_zero(self):
+        """反过来也要成立：真的没采到时给 null，不能给 0。"""
+        with _server_with_relay() as (c, _):
+            c.post("/api/upload",
+                   files={"file": ("m.txt", b"B0NOSTOCK1\n", "text/plain")},
+                   data={"batch_name": "missing_stock", "zip_code": "10001"})
+            t = c.get("/api/tasks/pull",
+                      params={"worker_id": "w-miss", "count": 1}).json()["tasks"][0]
+            c.post("/api/tasks/result", json={
+                "task_id": t["id"], "batch_id": t["batch_id"],
+                "worker_id": "w-miss", "lease_epoch": t["lease_epoch"],
+                "success": True, "asin": t["asin"], "title": "No Stock Info",
+                "current_price": "9.99", "stock_status": "In Stock",
+                # 采集侧「没取到」的哨兵就是 "N/A"
+                "stock_count": "N/A", "delivery_time": "N/A",
+                "crawl_time": "2026-08-05T10:00:00Z", "site": "US",
+                "zip_code": "10001"})
+            _drain(c)
+            recs = c.get("/api/export/incremental",
+                         params={"cursor": 0, "limit": 500}, headers=self._hdr()
+                         ).json()["records"]
+
+        hit = [r for r in recs if r["asin"] == "B0NOSTOCK1"]
+        self.assertTrue(hit, "样本没进事件流")
+        fast = hit[0]["fast"]
+        self.assertIsNone(fast["stock_count"])
+        self.assertIsNone(fast["delivery_days"])
 
     def test_slow_hash_is_16_hex_per_contract(self):
         """契约 v1：slow_hash 是 sha256 前 16 位。内部存的是 'v1:<64 位>'。"""
@@ -377,6 +451,35 @@ def _server_with_relay():
             yield pair
     finally:
         harness._PATCHED_LOOPS = saved
+
+
+def _drain(client=None, n: int = 1):
+    """等 relay 把 outbox 抽干、且 scrape_events 至少有 n 行。
+
+    从 `_seed` 里抽出来的：只提交结果、不用 `_seed` 那套固定字段的用例
+    （比如库存 0 / 缺值那两条）同样需要等 relay，否则查出来恒空。
+    """
+    import asyncio
+    import asyncpg
+    from common import config
+
+    async def _wait():
+        conn = await asyncpg.connect(config.PG_DSN)
+        try:
+            got = 0
+            for _ in range(80):
+                left = await conn.fetchval(
+                    "SELECT count(*) FROM scraper.scrape_outbox")
+                got = await conn.fetchval(
+                    "SELECT count(*) FROM scraper.scrape_events")
+                if left == 0 and got >= n:
+                    return got
+                await asyncio.sleep(0.25)
+            return got
+        finally:
+            await conn.close()
+
+    return asyncio.run(_wait())
 
 
 def _seed(client, n: int = 3):
