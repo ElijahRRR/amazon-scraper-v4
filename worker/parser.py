@@ -31,6 +31,7 @@ from worker.ziputil import _GLOW_LINE2_RE as _GLOW_INGRESS_LINE2_RE
 # 局部的 `ASIN_RE = r'B[0-9A-Z]{9}'`（_extract_page_asin 里那个无锚点裸片段）
 # 是另一回事，**不搬**，理由写在 common/core/idents.py 的 docstring 里。
 from common.core.idents import ASIN_RE as _ASIN_RE
+from common.core.textclean import clean_deep as _clean_deep
 
 # ==========================================================================
 # P4-7：crawl_time 的线格式
@@ -303,9 +304,20 @@ class AmazonParser:
         jsonld = self._extract_jsonld(html_text)
 
         if _USE_SELECTOLAX:
-            return self._parse_with_selectolax(html_text, asin, zip_code, result, jsonld)
+            parsed = self._parse_with_selectolax(html_text, asin, zip_code, result, jsonld)
         else:
-            return self._parse_with_lxml(html_text, asin, zip_code, result, jsonld)
+            parsed = self._parse_with_lxml(html_text, asin, zip_code, result, jsonld)
+
+        # 统一在**出口**剔除不可见控制字符（U+200E 等），两个引擎共用这一处。
+        #
+        # 为什么在这里而不是各个提取点：文本提取的 `.strip()` 散落在几十处，
+        # 逐个改必漏，而且新加一个字段就又漏一个。出口只有这两条 return，
+        # 覆盖面是完备的。
+        #
+        # 为什么不在 slowhash.normalize_text 里洗：那里只作用于**哈希输入**，
+        # 不改存下来的值 —— 洗了哈希稳了，下游拿到的仍然是脏数据，而下游按
+        # 品牌 join 正是最需要它干净的地方。详见 common/core/textclean.py。
+        return _clean_deep(parsed)
 
     # ==================== selectolax 解析路径 ====================
 
