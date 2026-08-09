@@ -158,6 +158,29 @@ def _price(v: Any) -> Optional[float]:
         return None
 
 
+def _int(v: Any) -> Optional[int]:
+    """'37' / '1,299' -> 37 / 1299；取不到 -> None。
+
+    与 ``_price`` 同一条原则：**绝不用 0 表示「没取到」**。
+    ``stock_count=0`` 是个合法值（缺货），拿它当哨兵会让消费侧把「这次没采到
+    库存」误读成「确认为 0 件」——那正好是最需要区分的两种情况。
+
+    只接受**整数**形态：``"3.7"`` 之类回 None 而不是截成 3。库存和配送天数
+    出现小数说明解析出问题了，静默取整会把一个信号变成一个看着正常的错值。
+    """
+    s = _clean(v)
+    if s is None:
+        return None
+    s = s.replace(",", "").replace(" ", "")
+    m = re.fullmatch(r"[+-]?\d+", s)
+    if not m:
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        return None
+
+
 def _stock_state(payload: Dict[str, Any]) -> str:
     """-> in_stock | out_of_stock | unknown"""
     s = _clean(payload.get("stock_status"))
@@ -302,6 +325,15 @@ def _to_record(row: Dict[str, Any]) -> Dict[str, Any]:
             "currency": DEFAULT_CURRENCY,
             "stock_state": _stock_state(payload),
             # ---- 契约可选 ----
+            # stock_count / delivery_days 是**追加**字段（契约 §3.2 允许单方面
+            # 加字段，因此仍是 v1）。数据本来就在事件体里、只是没往外给过，
+            # 所以**老事件也会拿到**，不需要回填。
+            #
+            # delivery_days 的源字段叫 delivery_time（采集侧存的是天数，
+            # 与 delivery_date 那个人读日期是两个字段）。对外用 _days 命名是
+            # 因为 "time" 读起来像时刻而不是时长。
+            "stock_count": _int(payload.get("stock_count")),
+            "delivery_days": _int(payload.get("delivery_time")),
             "buybox_price": _price(payload.get("buybox_price")),
             "buybox_seller": _clean(payload.get("seller_name")),
             "buybox_seller_id": _clean(payload.get("seller_id")),
