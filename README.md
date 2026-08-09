@@ -141,6 +141,80 @@ journalctl -u amazon-scraper -f
   - `callback_url`：采集完成时 POST 到此地址通知（详见下方 Webhook）
   - `expand_variants`：`true`/`false`，是否自动展开变体（同上方开关）
 
+### 推送采集任务（JSON API）
+
+程序化调用方不必先拼一个 xlsx 再 multipart 上传，`POST /api/batches` 收 JSON：
+
+```bash
+curl -X POST http://<server>:8899/api/batches \
+  -H 'Content-Type: application/json' -d '{
+    "asins": ["B0XXXXXXX1", "B0XXXXXXX2"],
+    "zip_code": "10001",
+    "needs_screenshot": true,
+    "batch_name": "job_20260809_10001"
+  }'
+```
+
+字段（除 `asins`/`items` 外全部可选）：
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `asins` | — | ASIN 数组。与 `items` 二选一，也可同时给（合并） |
+| `items` | — | `[{"asin": "...", "zip_code": "..."}]`，需要逐个 ASIN 指定邮编时用 |
+| `zip_code` | 服务端默认邮编 | **整批**邮编。不传 / `null` = 跟随服务端默认 |
+| `needs_screenshot` | `false` | **批次级**截图开关 |
+| `batch_name` | 自动生成 | 撞名 → `409`（同 `/api/upload`） |
+| `callback_url` | `null` | 完成回调，同 `/api/upload` |
+| `external_id` | `null` | 原样回传 |
+| `expand_variants` | `false` | 自动展开变体 |
+
+响应体、撞名 `409` 语义、回调注册与 `POST /api/upload` **完全一致**（同一份实现）。
+ASIN 去重保序；非法 ASIN 丢弃，一个都不剩 → `400`。整批邮编非法 → `400`；
+逐 ASIN 邮编非法只计入响应的 `invalid_zip_rows` 并退回批次邮编。
+
+**邮编优先级**：`items[].zip_code` > 顶层 `zip_code` > 服务端默认。
+
+#### 同一个 ASIN 要采多个邮编
+
+**一个邮编推一个批次**，批次名带上邮编。这不是风格建议，是库结构决定的：
+`tasks` 上有 `UNIQUE(batch_id, asin)`，一个批次里一个 ASIN 只能有一个邮编。
+所以在**同一次推送**里给同一个 ASIN 两个不同邮编会被拒绝：
+
+```
+400 {"error": "conflicting_zip_for_asin", "asin": "...", "zip_codes": ["10001", "90001"]}
+```
+
+拆成两个批次之后：
+
+- **截图**天然分开 —— 落盘路径是 `<批次名>/<asin>.png`，**批次名就是隔离键**；
+- **数据**要走 `GET /api/export/incremental`，按 `scrape_params.zipcode` 分辨。
+
+⚠️ **不要用快照类端点取多邮编数据。** `asin_data.asin` 是 `UNIQUE`，全库每个
+ASIN 只有一行，后采的覆盖先采的；而 `/api/results?batch_id=` 的 `batch_id`
+只用来**挑 ASIN**，数据仍取那一行全局快照。结果是同一个 ASIN 的两个邮编批次，
+`/api/results` 和 `GET /api/export/{batch_name}` 会返回**完全相同的行**，
+且不会有任何报错。逐邮编准确的只有增量导出这一条路。
+（这四条性质由 `tests/test_multi_zip_same_asin.py` 端到端钉住。）
+
+### 截图查询与取图
+
+- `GET /api/screenshots?batch_name=<批次>` —— 列出该批次每个 ASIN 的截图状态，
+  每条带 `url`（仅 `status == "done"` 时非 `null`）。可按 `asin` / `status`
+  过滤，按 ASIN 升序 `cursor` 分页，`limit` 上限 1000。响应里的 `progress`
+  是**整批**计数，不受过滤影响。也可用 `batch_id=` 代替 `batch_name=`。
+- `GET /api/screenshots/{batch_name}/{asin}` —— 取那张 PNG（`.png` 后缀可带可不带）。
+
+取图的状态码是有意分开的，调用方据此决定要不要重试：
+
+| 码 | 含义 | 该怎么办 |
+|---|---|---|
+| `200` | 图在这儿 | — |
+| `404` | 没有这条截图记录（或批次不存在、文件已被清理） | 别重试 |
+| `409` | 有记录但还没截好 | **稍后再来**，带 `Retry-After: 10` |
+| `410` | 截图失败，不会再有；响应体带 `error_detail` | 别重试 |
+
+整批打包下载仍是 `GET /api/export/{batch_name}/screenshots`（ZIP）。
+
 ### 卖家店铺采集
 
 同样在 **任务管理** 页面（没有单独页面），上传卖家 ID 或店铺链接文件：

@@ -137,6 +137,12 @@ ERROR_CODES = frozenset({
     # 一条显式断言看守。登记在这里是为了让「错误码封闭集」名副其实：
     # 一个对外发出去的机器读码不在册，这个集合就只是半个真源。
     "batch_name_conflict",
+    # `POST /api/batches`（JSON 推送）里，同一次请求给同一个 ASIN 两个**不同**
+    # 邮编 -> 400。库里表达不了（`tasks` 是 UNIQUE(batch_id, asin)，一个批次里
+    # 一个 ASIN 只能有一个邮编），所以明确拒绝而不是静默取第一个。
+    # 与 `batch_name_conflict` 同例：走 HTTPException 不走 `_err`，AST 扫不到，
+    # 靠 tests/test_multi_zip_same_asin.py 的显式断言看守。
+    "conflicting_zip_for_asin",
     "cursor_ahead_of_stream",
     "cursor_below_retention",
     "event_stream_unavailable",
@@ -146,6 +152,18 @@ ERROR_CODES = frozenset({
     "invalid_export_token",
     "invalid_parameter",
     "range_too_wide",
+    # 取图端点（`GET /api/screenshots/{batch_name}/{asin}`）的两个可重试判据：
+    #   screenshot_pending -> 409，还没截好，**回头再来**（带 Retry-After）
+    #   screenshot_failed  -> 410，截失败了，**不会再有**
+    # 这两个码存在的全部意义就是让调用方分清这两种情形（合并成 404 就等于
+    # 让人无限轮询一个永远不会出现的文件）。同样走 HTTPException、AST 扫不到，
+    # 由 tests/test_screenshot_api.py 的 test_all_four_outcomes_are_distinct 看守。
+    #
+    # ⚠ 登记它们不是为了过用例 —— `tests/test_error_codes.py` 的文档提取器当时
+    # 并没有捞到这两个（它们在 md 表格单元格里）。是按本集合注释里那句
+    # 「一个对外发出去的机器读码不在册，这个集合就只是半个真源」补的。
+    "screenshot_failed",
+    "screenshot_pending",
 })
 
 #: `_err` 自己组装的键。`extra` 里的同名键会被**丢掉**，不是覆盖。

@@ -606,6 +606,21 @@
                   }
                 },
                 "summary": "Api Batches"
+              },
+              "post": {
+                "description": "**推送采集任务（JSON）** —— 和 `POST /api/upload` 等价，只是不用传文件。\n\n给程序化调用方用：上游系统手里本来就是一个 ASIN 列表，为了调这个接口先拼\n一个 xlsx 再 multipart 上传是纯粹的仪式。响应体、409 撞名语义、回调注册，\n与 `/api/upload` **完全一致**（同一份实现）。\n\n请求体：\n\n    {\n      \"asins\": [\"B0XXXXXXX1\", \"B0XXXXXXX2\"],   // 与 items 二选一\n      \"items\": [                                // 需要逐个 ASIN 指定邮编时用\n        {\"asin\": \"B0XXXXXXX1\", \"zip_code\": \"10001\"},\n        {\"asin\": \"B0XXXXXXX2\"}                  // 不写 -> 用下面的 zip_code\n      ],\n      \"zip_code\":         \"90001\",   // 可选。不传 = 用服务端默认邮编\n      \"needs_screenshot\": false,     // 可选，默认 false\n      \"batch_name\":       null,      // 可选，不传则自动生成\n      \"callback_url\":     null,      // 可选，批次完成时 POST 通知\n      \"external_id\":      null,      // 可选，原样回传\n      \"expand_variants\":  false      // 可选\n    }\n\n两个「自由选择」按调用方要的语义来：\n\n* **邮编**：三档独立。`items[].zip_code`（这一个 ASIN）> 顶层 `zip_code`\n  （这一批）> 服务端默认。想跟随服务端默认就整个不传这个键——传 `null` 也\n  当没传，但**不要**传 `\"\"` 去表达「用默认」，空串这里按缺省处理、别的地方\n  未必，少一层歧义是一层。\n* **截图**：`needs_screenshot` 是**批次级**开关（底层 `batches` 表就一列，\n  截图任务是按批派生的）。不传即 false，也就是**默认不截图**。想要一半截图\n  一半不截，推两个批次——不要指望 items 里逐个开关，那个粒度库里不存在。\n\n`asins` 与 `items` 可以同时给（合并，`items` 的邮编优先）。ASIN 去重保序，\n非法 ASIN 直接丢弃；一个都不剩 -> 400。非法邮编不拦请求，计入响应的\n`invalid_zip_rows`，那些 ASIN 退回用批次邮编。",
+                "operationId": "api_create_batch_api_batches_post",
+                "responses": {
+                  "200": {
+                    "content": {
+                      "application/json": {
+                        "schema": {}
+                      }
+                    },
+                    "description": "Successful Response"
+                  }
+                },
+                "summary": "Api Create Batch"
               }
             },
             "/api/batches/delete-bulk": {
@@ -1566,6 +1581,138 @@
                   }
                 },
                 "summary": "Api Run Schedule Now"
+              }
+            },
+            "/api/screenshots": {
+              "get": {
+                "description": "列出某批次的截图状态，每条带可直接 GET 的 `url`。\n\n定位批次：`batch_name` 或 `batch_id` **给一个**（都不给 -> 400）。\n\n过滤：\n- `asin` —— 只看这一个\n- `status` —— `pending` / `processing` / `done` / `failed`\n\n分页：按 ASIN 升序，`cursor` 传上一页最后一个 `asin`，返回体的\n`next_cursor` 已经算好（没有下一页时是 `null`）。\n\n返回：\n\n    {\n      \"batch_id\": 12, \"batch_name\": \"batch_20260809_101500\",\n      \"progress\": {\"pending\": 3, \"processing\": 0, \"done\": 7,\n                   \"failed\": 0, \"total\": 10},\n      \"items\": [\n        {\"asin\": \"B0XXXXXXX1\", \"status\": \"done\", \"retry_count\": 0,\n         \"error_detail\": null, \"updated_at\": \"<TS>\",\n         \"url\": \"http://host:8899/api/screenshots/batch_.../B0XXXXXXX1\"}\n      ],\n      \"next_cursor\": \"B0XXXXXXX1\"\n    }\n\n`url` 只在 `status == \"done\"` 时是非 null —— 别的状态下那张图不存在，\n给个 URL 只会让调用方去撞 404。`progress` 是**整批**的计数，不受\n`asin`/`status`/`cursor` 过滤影响，方便一次请求同时回答「好了几张」和\n「这一页是哪几张」。",
+                "operationId": "api_screenshots_api_screenshots_get",
+                "parameters": [
+                  {
+                    "in": "query",
+                    "name": "batch_name",
+                    "required": false,
+                    "schema": {
+                      "title": "Batch Name",
+                      "type": "string"
+                    }
+                  },
+                  {
+                    "in": "query",
+                    "name": "batch_id",
+                    "required": false,
+                    "schema": {
+                      "title": "Batch Id",
+                      "type": "integer"
+                    }
+                  },
+                  {
+                    "in": "query",
+                    "name": "asin",
+                    "required": false,
+                    "schema": {
+                      "title": "Asin",
+                      "type": "string"
+                    }
+                  },
+                  {
+                    "in": "query",
+                    "name": "status",
+                    "required": false,
+                    "schema": {
+                      "title": "Status",
+                      "type": "string"
+                    }
+                  },
+                  {
+                    "in": "query",
+                    "name": "cursor",
+                    "required": false,
+                    "schema": {
+                      "title": "Cursor",
+                      "type": "string"
+                    }
+                  },
+                  {
+                    "in": "query",
+                    "name": "limit",
+                    "required": false,
+                    "schema": {
+                      "default": 200,
+                      "maximum": 1000,
+                      "title": "Limit",
+                      "type": "integer"
+                    }
+                  }
+                ],
+                "responses": {
+                  "200": {
+                    "content": {
+                      "application/json": {
+                        "schema": {}
+                      }
+                    },
+                    "description": "Successful Response"
+                  },
+                  "422": {
+                    "content": {
+                      "application/json": {
+                        "schema": {
+                          "$ref": "#/components/schemas/HTTPValidationError"
+                        }
+                      }
+                    },
+                    "description": "Validation Error"
+                  }
+                },
+                "summary": "Api Screenshots"
+              }
+            },
+            "/api/screenshots/{batch_name}/{asin}": {
+              "get": {
+                "description": "取一张截图（`image/png`）。\n\n状态码是有意分开的，调用方可以据此决定要不要重试：\n\n- **200** —— 图在这儿\n- **404** —— 这个批次/ASIN 根本没有截图记录（或批次不存在）。别重试。\n- **409** —— 有记录但还没截好（`pending` / `processing`）。**稍后再来**。\n  响应体带 `status`，`Retry-After: 10`。\n- **410** —— 截图**失败**了，不会再有。响应体带 `error_detail`。别重试。\n\n`.png` 后缀可带可不带，`B0XXXXXXX1` 与 `B0XXXXXXX1.png` 等价。",
+                "operationId": "api_screenshot_file_api_screenshots__batch_name___asin__get",
+                "parameters": [
+                  {
+                    "in": "path",
+                    "name": "batch_name",
+                    "required": true,
+                    "schema": {
+                      "title": "Batch Name",
+                      "type": "string"
+                    }
+                  },
+                  {
+                    "in": "path",
+                    "name": "asin",
+                    "required": true,
+                    "schema": {
+                      "title": "Asin",
+                      "type": "string"
+                    }
+                  }
+                ],
+                "responses": {
+                  "200": {
+                    "content": {
+                      "application/json": {
+                        "schema": {}
+                      }
+                    },
+                    "description": "Successful Response"
+                  },
+                  "422": {
+                    "content": {
+                      "application/json": {
+                        "schema": {
+                          "$ref": "#/components/schemas/HTTPValidationError"
+                        }
+                      }
+                    },
+                    "description": "Validation Error"
+                  }
+                },
+                "summary": "Api Screenshot File"
               }
             },
             "/api/seller-batches/{batch_id}/discoveries": {
@@ -5886,6 +6033,160 @@
         },
         "content_type": "application/json",
         "status": 400
+      }
+    },
+    {
+      "name": "json_submit_no_valid_asin",
+      "request": {
+        "data": null,
+        "files": null,
+        "json": {
+          "asins": [
+            "not-an-asin"
+          ],
+          "batch_name": "golden_json_bad"
+        },
+        "method": "POST",
+        "params": null,
+        "path": "/api/batches"
+      },
+      "response": {
+        "body": {
+          "detail": "未找到有效 ASIN"
+        },
+        "content_type": "application/json",
+        "status": 400
+      }
+    },
+    {
+      "name": "json_submit_body_not_an_object",
+      "request": {
+        "data": null,
+        "files": null,
+        "json": [
+          "B0GOLDEN01"
+        ],
+        "method": "POST",
+        "params": null,
+        "path": "/api/batches"
+      },
+      "response": {
+        "body": {
+          "detail": "请求体必须是 JSON 对象"
+        },
+        "content_type": "application/json",
+        "status": 400
+      }
+    },
+    {
+      "name": "json_submit_bad_zip",
+      "request": {
+        "data": null,
+        "files": null,
+        "json": {
+          "asins": [
+            "B0GOLDEN01",
+            "B0GOLDEN02",
+            "B0GOLDEN03"
+          ],
+          "batch_name": "golden_json_zip",
+          "zip_code": "abcde"
+        },
+        "method": "POST",
+        "params": null,
+        "path": "/api/batches"
+      },
+      "response": {
+        "body": {
+          "detail": "非法邮编: abcde"
+        },
+        "content_type": "application/json",
+        "status": 400
+      }
+    },
+    {
+      "name": "json_submit_duplicate_name",
+      "request": {
+        "data": null,
+        "files": null,
+        "json": {
+          "asins": [
+            "B0GOLDEN01",
+            "B0GOLDEN02",
+            "B0GOLDEN03"
+          ],
+          "batch_name": "golden_batch_a"
+        },
+        "method": "POST",
+        "params": null,
+        "path": "/api/batches"
+      },
+      "response": {
+        "body": {
+          "detail": {
+            "batch_id": 1,
+            "batch_name": "golden_batch_a",
+            "error": "batch_name_conflict",
+            "message": "批次名已存在: golden_batch_a（未合并，也未改动既有批次）",
+            "status_url": "http://testserver/api/batches/golden_batch_a/status"
+          }
+        },
+        "content_type": "application/json",
+        "status": 409
+      }
+    },
+    {
+      "name": "screenshots_without_batch_selector",
+      "request": {
+        "data": null,
+        "files": null,
+        "json": null,
+        "method": "GET",
+        "params": null,
+        "path": "/api/screenshots"
+      },
+      "response": {
+        "body": {
+          "detail": "需要 batch_name 或 batch_id"
+        },
+        "content_type": "application/json",
+        "status": 400
+      }
+    },
+    {
+      "name": "screenshots_missing_batch",
+      "request": {
+        "data": null,
+        "files": null,
+        "json": null,
+        "method": "GET",
+        "params": null,
+        "path": "/api/screenshots?batch_name=no_such_batch"
+      },
+      "response": {
+        "body": {
+          "detail": "批次不存在: no_such_batch"
+        },
+        "content_type": "application/json",
+        "status": 404
+      }
+    },
+    {
+      "name": "screenshot_file_missing_batch",
+      "request": {
+        "data": null,
+        "files": null,
+        "json": null,
+        "method": "GET",
+        "params": null,
+        "path": "/api/screenshots/no_such_batch/B0GOLDEN01"
+      },
+      "response": {
+        "body": {
+          "detail": "批次不存在: no_such_batch"
+        },
+        "content_type": "application/json",
+        "status": 404
       }
     },
     {

@@ -562,3 +562,30 @@ class MediaMixin:
                 stats[row["status"]] = row["cnt"]
         stats["total"] = sum(stats.values())
         return stats
+
+    async def list_screenshots(self, batch_id: int, asin: str = None,
+                               status: str = None, cursor_asin: str = None,
+                               limit: int = 200) -> List[Dict]:
+        """逐条列出一个批次的截图状态。SQLite 侧同名方法的对等实现。
+
+        文本参数一律过 ``text_affinity``：``screenshots.asin`` / ``status`` 是
+        ``text COLLATE "C"``，而 asyncpg 对 Python str 的推断在参数位置上不总能
+        落到同一类型，绕过索引就得全表扫。排序由 ``COLLATE "C"`` 保证与 SQLite
+        逐字节一致 —— 这也是建库必须 ``LC_COLLATE=C`` 的老原因，游标分页靠它。
+        """
+        sql = ["SELECT asin, status, retry_count, error_detail, file_path, updated_at "
+               "FROM screenshots WHERE batch_id = ?"]
+        params: List[Any] = [self.as_int(batch_id)]
+        if asin:
+            sql.append("AND asin = ?")
+            params.append(self.text_affinity(asin))
+        if status:
+            sql.append("AND status = ?")
+            params.append(self.text_affinity(status))
+        if cursor_asin:
+            sql.append("AND asin > ?")
+            params.append(self.text_affinity(cursor_asin))
+        sql.append("ORDER BY asin LIMIT ?")
+        params.append(self.as_int(max(1, min(int(limit), 1000))))
+        async with self.read() as rc, rc.execute(" ".join(sql), tuple(params)) as c:
+            return [dict(r) for r in await c.fetchall()]

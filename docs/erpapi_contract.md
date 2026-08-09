@@ -6,7 +6,11 @@
 > 代码与本文不一致时**以代码为准**，并请开 issue —— 本文的每一条行为都有
 > 守卫用例钉住（见 §8），代码改了而用例没红，说明是本文漏写。
 >
-> **版本**：2026-08-07。本轮改了 `POST /api/upload` 的撞名语义与
+> **版本**：2026-08-09。本轮**只新增**三个端点（`POST /api/batches` JSON 推送、
+> `GET /api/screenshots` 列截图、`GET /api/screenshots/{batch_name}/{asin}` 取图），
+> 既有端点一个字节都没改，现有接入无需改动。新增部分见 §4.9 / §4.10。
+>
+> 上一版（2026-08-07）改了 `POST /api/upload` 的撞名语义与
 > `GET /api/results` 的单页上限，两处都是**有意的、破坏性的**变更，
 > 详见 §5「与旧系统的差异」。
 
@@ -23,12 +27,15 @@
 | 5 | `GET /api/batches/{batch_id}/failures` | 完整失败明细 | 保留，旧坑在我们这边本来就不存在（§4.4） |
 | 6 | `POST /api/batches/{batch_id}/prioritize` | 插队 | 保留，但 `ok:true` 不代表批次存在（§4.6） |
 | 7 | `GET /static/screenshots/...` | 取截图 | 保留，未改（§4.7） |
+| 8 | `POST /api/batches` | 提交采集批次（**JSON**） | **本轮新增**，与 #2 等价（§4.9） |
+| 9 | `GET /api/screenshots` | 列批次截图状态 + URL | **本轮新增**（§4.10） |
+| 10 | `GET /api/screenshots/{batch_name}/{asin}` | 取单张截图，状态码可区分 | **本轮新增**（§4.10） |
 
 > 曾经的第 6 个端点 `GET /api/batches/{batch_name}/errors`（失败明细旧接口）
 > 已经**删除**，不是废弃——`失败明细`统一走 `GET /api/batches/{batch_id}/failures`
 > （§4.4）。历史细节见 §5.4。
 
-七个端点在本仓库**全部存在**，路由声明位置：
+十个端点在本仓库**全部存在**，路由声明位置：
 
 | 端点 | 声明处 |
 |---|---|
@@ -39,6 +46,9 @@
 | `GET /api/results` | `server/api/results.py:151` |
 | `GET /api/export/incremental` | `server/api/export_incremental.py:375` |
 | `/static/**`（截图） | `server/app.py:253`（`StaticFiles` 挂载） |
+| `POST /api/batches` | `server/api/batches.py:api_create_batch` |
+| `GET /api/screenshots` | `server/api/screenshots.py:api_screenshots` |
+| `GET /api/screenshots/{batch_name}/{asin}` | `server/api/screenshots.py:api_screenshot_file` |
 
 ---
 
@@ -571,6 +581,142 @@ while True:
 
 ---
 
+### 4.9 `POST /api/batches` —— 提交采集批次（**JSON**，本轮新增）
+
+与 §4.1 的 `POST /api/upload` **是同一件事**，只是不用把 ASIN 列表拼成
+xlsx/csv 再 multipart 上传。两者在采集侧共用同一个函数
+（`server/api/batches.py:_create_batch_with_tasks`），所以 §4.1 里关于
+**撞名 409、回调注册、回显读回值**的每一条在这里逐字成立，包括 §5.1 / §5.2
+说的「批次名不需要毫秒精度」「POST 可以安全重试」。
+
+**请求**：`Content-Type: application/json`
+
+```json
+{
+  "asins": ["B0XXXXXXX1", "B0XXXXXXX2"],
+  "items": [{"asin": "B0XXXXXXX1", "zip_code": "10001"}],
+  "zip_code": "90001",
+  "needs_screenshot": false,
+  "batch_name": null,
+  "callback_url": null,
+  "external_id": null,
+  "expand_variants": false
+}
+```
+
+| 字段 | 必填 | 默认 | 说明 |
+|---|---|---|---|
+| `asins` | 与 `items` 二选一 | — | ASIN 数组。两个都给 = 合并 |
+| `items` | 与 `asins` 二选一 | — | `[{asin, zip_code}]`，逐 ASIN 指定邮编。元素也可以直接是 ASIN 字符串 |
+| `zip_code` | 否 | 服务端默认邮编 | 整批邮编。不传或 `null` = 跟随默认 |
+| `needs_screenshot` | 否 | `false` | **批次级**开关，没有逐 ASIN 粒度 |
+| `batch_name` | 否 | 自动生成 | 撞名 → 409，形状同 §4.1 |
+| `callback_url` | 否 | `null` | 同 §4.1，走同一套 SSRF 校验 |
+| `external_id` | 否 | `null` | 原样回传，上限 120 字符 |
+| `expand_variants` | 否 | `false` | 自动展开变体 |
+
+**邮编优先级**：`items[].zip_code` > 顶层 `zip_code` > 服务端默认。
+
+**200 响应**：键集合与 §4.1 完全一致（`batch_id` / `batch_name` /
+`external_id` / `total_asins` / `inserted` / `per_asin_zip_count` /
+`invalid_zip_rows` / `callback_url` / `status_url`）。
+
+**错误**：
+
+| 码 | `detail` | 触发 |
+|---|---|---|
+| 400 | `"请求体不是合法 JSON"` / `"请求体必须是 JSON 对象"` | 体坏了 / 顶层不是对象 |
+| 400 | `"未找到有效 ASIN"` | 过滤后一个 ASIN 都不剩 |
+| 400 | `"非法邮编: xxx"` | **整批**邮编非法（逐 ASIN 的非法邮编不致命，见下） |
+| 400 | `"非法批次名"` | 批次名含 `/` `\\` `..` 等，会穿出截图目录 |
+| 400 | 对象，`error = "conflicting_zip_for_asin"` | 同一次推送里给同一 ASIN 两个**不同**邮编，见下 |
+| 409 | 对象，`error = "batch_name_conflict"` | 撞名，形状同 §4.1 |
+
+**逐 ASIN 邮编非法不拦请求**：计入响应的 `invalid_zip_rows`，那些 ASIN 退回
+用批次邮编。这与「整批邮编非法就 400」的不对称是有意的，也与 §4.1 处理
+xlsx B 列的方式一致：一列几万行里有一格脏数据就整批失败，比退回默认更难用。
+
+#### 4.9.1 同一个 ASIN 要采多个邮编 —— **一个邮编一个批次**
+
+这是库结构决定的，不是接口偏好：`tasks` 上有 `UNIQUE(batch_id, asin)`，
+**一个批次里一个 ASIN 只能有一个邮编**。所以同一次推送里给同一 ASIN 两个不同
+邮编会被拒绝，而不是静默取第一个：
+
+```json
+400 {"detail": {"error": "conflicting_zip_for_asin",
+                "asin": "B0XXXXXXX1",
+                "zip_codes": ["10001", "90001"],
+                "message": "...一个邮编推一个批次..."}}
+```
+
+拆成两个批次（批次名带上邮编）之后：
+
+* **截图**天然分开 —— 落盘是 `<批次名>/<asin>.png`，**批次名就是隔离键**；
+* **数据**必须走 `GET /api/export/incremental`（§4.8），按
+  `scrape_params.zipcode` 分辨。
+
+> ⚠ **不要用快照类端点取多邮编数据。** `asin_data.asin` 是 `UNIQUE`，全库每个
+> ASIN 只有一行，后采的覆盖先采的；而 `GET /api/results?batch_id=` 的
+> `batch_id` 只用来**挑 ASIN**，数据仍取那一行全局快照
+> （`common/pgdb/results_read.py:156`，`JOIN batch_asins ba ON ba.asin = d.asin`）。
+> 结果：同一 ASIN 的两个邮编批次，`GET /api/results` 与
+> `GET /api/export/{batch_name}` 返回**完全相同的行**，且不报任何错。
+> 逐邮编准确的只有 §4.8 这一条路。
+> 四条性质由 `tests/test_multi_zip_same_asin.py` 端到端钉住。
+
+---
+
+### 4.10 `GET /api/screenshots*` —— 查截图状态与取图（本轮新增）
+
+§4.7 的 `/static/screenshots/...` **保留不变**，本节是它的补充而非替代。
+用本节这两条的理由：不必为了拿一个路径去 `GET /api/results` 拉整行商品数据，
+以及取图失败时能分清「再等等」和「别等了」。
+
+**`GET /api/screenshots`** —— 列一个批次的截图状态
+
+查询参数：`batch_name` 或 `batch_id`（**给一个**，都不给 → 400）；可选
+`asin`、`status`（`pending`/`processing`/`done`/`failed`）、`cursor`、
+`limit`（默认 200，上限 1000）。
+
+```json
+{
+  "batch_id": 12,
+  "batch_name": "job_20260809_10001",
+  "progress": {"pending": 3, "processing": 0, "done": 7, "failed": 0, "total": 10},
+  "items": [
+    {"asin": "B0XXXXXXX1", "status": "done", "retry_count": 0,
+     "error_detail": null, "updated_at": "2026-08-09 10:20:31",
+     "url": "http://host:8899/api/screenshots/job_20260809_10001/B0XXXXXXX1"}
+  ],
+  "next_cursor": "B0XXXXXXX1"
+}
+```
+
+* `url` **仅在 `status == "done"` 时非 `null`** —— 别的状态那张图不存在，
+  给 URL 只会让你去撞 404。
+* `progress` 是**整批**计数，不受 `asin`/`status`/`cursor` 过滤影响。
+* 分页按 ASIN 升序；`next_cursor` 为 `null` 表示到底了（本页没装满就必然到底，
+  不会再给 cursor）。
+* 批次不存在 → 404。非法 `status` → 400。
+
+**`GET /api/screenshots/{batch_name}/{asin}`** —— 取那张 PNG
+
+`.png` 后缀可带可不带。**四种结局是四个不同的状态码**，据此决定要不要重试：
+
+| 码 | 含义 | body | 该怎么办 |
+|---|---|---|---|
+| 200 | 图在这儿 | `image/png` 二进制 | — |
+| 404 | 没有这条截图记录 / 批次不存在 / 文件已被清理 | `{"detail": "..."}` | **别重试** |
+| 409 | 有记录但还没截好 | `detail.error = "screenshot_pending"`，带 `detail.status`；响应头 `Retry-After: 10` | **稍后再来** |
+| 410 | 截图失败，不会再有 | `detail.error = "screenshot_failed"`，带 `detail.error_detail` / `detail.retry_count` | **别重试** |
+
+对比 §4.7：那条路上后三种全是同一个 404，分不出来。
+
+由 `tests/test_screenshot_api.py` 钉住，其中
+`test_all_four_outcomes_are_distinct` 专门守「这四个码互不相同」。
+
+---
+
 ## 5. 与旧系统的差异 —— 哪些规避动作**现在可以拆掉了**
 
 > 这一节逐条对应 erpAPI 给来的旧坑清单。**这些约束是旧数据库的限制，
@@ -874,6 +1020,13 @@ if r["status"] == "completed":      # ✅ 权威判据
 | `/failures` 的 `limit` 上限（100000）与 `error_type` 过滤不能被削弱 | `tests/test_batch_failures_endpoint.py` |
 | 错误码封闭集不漂移（含 `batch_name_conflict`） | `tests/test_error_codes.py` |
 | 增量导出契约 v1 逐句 | `tests/test_incremental_export.py` |
+| `POST /api/batches` 与 `/api/upload` 走**同一份实现**（撞名语义不会分叉） | `tests/test_json_submit_endpoint.py::ParityWithUploadTests` |
+| JSON 推送的邮编三档（逐 ASIN / 整批 / 服务端默认） | `…::ZipCodeChoiceTests` |
+| JSON 推送的截图开关，不传即不截 | `…::ScreenshotChoiceTests` |
+| 取图的四种结局是**四个不同的状态码** | `tests/test_screenshot_api.py::…::test_all_four_outcomes_are_distinct` |
+| 截图列表给的 `url` 真的能打，且只在 `done` 时非 null | `tests/test_screenshot_api.py::ScreenshotListTests` |
+| 同 ASIN 多邮编：截图按批次隔离、增量导出保留两份、快照只有一行 | `tests/test_multi_zip_same_asin.py` |
+| 一次推送里同 ASIN 给两个邮编 → 400（不静默丢一个） | `…::test_two_zips_for_one_asin_in_one_push_is_rejected` |
 | 两个后端行为逐字节一致 | `python -m tests.golden.run verify` / `DB_BACKEND=postgres … verify` |
 
 **门禁**（改了本文覆盖的任何行为都要全绿）：

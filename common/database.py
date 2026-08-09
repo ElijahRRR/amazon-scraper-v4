@@ -2458,6 +2458,35 @@ class Database:
         stats["total"] = sum(stats.values())
         return stats
 
+    async def list_screenshots(self, batch_id: int, asin: str = None,
+                               status: str = None, cursor_asin: str = None,
+                               limit: int = 200) -> List[Dict]:
+        """逐条列出一个批次的截图状态（给 GET /api/screenshots 用）。
+
+        与 ``get_screenshot_progress`` 的区别：那个只给四个计数，调用方拿不到
+        「**哪个** ASIN 好了、URL 是什么」——而这正是取图的前提。
+
+        按 ``asin`` 升序 + keyset 分页（``cursor_asin`` 是**已返回的最后一个**
+        asin，严格大于）。走的是 ``UNIQUE(batch_id, asin)``，翻页不退化。
+        ``limit`` 由调用方夹紧，这里只做保底截断。
+        """
+        sql = ["SELECT asin, status, retry_count, error_detail, file_path, updated_at "
+               "FROM screenshots WHERE batch_id = ?"]
+        params: List = [batch_id]
+        if asin:
+            sql.append("AND asin = ?")
+            params.append(asin)
+        if status:
+            sql.append("AND status = ?")
+            params.append(status)
+        if cursor_asin:
+            sql.append("AND asin > ?")
+            params.append(cursor_asin)
+        sql.append("ORDER BY asin LIMIT ?")
+        params.append(max(1, min(int(limit), 1000)))
+        async with self.read() as rc, rc.execute(" ".join(sql), tuple(params)) as c:
+            return [dict(r) for r in await c.fetchall()]
+
     # ==================== 导出操作 ====================
 
     async def iter_results(self, batch_id: int = None, change_filter: str = "all",

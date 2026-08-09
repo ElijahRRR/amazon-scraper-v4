@@ -1,6 +1,7 @@
-"""批次上传与生命周期（11 个端点）—— 从 `server/app.py` 拆出。
+"""批次上传与生命周期（12 个端点）—— 从 `server/app.py` 拆出。
 
     POST   /api/upload
+    POST   /api/batches
     GET    /api/batches
     GET    /api/progress
     GET    /api/batches/{batch_name}/screenshots/progress
@@ -44,6 +45,12 @@
      `{batch_id}/failures`。
    `POST /api/batches/delete-bulk` 与 `DELETE /api/batches/{batch_name}` 段数
    相同但**方法不同**，也不冲突。
+   `POST /api/batches`（JSON 推送）比它们都短一段，同样不冲突。
+
+6. **`POST /api/upload` 与 `POST /api/batches` 共用 `_create_batch_with_tasks`。**
+   两者只在「怎么把 ASIN 递进来」上不同（multipart 文件 vs JSON 数组），
+   递进来之后的语义——撞名 409 的响应体、回显读回值——必须逐字一致，所以那段
+   只有一份实现。改 409 的形状请改那个函数，别在端点里各改各的。
 """
 
 import csv
@@ -64,6 +71,106 @@ def _srv():
 
 
 router = APIRouter()
+
+
+async def _create_batch_with_tasks(
+    request: Request,
+    unique_asins: List[str],
+    per_asin_zip: Dict[str, str],
+    invalid_zip_count: int,
+    batch_name: Optional[str],
+    zip_code: Optional[str],
+    needs_screenshot: bool,
+    callback_url: Optional[str],
+    external_id: Optional[str],
+    expand_variants: bool,
+) -> Dict:
+    """「建批次 + 建任务 + 撞名 409 + 回显存下来的值」——**唯一**一份实现。
+
+    `POST /api/upload`（传文件）和 `POST /api/batches`（传 JSON）只是两种把
+    ASIN 递进来的方式，递进来之后的语义必须一模一样。所以差异到 `unique_asins`
+    / `per_asin_zip` 这两个入参就结束了，往下共用本函数。
+
+    这里是**共享层**而不是复制粘贴，理由很具体：撞名 409 那段（见下）是靠一堆
+    互相咬合的性质成立的——响应体里带既有 batch_id 才能让调用方接着轮询、回显
+    读回值而不是请求值才不会对 callback 撒谎。这些性质抄第二遍必然会漂，而漂了
+    之后**两个端点都不报错**，只是行为不同。
+
+    入参 `unique_asins` 必须已经去重且保序（谁调谁负责），本函数不再去一次。
+    """
+    _s = _srv()
+
+    if not batch_name:
+        batch_name = _s._batch_name("batch")     # P4.7：精度不变（本来就是秒）
+
+    # callback_url 校验（防 SSRF + 格式）
+    cb_url = (callback_url or "").strip() or None
+    if cb_url:
+        ok, reason = await _s._is_safe_callback_url(cb_url)
+        if not ok:
+            raise HTTPException(400, f"非法 callback_url（{reason}）。仅接受 http(s)://公网域名/IP")
+
+    ext_id = (external_id or "").strip()[:120] or None  # 上限 120 字符防滥用
+
+    zc = zip_code or _s._runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE)
+
+    # 构造 status URL（调用方可以轮询）。409 也要带上它，所以在建批次之前先算好。
+    base = str(request.base_url).rstrip("/")
+    status_url = f"{base}/api/batches/{batch_name}/status"
+
+    batch_id, created = await _s.db.create_batch_if_absent(
+        batch_name, needs_screenshot,
+        external_id=ext_id, callback_url=cb_url,
+        expand_variants=expand_variants,
+    )
+    if not created:
+        # 撞名 -> 409，**绝不静默合并**。
+        #
+        # 以前这里是 200 + 既有 batch_id，实测后果（Phase 4.7 已证明撞名不是
+        # no-op，本轮修的就是它）：
+        #   * 本次的新 ASIN 被悄悄塞进上一个批次，「一次采集」的语义破掉；
+        #   * `inserted` 在部分重叠时是非零，看起来像成功新建；
+        #   * **本次的 external_id / callback_url 被静默丢弃**（INSERT OR IGNORE
+        #     整行不插，既有行一个字段都不更新），而响应回显的是**请求**里的值 ——
+        #     调用方以为回调注册好了，回调永远不会触发。
+        #
+        # 为什么是 409，而不是「自动加后缀」或「200 加个 merged 标志」：只有让
+        # 撞名变成一个**可识别的失败**，上传/推送才是可安全重试的 —— 网络超时后
+        # 重发，上一次若其实成功了，这里回的是 409 + 那个 batch_id。
+        # 自动加后缀会让重试造出第二个批次，200+标志则要求每个调用方都记得读那个
+        # 标志，漏读的代价与今天一模一样。
+        #
+        # 注意 batch_id 是**既有批次**的 id（create_batch_if_absent 撞名时照样把它
+        # SELECT 回来），调用方可以直接拿 status_url 接着轮询，不必再查一次。
+        raise HTTPException(409, {
+            "error": _s._BATCH_NAME_CONFLICT_CODE,
+            "message": f"批次名已存在: {batch_name}（未合并，也未改动既有批次）",
+            "batch_id": batch_id,
+            "batch_name": batch_name,
+            "status_url": status_url,
+        })
+
+    inserted = await _s.db.create_tasks(
+        batch_id, unique_asins, zc, needs_screenshot,
+        per_asin_zip=per_asin_zip,
+    )
+
+    # 回显**存下来的**值，不是请求里的值。
+    # 撞名已经在上面 409 掉了，所以走到这里两者必然相等——但「回显请求值」这个
+    # 写法本身就是上面那个回调撒谎 bug 的载体，留着它等于把地雷埋回去。
+    # 读回一行的代价（一次主键级 SELECT）远小于「回调注册成功了吗」这种问题。
+    stored = await _s.db.get_batch_by_name(batch_name)
+    return {
+        "batch_id": batch_id,
+        "batch_name": batch_name,
+        "external_id": stored.get("external_id") if stored else ext_id,
+        "total_asins": len(unique_asins),
+        "inserted": inserted,
+        "per_asin_zip_count": len(per_asin_zip),
+        "invalid_zip_rows": invalid_zip_count,
+        "callback_url": stored.get("callback_url") if stored else cb_url,
+        "status_url": status_url,
+    }
 
 
 @router.post("/api/upload")
@@ -171,77 +278,150 @@ async def api_upload(request: Request,
             unique_asins.append(a)
             seen.add(a)
 
-    if not batch_name:
-        batch_name = _s._batch_name("batch")     # P4.7：精度不变（本来就是秒）
-
-    # callback_url 校验（防 SSRF + 格式）
-    cb_url = (callback_url or "").strip() or None
-    if cb_url:
-        ok, reason = await _s._is_safe_callback_url(cb_url)
-        if not ok:
-            raise HTTPException(400, f"非法 callback_url（{reason}）。仅接受 http(s)://公网域名/IP")
-
-    ext_id = (external_id or "").strip()[:120] or None  # 上限 120 字符防滥用
-
-    zc = zip_code or _s._runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE)
-
-    # 构造 status URL（调用方可以轮询）。409 也要带上它，所以在建批次之前先算好。
-    base = str(request.base_url).rstrip("/")
-    status_url = f"{base}/api/batches/{batch_name}/status"
-
-    batch_id, created = await _s.db.create_batch_if_absent(
-        batch_name, needs_screenshot,
-        external_id=ext_id, callback_url=cb_url,
-        expand_variants=expand_variants,
-    )
-    if not created:
-        # 撞名 -> 409，**绝不静默合并**。
-        #
-        # 以前这里是 200 + 既有 batch_id，实测后果（Phase 4.7 已证明撞名不是
-        # no-op，本轮修的就是它）：
-        #   * 本次的新 ASIN 被悄悄塞进上一个批次，「一次采集」的语义破掉；
-        #   * `inserted` 在部分重叠时是非零，看起来像成功新建；
-        #   * **本次的 external_id / callback_url 被静默丢弃**（INSERT OR IGNORE
-        #     整行不插，既有行一个字段都不更新），而响应回显的是**请求**里的值 ——
-        #     调用方以为回调注册好了，回调永远不会触发。
-        #
-        # 为什么是 409，而不是「自动加后缀」或「200 加个 merged 标志」：只有让
-        # 撞名变成一个**可识别的失败**，POST /api/upload 才是可安全重试的 ——
-        # 网络超时后重发，上一次若其实成功了，这里回的是 409 + 那个 batch_id。
-        # 自动加后缀会让重试造出第二个批次，200+标志则要求每个调用方都记得读那个
-        # 标志，漏读的代价与今天一模一样。
-        #
-        # 注意 batch_id 是**既有批次**的 id（create_batch_if_absent 撞名时照样把它
-        # SELECT 回来），调用方可以直接拿 status_url 接着轮询，不必再查一次。
-        raise HTTPException(409, {
-            "error": _s._BATCH_NAME_CONFLICT_CODE,
-            "message": f"批次名已存在: {batch_name}（未合并，也未改动既有批次）",
-            "batch_id": batch_id,
-            "batch_name": batch_name,
-            "status_url": status_url,
-        })
-
-    inserted = await _s.db.create_tasks(
-        batch_id, unique_asins, zc, needs_screenshot,
-        per_asin_zip=per_asin_zip,
+    return await _create_batch_with_tasks(
+        request, unique_asins, per_asin_zip, invalid_zip_count,
+        batch_name=batch_name, zip_code=zip_code,
+        needs_screenshot=needs_screenshot, callback_url=callback_url,
+        external_id=external_id, expand_variants=expand_variants,
     )
 
-    # 回显**存下来的**值，不是请求里的值。
-    # 撞名已经在上面 409 掉了，所以走到这里两者必然相等——但「回显请求值」这个
-    # 写法本身就是上面那个回调撒谎 bug 的载体，留着它等于把地雷埋回去。
-    # 读回一行的代价（一次主键级 SELECT）远小于「回调注册成功了吗」这种问题。
-    stored = await _s.db.get_batch_by_name(batch_name)
-    return {
-        "batch_id": batch_id,
-        "batch_name": batch_name,
-        "external_id": stored.get("external_id") if stored else ext_id,
-        "total_asins": len(unique_asins),
-        "inserted": inserted,
-        "per_asin_zip_count": len(per_asin_zip),
-        "invalid_zip_rows": invalid_zip_count,
-        "callback_url": stored.get("callback_url") if stored else cb_url,
-        "status_url": status_url,
-    }
+
+@router.post("/api/batches")
+async def api_create_batch(request: Request):
+    """**推送采集任务（JSON）** —— 和 `POST /api/upload` 等价，只是不用传文件。
+
+    给程序化调用方用：上游系统手里本来就是一个 ASIN 列表，为了调这个接口先拼
+    一个 xlsx 再 multipart 上传是纯粹的仪式。响应体、409 撞名语义、回调注册，
+    与 `/api/upload` **完全一致**（同一份实现）。
+
+    请求体：
+
+        {
+          "asins": ["B0XXXXXXX1", "B0XXXXXXX2"],   // 与 items 二选一
+          "items": [                                // 需要逐个 ASIN 指定邮编时用
+            {"asin": "B0XXXXXXX1", "zip_code": "10001"},
+            {"asin": "B0XXXXXXX2"}                  // 不写 -> 用下面的 zip_code
+          ],
+          "zip_code":         "90001",   // 可选。不传 = 用服务端默认邮编
+          "needs_screenshot": false,     // 可选，默认 false
+          "batch_name":       null,      // 可选，不传则自动生成
+          "callback_url":     null,      // 可选，批次完成时 POST 通知
+          "external_id":      null,      // 可选，原样回传
+          "expand_variants":  false      // 可选
+        }
+
+    两个「自由选择」按调用方要的语义来：
+
+    * **邮编**：三档独立。`items[].zip_code`（这一个 ASIN）> 顶层 `zip_code`
+      （这一批）> 服务端默认。想跟随服务端默认就整个不传这个键——传 `null` 也
+      当没传，但**不要**传 `""` 去表达「用默认」，空串这里按缺省处理、别的地方
+      未必，少一层歧义是一层。
+    * **截图**：`needs_screenshot` 是**批次级**开关（底层 `batches` 表就一列，
+      截图任务是按批派生的）。不传即 false，也就是**默认不截图**。想要一半截图
+      一半不截，推两个批次——不要指望 items 里逐个开关，那个粒度库里不存在。
+
+    `asins` 与 `items` 可以同时给（合并，`items` 的邮编优先）。ASIN 去重保序，
+    非法 ASIN 直接丢弃；一个都不剩 -> 400。非法邮编不拦请求，计入响应的
+    `invalid_zip_rows`，那些 ASIN 退回用批次邮编。
+    """
+    _s = _srv()
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        raise HTTPException(400, "请求体不是合法 JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "请求体必须是 JSON 对象")
+
+    asins: List[str] = []
+    per_asin_zip: Dict[str, str] = {}
+    invalid_zip_count = 0
+
+    def add_pair(asin_val, zip_val):
+        nonlocal invalid_zip_count
+        asin = _s._normalize_asin(asin_val)
+        if not asin:
+            return
+        asins.append(asin)
+        if zip_val is not None and str(zip_val).strip():
+            zip_norm = _s._normalize_zip(zip_val)
+            if zip_norm:
+                # 同一 ASIN 给了**两个不同**邮编 -> 400，不静默取第一个。
+                #
+                # 库里 `tasks` 是 UNIQUE(batch_id, asin)，一个批次里同一个 ASIN
+                # 只能有一条任务、也就只能有一个邮编 —— 这个诉求在**一个批次内**
+                # 根本表达不了。/api/upload 那边靠 `setdefault` 悄悄取第一个，
+                # 调用方拿到 200、少采了一个邮编，而且响应里看不出来。
+                # 这里明确失败并告诉他们怎么做：一个邮编一个批次。
+                prev = per_asin_zip.get(asin)
+                if prev is not None and prev != zip_norm:
+                    raise HTTPException(400, {
+                        "error": "conflicting_zip_for_asin",
+                        "message": (
+                            f"同一批次里 {asin} 被指定了两个邮编"
+                            f"（{prev} 与 {zip_norm}）。一个批次里一个 ASIN 只能有"
+                            f"一个邮编——同一 ASIN 要采多个邮编，请**一个邮编推一个"
+                            f"批次**（批次名带上邮编），这样数据与截图都按批次分开。"),
+                        "asin": asin,
+                        "zip_codes": [prev, zip_norm],
+                    })
+                per_asin_zip.setdefault(asin, zip_norm)
+            else:
+                invalid_zip_count += 1
+
+    raw_asins = body.get("asins") or []
+    if not isinstance(raw_asins, list):
+        raise HTTPException(400, "asins 必须是数组")
+    for a in raw_asins:
+        add_pair(a, None)
+
+    raw_items = body.get("items") or []
+    if not isinstance(raw_items, list):
+        raise HTTPException(400, "items 必须是数组")
+    for it in raw_items:
+        if isinstance(it, dict):
+            add_pair(it.get("asin"), it.get("zip_code"))
+        else:
+            # 允许 items 里直接写字符串 ASIN——调用方混着写不该是个错误
+            add_pair(it, None)
+
+    if not asins:
+        raise HTTPException(400, "未找到有效 ASIN")
+
+    # 去重（保持顺序）
+    seen = set()
+    unique_asins = []
+    for a in asins:
+        if a not in seen:
+            unique_asins.append(a)
+            seen.add(a)
+
+    zip_code = body.get("zip_code")
+    zip_code = str(zip_code).strip() if zip_code is not None else None
+    if zip_code:
+        zip_norm = _s._normalize_zip(zip_code)
+        if not zip_norm:
+            raise HTTPException(400, f"非法邮编: {zip_code}")
+        zip_code = zip_norm
+    else:
+        # "" 与 null 同义：跟随服务端默认
+        zip_code = None
+
+    batch_name = body.get("batch_name")
+    batch_name = str(batch_name).strip() if batch_name else None
+    if batch_name and _s._safe_fs_component(batch_name) is None:
+        # 批次名会拼成截图目录名，非法值必须在建批次**之前**挡掉，
+        # 否则批次建好了、截图却永远落不了盘。
+        raise HTTPException(400, "非法批次名")
+
+    return await _create_batch_with_tasks(
+        request, unique_asins, per_asin_zip, invalid_zip_count,
+        batch_name=batch_name,
+        zip_code=zip_code,
+        needs_screenshot=bool(body.get("needs_screenshot", False)),
+        callback_url=body.get("callback_url"),
+        external_id=body.get("external_id"),
+        expand_variants=bool(body.get("expand_variants", False)),
+    )
 
 
 @router.get("/api/batches")
