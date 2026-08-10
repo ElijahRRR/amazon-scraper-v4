@@ -546,7 +546,7 @@ amazon-scraper-v4/
 │   else: status='pending'（重新入队）                            │
 ├────────────────────────────────────────────────────────────────┤
 │ 层 3：auto_retry_failed_tasks（每 30s 周期任务）                │
-│   扫描 status='failed' AND auto_retry_count < 2 AND 失败>5min  │
+│   扫描 status='failed' AND auto_retry_count < 2 AND 失败>1min  │
 │   重置为 pending，再走 2 轮（每轮 = 层 1+2 完整循环）          │
 ├────────────────────────────────────────────────────────────────┤
 │ 层 4：reclaim_dead_worker_tasks（每 30s 周期任务）              │
@@ -556,6 +556,24 @@ amazon-scraper-v4/
 ```
 
 正常错误（network / timeout / blocked / captcha / ...）最大尝试 = `MAX_RETRIES × MAX_RETRIES × (1 + auto_retry_cycles) = 3 × 3 × 3 = 27 次`；`variant_offset` 这类首次失败即终态的错误只会尝试 1 次。
+
+层 3 的两个参数是**运行期设置**，可随时改，不用重启：
+
+| 设置项 | 默认 | 含义 |
+|---|---|---|
+| `auto_retry_failed_enabled` | `true` | 关掉就完全不自动重试 |
+| `auto_retry_cycles` | `2` | 最多捞回来几轮 |
+| `auto_retry_delay_minutes` | `1` | 终态失败后至少等这么久才有资格被捞 |
+
+```bash
+curl -X PUT http://<server>:8899/api/settings \
+  -H 'Content-Type: application/json' -d '{"auto_retry_delay_minutes": 1}'
+```
+
+⚠️ 代码里的默认值只对**全新部署**和 `POST /api/settings/reset` 之后生效 ——
+`_load_settings` 是「默认值 `.update(` 磁盘上的 `runtime_settings.json)`」，
+已有部署以磁盘那份为准。升级后想让新默认值生效，要么走上面的 `PUT`，
+要么删掉 `runtime_settings.json` 里那个键。
 
 按 `error_type` 分级的不重试策略（`common/core/retry.py`，SQLite/PostgreSQL 共用同一份）：
 

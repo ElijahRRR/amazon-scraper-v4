@@ -15,7 +15,7 @@
           "settings": {
             "adjust_interval": 3,
             "auto_retry_cycles": 2,
-            "auto_retry_delay_minutes": 5,
+            "auto_retry_delay_minutes": 1,
             "auto_retry_failed_enabled": true,
             "auto_scrape_schedules": [],
             "block_rate_threshold": 0.05,
@@ -2639,7 +2639,7 @@
           "settings": {
             "adjust_interval": 3,
             "auto_retry_cycles": 2,
-            "auto_retry_delay_minutes": 5,
+            "auto_retry_delay_minutes": 1,
             "auto_retry_failed_enabled": true,
             "auto_scrape_schedules": [],
             "block_rate_threshold": 0.05,
@@ -5120,7 +5120,7 @@
           "settings": {
             "adjust_interval": 3,
             "auto_retry_cycles": 2,
-            "auto_retry_delay_minutes": 5,
+            "auto_retry_delay_minutes": 1,
             "auto_retry_failed_enabled": true,
             "auto_scrape_schedules": [],
             "block_rate_threshold": 0.05,
@@ -5165,7 +5165,7 @@
           "settings": {
             "adjust_interval": 3,
             "auto_retry_cycles": 2,
-            "auto_retry_delay_minutes": 5,
+            "auto_retry_delay_minutes": 1,
             "auto_retry_failed_enabled": true,
             "auto_scrape_schedules": [],
             "block_rate_threshold": 0.05,

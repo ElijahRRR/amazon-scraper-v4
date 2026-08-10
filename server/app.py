@@ -83,7 +83,13 @@ def _default_settings() -> dict:
         # 后台自动重试失败任务（AI 自动化场景：不需要人工点击重试）
         "auto_retry_failed_enabled": True,
         "auto_retry_cycles": 2,          # 最多重试多少轮（每轮会再走 MAX_RETRIES 次常规重试）
-        "auto_retry_delay_minutes": 5,   # 任务失败后至少等这么久才会被自动重入队
+        # 任务终态失败后至少等这么久才会被自动重入队。
+        #
+        # ⚠ 这只是**默认值**。`_load_settings` 是 `默认值.update(磁盘上的 json)`，
+        # 所以已经存在 runtime_settings.json 的部署里，磁盘上那份说了算，改这里
+        # 不生效——那种情况要走 `PUT /api/settings`（立即生效，不用重启）。
+        # 这里的值只影响全新部署，以及 `POST /api/settings/reset` 之后。
+        "auto_retry_delay_minutes": 1,
     }
 
 
