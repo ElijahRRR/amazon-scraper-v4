@@ -1203,6 +1203,19 @@ from server.api import worker_package as _worker_package_api  # noqa: E402
 app.include_router(_worker_package_api.router)
 
 
+# ==================== API: 截图查询与取图 ====================
+#
+# GET /api/screenshots 与 GET /api/screenshots/{batch_name}/{asin}。
+# 在这之前，程序化调用方拿截图只能整批下 ZIP（/api/export/{b}/screenshots）
+# 或者去猜 /static/ 下的磁盘路径 —— 后者是契约外的实现细节，而且 404 有歧义
+# （没这个 ASIN / 还没截 / 截失败了 无法区分）。详见模块头。
+# router 光秃，不带 tags/prefix。两条路径段数不同（2 段 vs 4 段），
+# `/api/screenshots` 下没有 catch-all，注册次序不影响匹配。
+from server.api import screenshots as _screenshots_api  # noqa: E402
+
+app.include_router(_screenshots_api.router)
+
+
 # ==================== 定时采集管理 ====================
 
 _SCHEDULES_DIR = os.path.join(config.PROJECT_DIR, "data", "schedules")

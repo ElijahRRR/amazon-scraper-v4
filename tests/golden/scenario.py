@@ -381,6 +381,32 @@ def run(rec: Recorder) -> None:
     rec.call("delete_bulk_empty", "POST", "/api/batches/delete-bulk",
              expect=400, json={"batch_ids": ["abc", None]})
 
+    # JSON 推送（POST /api/batches）的入参 400。
+    # 前三条都在 create_batch_if_absent **之前** raise，无落盘副作用、不烧自增号。
+    rec.call("json_submit_no_valid_asin", "POST", "/api/batches", expect=400,
+             json={"asins": ["not-an-asin"], "batch_name": "golden_json_bad"})
+    rec.call("json_submit_body_not_an_object", "POST", "/api/batches",
+             expect=400, json=["B0GOLDEN01"])
+    rec.call("json_submit_bad_zip", "POST", "/api/batches", expect=400,
+             json={"asins": ASINS_A, "zip_code": "abcde",
+                   "batch_name": "golden_json_zip"})
+    # 撞名 409 必须在 JSON 这条路上也成立 —— 两个端点共用同一份实现，
+    # 这一步与上面 upload_duplicate_name_new_callback 是同一个不变量的两条路。
+    # 它会烧掉一个 batch 自增号（同那一步），所以同样放在这个尾节里：
+    # 这之后没有任何一步再读批次 id。
+    rec.call("json_submit_duplicate_name", "POST", "/api/batches", expect=409,
+             json={"asins": ASINS_A, "batch_name": BATCH_A})
+
+    # 截图查询与取图的错误路径。取图的四种结局里，200/409/410 需要真的跑完
+    # 一轮采集+上传才造得出来，那些钉在 tests/test_screenshot_api.py；
+    # 这里录的是不依赖采集状态的两条 400/404。
+    rec.call("screenshots_without_batch_selector", "GET", "/api/screenshots",
+             expect=400)
+    rec.call("screenshots_missing_batch", "GET",
+             "/api/screenshots?batch_name=no_such_batch", expect=404)
+    rec.call("screenshot_file_missing_batch", "GET",
+             "/api/screenshots/no_such_batch/B0GOLDEN01", expect=404)
+
     # 定时任务：创建时的两条 400。两条都在 os.makedirs/写文件之前 raise，无落盘副作用
     rec.call("schedule_bad_time_format", "POST", "/api/schedules", expect=400,
              files={"file": ("golden_sched.txt", "\n".join(ASINS_A).encode(),

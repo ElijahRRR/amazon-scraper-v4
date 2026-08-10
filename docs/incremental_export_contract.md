@@ -32,6 +32,23 @@ null）。这是**纯追加**，按 `docs/erpapi_contract.md` §3.2「往成功�
 而 "time" 读起来像时刻；`delivery_date`（"Tomorrow" / "August 12" 那种人读日期）
 是另一个字段，仍只在 `raw` 里。
 
+**2026-08-09 追加（第二批）**：`fast` 新增 `shipping`（float 或 null）与
+`shipping_raw`（string 或 null）。同样是**纯追加**，`contract_version` 仍是 1；
+值本来就在 `raw.buybox_shipping` 里，**存量事件也会拿到，不需要回填**。
+
+为什么给两个字段而不是一个：采集侧存的是**字符串**，三种形态
+`"FREE"` / `"N/A"` / `"$5.99"`。压成单个数值会丢掉「凭什么是这个数」，
+而只给字符串又要求每个消费者各写一遍解析。
+
+| 采集侧 | `shipping` | `shipping_raw` | 含义 |
+|---|---|---|---|
+| `"FREE"` | `0.0` | `"FREE"` | **确认免运费**，落地价 = `price + 0` |
+| `"$5.99"` | `5.99` | `"$5.99"` | 确认运费 5.99 |
+| `"N/A"` / 空 | `null` | `null` | **这次没采到**，落地价**算不出来** |
+
+⚠ 见下面不变量 3b：`null` ≠ `0`。把没采到当 0 的话落地价照样算得出来、
+看着也正常，只是**偏小**，没有任何一侧会报错。
+
 ### 5 处待确认项：沃尔玛侧已确认（2026-08-06），全部按采集侧实现
 
 | # | 结论 | 要点 |
@@ -39,7 +56,7 @@ null）。这是**纯追加**，按 `docs/erpapi_contract.md` §3.2「往成功�
 | 1 | **`slow_hash` 当不透明值用** | 算法是采集侧那一套（NFKC + 空白折叠 + 哨兵值全等归一 + 列表排序 + 图片 URL 归约到 image ID + 排序键 JSON + SHA-256，取前 16 位十六进制），**与契约文字描述的「字段排序后 sha256」不是同一个算法**。⚠ **不要按收到的 `slow` 对象自己重算再比对——两边必然不等。** 它保证的是「同页面跨进程跨引擎稳定、慢变字段真变了才变」 |
 | 2 | `fast.currency` 恒 `"USD"` | 采集侧**不采币种**，这是适配器补的常量。要真实币种需先在采集侧加抓取 |
 | 3 | `fast.stock_state` 值域 = `in_stock` / `out_of_stock` / `unknown` | 三值封闭集 |
-| 3b | `fast.stock_count` / `fast.delivery_days` 的 `null` 与 `0` **不是一回事** | `null` = 这次没采到；`0` = 采到了且确实是 0（`stock_count=0` 即缺货）。适配器绝不用 0 表示「没取到」，与 `price` 同一条原则。消费侧请分开处理，别用 `or 0` 兜底 |
+| 3b | `fast.stock_count` / `fast.delivery_days` / `fast.shipping` 的 `null` 与 `0` **不是一回事** | `null` = 这次没采到；`0` = 采到了且确实是 0（`stock_count=0` 即缺货；`shipping=0.0` 即**确认免运费**）。适配器绝不用 0 表示「没取到」，与 `price` 同一条原则。消费侧请分开处理，别用 `or 0` 兜底 |
 | 4 | `slow.weight` / `slow.dimensions` = `{package, item}` 对象 | 采集侧两个值分别是包装与本体，不合并 |
 | 5 | 游标掉出保留窗口 → **409 `cursor_below_retention`** | 消费侧须实现「告警 + 全量对账 + 停」 |
 
@@ -163,6 +180,8 @@ X-Export-Token: <token>
     "stock_state": "in_stock",                   // in_stock|out_of_stock|unknown
     "stock_count": 37,                           // int 或 null；**0 是合法值**
     "delivery_days": 8,                          // int 或 null；预计送达天数
+    "shipping": 5.99,                            // float 或 null；FREE -> 0.0
+    "shipping_raw": "$5.99",                     // 原始串 "FREE"/"$5.99"，没采到 -> null
     "buybox_price": null,
     "buybox_seller": null,
     "buybox_seller_id": null,
