@@ -269,7 +269,7 @@ class ContractTests(unittest.TestCase):
                 self.assertIn(k, rec["fast"])
             # 契约 v1 的可选快变字段
             for k in ("buybox_price", "buybox_seller", "coupon", "deal",
-                      "stock_count", "delivery_days"):
+                      "stock_count", "delivery_days", "shipping", "shipping_raw"):
                 self.assertIn(k, rec["fast"])
             self.assertIn("slow_hash", rec)
             self.assertIn("raw", rec)
@@ -348,6 +348,101 @@ class ContractTests(unittest.TestCase):
         fast = hit[0]["fast"]
         self.assertIsNone(fast["stock_count"])
         self.assertIsNone(fast["delivery_days"])
+
+    # ---------------- 运费（fast.shipping / fast.shipping_raw） ----------------
+    #
+    # 采集侧存的是**字符串**，三种形态："FREE" / "N/A" / "$5.99"。
+    # 对外要拆成两个字段，而三者必须映射到**三个互不相同**的结果：
+    #
+    #     FREE   -> shipping 0.0    确认免运费，落地价 = price + 0
+    #     N/A    -> shipping null   没采到，落地价**算不出来**
+    #     $5.99  -> shipping 5.99
+    #
+    # 把 N/A 也当成 0（UI 导出的「总价」列现在就是这么干的）是这里最容易犯、
+    # 也最难发现的错：落地价照样算得出来、数值看着正常，只是**偏小**。
+    def _submit_shipping(self, c, asin, shipping_value, batch):
+        """提交一条只在 buybox_shipping 上有差别的采集结果，返回它的 fast 块。"""
+        c.post("/api/upload",
+               files={"file": ("s.txt", f"{asin}\n".encode(), "text/plain")},
+               data={"batch_name": batch, "zip_code": "10001"})
+        t = c.get("/api/tasks/pull",
+                  params={"worker_id": f"w-{batch}", "count": 1}).json()["tasks"][0]
+        c.post("/api/tasks/result", json={
+            "task_id": t["id"], "batch_id": t["batch_id"],
+            "worker_id": f"w-{batch}", "lease_epoch": t["lease_epoch"],
+            "success": True, "asin": t["asin"], "title": "Shipping Probe",
+            "current_price": "19.99", "buybox_price": "19.99",
+            "buybox_shipping": shipping_value,
+            "stock_status": "In Stock", "stock_count": "5",
+            "crawl_time": "2026-08-05T10:00:00Z", "site": "US",
+            "zip_code": "10001"})
+        _drain(c)
+        recs = c.get("/api/export/incremental",
+                     params={"cursor": 0, "limit": 500}, headers=self._hdr()
+                     ).json()["records"]
+        hit = [r for r in recs if r["asin"] == asin]
+        self.assertTrue(hit, f"样本 {asin} 没进事件流")
+        return hit[0]["fast"]
+
+    def test_numeric_shipping_is_a_number_and_raw_keeps_the_string(self):
+        with _server_with_relay() as (c, _):
+            fast = self._submit_shipping(c, "B0SHIPNUM1", "$5.99", "ship_num")
+
+        self.assertAlmostEqual(fast["shipping"], 5.99, places=2)
+        self.assertNotIsInstance(fast["shipping"], str,
+                                 "shipping 要能直接参与落地价计算，不能是字符串")
+        self.assertEqual(fast["shipping_raw"], "$5.99",
+                         "shipping_raw 要原样留住采集侧那个串，供消费侧复核")
+
+    def test_free_shipping_is_zero_not_null(self):
+        """`FREE` 是**一条真信息**（确认免运费），丢成 null 就和「没采到」混了。"""
+        with _server_with_relay() as (c, _):
+            fast = self._submit_shipping(c, "B0SHIPFRE1", "FREE", "ship_free")
+
+        self.assertEqual(fast["shipping"], 0.0)
+        self.assertIsNotNone(fast["shipping"],
+                             "FREE 被吞成 null —— 「确认免运费」变成了「不知道」")
+        self.assertEqual(fast["shipping_raw"], "FREE")
+
+    def test_unknown_shipping_is_null_not_zero(self):
+        """**这条是运费最容易做错的地方。**
+
+        采集侧的 `N/A` 是「这次没采到」。当成 0 的话落地价照样算得出来、
+        看着也正常，只是**偏小**——没有任何一侧会报错。
+        与 `stock_count` 同一条不变量（3b）：null ≠ 0，消费端不能写 `or 0`。
+        """
+        with _server_with_relay() as (c, _):
+            fast = self._submit_shipping(c, "B0SHIPNA01", "N/A", "ship_na")
+
+        self.assertIsNone(fast["shipping"],
+                          "没采到的运费被当成 0 —— 落地价会静默偏小")
+        self.assertIsNone(fast["shipping_raw"],
+                          "N/A 是哨兵不是值，_clean 应当把它归一到 null")
+
+    def test_free_and_unknown_do_not_collapse_into_the_same_value(self):
+        """把三种形态摆在一起 —— 这才是真正要守的不变量。
+
+        单独看，每条都可能被「统一成 0 更好算」或「统一成 null 更保守」改掉而
+        只红一条；摆在一起，任何两者塌成同一个值都会被这条直接指出来。
+        """
+        with _server_with_relay() as (c, _):
+            got = {
+                "free": self._submit_shipping(
+                    c, "B0SHIPMX01", "FREE", "ship_mx_free")["shipping"],
+                "unknown": self._submit_shipping(
+                    c, "B0SHIPMX02", "N/A", "ship_mx_na")["shipping"],
+                "priced": self._submit_shipping(
+                    c, "B0SHIPMX03", "$5.99", "ship_mx_num")["shipping"],
+            }
+
+        self.assertEqual(got["free"], 0.0)
+        self.assertIsNone(got["unknown"])
+        self.assertAlmostEqual(got["priced"], 5.99, places=2)
+        # 0.0 == False、None != 0 —— 用 repr 比对，避免 Python 的真值坑
+        # 把「塌成同一个值」这件事本身给掩盖过去。
+        self.assertEqual(
+            len({repr(v) for v in got.values()}), 3,
+            f"FREE / 没采到 / 具体金额 必须是三个不同的值，实际 {got}")
 
     def test_slow_hash_is_16_hex_per_contract(self):
         """契约 v1：slow_hash 是 sha256 前 16 位。内部存的是 'v1:<64 位>'。"""

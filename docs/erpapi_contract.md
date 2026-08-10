@@ -114,10 +114,11 @@ body 不泄漏任何异常细节，这是有意的。
 所有机器读的 `error` 码登记在 `server/api/sync.py:132-149` 的 `ERROR_CODES`：
 
 ```
-ack_ahead_of_stream, batch_name_conflict, cursor_ahead_of_stream,
-cursor_below_retention, event_stream_unavailable, export_token_not_configured,
-gen_mismatch, internal_error, invalid_export_token, invalid_parameter,
-range_too_wide
+ack_ahead_of_stream, batch_name_conflict, conflicting_zip_for_asin,
+cursor_ahead_of_stream, cursor_below_retention, event_stream_unavailable,
+export_token_not_configured, gen_mismatch, internal_error,
+invalid_export_token, invalid_parameter, range_too_wide,
+screenshot_failed, screenshot_pending
 ```
 
 漂移由 `tests/test_error_codes.py` 看守（调用点 ⊆ 本集合、文档里出现的码 ⊆ 本集合）。
@@ -156,8 +157,13 @@ status.status == "completed"
        +-> GET /api/results?batch_id=&cursor=&limit=1000   # 翻页拉成功结果（§4.3）
        +-> GET /api/batches/{batch_id}/failures            # 拉完整失败明细（§4.4）
        +-> GET /static/screenshots/{batch_name}/{asin}.png # 逐张取截图（§4.7）
+           或 GET /api/screenshots?batch_name=             # 列状态 + url（§4.10）
+           或 GET /api/screenshots/{batch_name}/{asin}     # 取图，状态码可区分（§4.10）
            或 GET /api/export/{batch_name}/screenshots     # 整批打包 zip
 ```
+
+`POST /api/upload` 也可以换成 `POST /api/batches`（JSON，§4.9）—— 两者等价，
+上面这条流程的其余每一步都不变。
 
 ---
 
@@ -176,7 +182,7 @@ status.status == "completed"
   （`docs/incremental_export_contract.md` 里已登记 3 处待补进沃尔玛侧 §5 的空白，
   它们是「填补原文未定义的空白」，不改变已写死的行为，因此**仍是 v1**。）
 
-### 3.2 本文档覆盖的 erpAPI 端点（#2 ~ #8）
+### 3.2 本文档覆盖的 erpAPI 端点（#2 ~ #10）
 
 一经本文发布即为对外契约。具体地：
 
@@ -564,6 +570,25 @@ while True:
 
 `next_cursor` 只推进到**真正投递过的那一条**；**空页不推进游标**
 （`server/api/export_incremental.py:441`）—— 这是唯一不丢数据的方向。
+
+**本轮 `fast` 追加了 `shipping` / `shipping_raw`**（运费）。纯追加，按 §3.2
+可以单方面做，`contract_version` 仍是 1；值本来就在 `raw.buybox_shipping` 里，
+**存量事件也会拿到，不需要回填**。三种形态映射到三个互不相同的结果：
+
+| 采集侧 | `fast.shipping` | `fast.shipping_raw` | 含义 |
+|---|---|---|---|
+| `"FREE"` | `0.0` | `"FREE"` | **确认免运费**，落地价 = `price + 0` |
+| `"$5.99"` | `5.99` | `"$5.99"` | 确认运费 5.99 |
+| `"N/A"` / 空 | `null` | `null` | **这次没采到**，落地价**算不出来** |
+
+⚠ `null` ≠ `0`（`docs/incremental_export_contract.md` 不变量 3b，与
+`stock_count` 同一条）。**别写 `shipping or 0`** —— 把没采到当 0 的话落地价
+照样算得出来、看着也正常，只是**偏小**，没有任何一侧会报错。
+
+> 顺带说明一处**已知的不一致**，以免被当成本端点的行为：UI 导出（Excel/CSV）
+> 的虚拟列「总价」把 `N/A` 也当 0 加进总价（`server/api/export.py:_prepare_row`），
+> 所以那一列上「没采到运费」和「免运费」是同一个结果。本端点**刻意不复制**
+> 那个行为。两者哪个对齐哪个，是个待定项，不影响本契约。
 
 #### 错误响应（形状 (c)，见 §1.2）
 
@@ -1020,6 +1045,8 @@ if r["status"] == "completed":      # ✅ 权威判据
 | `/failures` 的 `limit` 上限（100000）与 `error_type` 过滤不能被削弱 | `tests/test_batch_failures_endpoint.py` |
 | 错误码封闭集不漂移（含 `batch_name_conflict`） | `tests/test_error_codes.py` |
 | 增量导出契约 v1 逐句 | `tests/test_incremental_export.py` |
+| `fast.shipping` 的 FREE→0.0 / 没采到→null / 具体金额 **三者互不相同** | `…::test_free_and_unknown_do_not_collapse_into_the_same_value` |
+| 没采到的运费不得当成 0（落地价会静默偏小） | `…::test_unknown_shipping_is_null_not_zero` |
 | `POST /api/batches` 与 `/api/upload` 走**同一份实现**（撞名语义不会分叉） | `tests/test_json_submit_endpoint.py::ParityWithUploadTests` |
 | JSON 推送的邮编三档（逐 ASIN / 整批 / 服务端默认） | `…::ZipCodeChoiceTests` |
 | JSON 推送的截图开关，不传即不截 | `…::ScreenshotChoiceTests` |

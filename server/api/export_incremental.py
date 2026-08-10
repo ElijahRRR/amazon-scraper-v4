@@ -181,6 +181,38 @@ def _int(v: Any) -> Optional[int]:
         return None
 
 
+#: 采集侧用来表示「免运费」的字面量。**只认这一个**（大小写不敏感）——
+#: 两个解析引擎的 `_parse_buybox_shipping` / `_slx_parse_buybox_shipping`
+#: 在四条分支上返回的都是这个词（Prime 免邮、满额免邮达标、以及兜底）。
+#: 想再认 "free shipping" / "$0.00" 之类，请先去采集侧确认它真会产出，
+#: 别在这里凭印象放宽 —— 放宽的代价是把一个没采到的值算成 0。
+_SHIPPING_FREE = "free"
+
+
+def _shipping(v: Any) -> Optional[float]:
+    """运费数值。``FREE`` -> ``0.0``；``$5.99`` -> ``5.99``；没采到 -> ``None``。
+
+    ``FREE`` 必须映射成 **0.0 而不是 None** —— 「确认免运费」是一条真信息，
+    丢成 None 会让消费侧把它和「这次没采到运费」混在一起。反过来，采集侧的
+    ``"N/A"`` 是**没采到**（``_clean`` 已经把它归一到 None），绝不能当 0：
+
+        FREE  -> 0.0    确认免运费，落地价 = price + 0
+        N/A   -> None   没采到，落地价**算不出来**
+        $5.99 -> 5.99
+
+    这正是 ``stock_count`` 那条不变量（3b）的同一个形状：``null`` ≠ ``0``，
+    消费端不能写 ``or 0``。UI 导出的「总价」列现在就把 ``N/A`` 当 0 加进总价
+    （见 ``server/api/export.py:_prepare_row``），于是「没采到运费」和「免运费」
+    在那一列上是同一个结果 —— **本函数刻意不复制那个行为**。
+    """
+    s = _clean(v)
+    if s is None:
+        return None
+    if s.strip().lower() == _SHIPPING_FREE:
+        return 0.0
+    return _price(s)
+
+
 def _stock_state(payload: Dict[str, Any]) -> str:
     """-> in_stock | out_of_stock | unknown"""
     s = _clean(payload.get("stock_status"))
@@ -334,6 +366,17 @@ def _to_record(row: Dict[str, Any]) -> Dict[str, Any]:
             # 因为 "time" 读起来像时刻而不是时长。
             "stock_count": _int(payload.get("stock_count")),
             "delivery_days": _int(payload.get("delivery_time")),
+            # shipping / shipping_raw 同为**追加**字段（契约 §3.2 允许单方面加
+            # 字段，仍是 v1）。数据本来就在事件体里、只是以前只能从 `raw` 里翻，
+            # 所以**老事件也会拿到**，不需要回填。
+            #
+            # 为什么给两个而不是一个：采集侧存的是字符串（"FREE" / "N/A" /
+            # "$5.99"），把它压成一个数值会丢掉「凭什么是这个数」。
+            #   shipping     -> 可直接参与落地价计算，FREE 是 0.0、没采到是 null
+            #   shipping_raw -> 原始串原样，消费侧可复核，也留住将来出现的新形态
+            #                   （比如满额免邮的门槛信息）而不必等采集侧改契约
+            "shipping": _shipping(payload.get("buybox_shipping")),
+            "shipping_raw": _clean(payload.get("buybox_shipping")),
             "buybox_price": _price(payload.get("buybox_price")),
             "buybox_seller": _clean(payload.get("seller_name")),
             "buybox_seller_id": _clean(payload.get("seller_id")),

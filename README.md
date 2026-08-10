@@ -247,6 +247,12 @@ ASIN 只有一行，后采的覆盖先采的；而 `/api/results?batch_id=` 的 
 
 1. **UI 导出**（`server/api/export.py`，`GET /api/export/*`）：网页点"导出"按钮走的路径，弹窗选择格式（Excel/CSV）、字段（全选/仅价格库存/自定义勾选）、范围（当前批次 + 变动筛选）；支持流式导出，百万级数据不 OOM。导出列含**变体属性**（`color_name=X; size_name=Y`）/ 父体 ASIN / 变体 ASIN 列表；原 **EAN 列已下线**（amazon.com 实测 100% 为空，`ean_list` 已经不在可导出字段集合里），槽位由「变体属性」顶上。
 2. **增量导出契约**（`server/api/export_incremental.py`，`GET /api/export/incremental`，**仅 PostgreSQL 后端**）：面向下游 catalog_sync（沃尔玛侧）的固定契约 v1，cursor+limit 分页，可选 `X-Export-Token` 请求头鉴权（`EXPORT_TOKEN`/`EXPORT_REQUIRE_TOKEN` 控制是否强制）。完整字段定义与不变量见 [`docs/incremental_export_contract.md`](docs/incremental_export_contract.md)。
+
+   **运费在这里**：`fast.shipping`（float 或 null）+ `fast.shipping_raw`（原始串）。
+   采集侧存的是字符串，三种形态映射到三个互不相同的结果 ——
+   `"FREE"` → `0.0`（**确认免运费**）、`"$5.99"` → `5.99`、`"N/A"` → `null`
+   （**这次没采到**，落地价算不出来）。⚠️ `null` ≠ `0`，**别写 `shipping or 0`**：
+   把没采到当 0 的话落地价照样算得出来、看着也正常，只是偏小，两侧都不报错。
 3. **同步运维 API**（`server/api/sync.py`，`/api/v1/sync/*`，**仅 PostgreSQL 后端**）：读的是同一份事件流，但给的是内部原始事件形状 + 运维可观测性（relay 延迟、outbox 深度、保留期水位、`ack` 游标、强制裁剪通知）。完整契约见 [`docs/sync_contract.md`](docs/sync_contract.md)；面向 erpAPI 侧的业务端点（上传/状态/结果/失败明细）契约见 [`docs/erpapi_contract.md`](docs/erpapi_contract.md)。
 
 后两者依赖事件流，只有 PostgreSQL 后端提供；万一跑在 SQLite 回滚路径上，它们统一返回结构化 `503`（不是 404——404 容易被消费方误读成"暂无数据"，导致游标停滞）。
