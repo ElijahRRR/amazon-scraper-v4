@@ -3,7 +3,11 @@
 
 架构：1 个 Playwright + 1 个 Chromium（常驻复用），Semaphore 控制并发。
 渲染：base 注入 + 资源拦截 + 智能等主图 + 空白检测重试。
-防泄漏：signal 优雅停机 + finally page.close；父进程负责进程组级兜底清理。
+防泄漏：三道，缺一道都会留下 Chromium ——
+  1. signal 优雅停机 + finally page.close（正常退出）；
+  2. 父进程的进程组级兜底清理（worker 还活着、能跑代码时）；
+  3. **父进程死亡看门狗**（worker 被 kill -9 / OOM，跑不到第 2 道时）——
+     见文件末尾 `_start_parent_death_watchdog` 的注释。
 """
 import asyncio
 import logging
@@ -92,6 +96,10 @@ class ScreenshotWorker:
                 loop.add_signal_handler(sig, self.request_stop, sig.name)
             except NotImplementedError:
                 signal.signal(sig, lambda *_args, _sig=sig: self.request_stop(_sig.name))
+        # ⚠ 上面那两个处理器覆盖不到 worker 被 kill -9 的情形：SIGKILL 不可捕获，
+        # worker 的 `_reap_screenshot_descendants()` 根本不会被调到，我们就成了
+        # 孤儿、Chromium 跟着一起留。看门狗补的正是这一段，理由见它的文件内注释。
+        _start_parent_death_watchdog(self, loop)
         logger.info(f"截图进程启动（并发: {self._concurrency}, 监控: {self.html_dir}）")
 
         _last_completion_check = 0.0
@@ -490,6 +498,112 @@ class ScreenshotWorker:
                 logger.warning(f"恢复中断截图任务: {os.path.basename(html_path)}")
             except OSError as e:
                 logger.warning(f"恢复中断截图任务失败 {fname}: {e}")
+
+
+# ==================== 父进程死亡看门狗 ====================
+#
+# 为什么需要它
+# ------------
+# 回收截图进程树的逻辑**全部**在 worker 那边（engine.py 的
+# `_reap_screenshot_descendants`，走 `os.killpg`）。那条路要成立有个前提：
+# worker 还活着、还能跑代码。凡是它来不及反应的死法——`kill -9`、OOM killer、
+# 断电——整棵树就都留下了：Chromium 连同它自己派生的 renderer / GPU 进程，
+# 一个都不会走，直到有人手动 pkill。
+#
+# ⚠ **这不是启动方式的问题，别去动 `start_new_session=True`。** 实测对照过：
+# 带与不带这个参数，`kill -9` 父进程之后子孙**同样**全部存活、同样被 init
+# 收养（ppid=1）。SIGKILL 不可捕获，父进程一行清理代码都执行不到；而 Unix
+# 的规矩本来就是父死子不死。去掉 `start_new_session` 反而更糟——子进程会和
+# worker 同处一个进程组，`killpg` 会把 worker 自己也杀掉，重启截图子进程时
+# 也没法只收掉旧的那一棵树。
+#
+# 所以修法只能是把清理从「父驱动」改成「子自查」：本进程定期看一眼父进程还
+# 在不在，不在了就自己连整个进程组一起收掉。本进程正是进程组组长
+# （`start_new_session=True` 让它 setsid 了，engine.py:2074 还校验过
+# `pgid == pid`），所以 `killpg(0, ...)` 一刀就能带走 Chromium 全家。
+#
+# 为什么用轮询 getppid 而不是 PR_SET_PDEATHSIG
+# --------------------------------------------
+# `prctl(PR_SET_PDEATHSIG)` 是内核级、零延迟，但**只有 Linux 有**。本项目的
+# worker 也跑在 macOS 上（deploy 里有 start.sh/start.bat 两套），那边没有这个
+# 调用。轮询 `getppid()` 是可移植的，代价是最多晚 `_PARENT_WATCH_INTERVAL`
+# 秒才发现——而这个场景下（进程已经没人管了）晚几秒毫无影响。
+
+#: 多久查一次父进程。几秒的延迟在「父进程已经死了」这个场景下无所谓，
+#: 但别调太大：这段时间里 Chromium 还占着内存和 CPU。
+_PARENT_WATCH_INTERVAL = 3.0
+
+#: 发现父进程没了之后，留给优雅收尾（关浏览器、落盘）的时间。
+#: 到点无论如何硬杀——**这一步不允许再依赖任何可能挂住的代码**，
+#: 否则就是把「关停卡死」那个 bug 原样搬进看门狗里。
+_PARENT_DEATH_GRACE = 5.0
+
+
+def _hard_kill_own_process_group():
+    """连同 Chromium 全家一起收掉。本函数**不可能**挂住，也不返回。"""
+    if hasattr(os, "killpg"):
+        try:
+            # 0 = 本进程所在的进程组。我们是组长，所以这一刀覆盖
+            # screenshot.py + Chromium + 它派生的 renderer/GPU 进程。
+            os.killpg(0, signal.SIGKILL)
+        except Exception:                                      # noqa: BLE001
+            pass
+    # killpg 不可用（Windows）或没生效时的兜底：至少让自己走掉。
+    # 用 os._exit 而不是 sys.exit —— 后者靠抛异常退出，可能被上层 except 吞掉。
+    os._exit(9)
+
+
+def _start_parent_death_watchdog(worker: "ScreenshotWorker" = None,
+                                 loop: asyncio.AbstractEventLoop = None):
+    """起一个守护线程：父进程一没，就把本进程组整个收掉。
+
+    返回该线程（未启动的情形返回 None，便于调用方与用例判断）。
+    """
+    import threading
+
+    orig_ppid = os.getppid()
+
+    if orig_ppid <= 1:
+        # 启动时父进程就已经是 init/launchd —— 要么我们本来就是被 detach 起来的，
+        # 要么父进程在这几毫秒里已经死了。无论哪种，"ppid 变了"这个信号都用不了，
+        # 硬判 ppid==1 又会在容器里误杀（那儿 1 号进程可能就是正常的父进程）。
+        # 明确关掉并留一行日志，好过装作有保护。
+        logger.warning(
+            "父进程死亡看门狗未启用：启动时 ppid=%s。"
+            "本进程若被孤儿化，Chromium 需要外部清理（pkill -f chromium）。",
+            orig_ppid)
+        return None
+
+    def _watch():
+        while True:
+            time.sleep(_PARENT_WATCH_INTERVAL)
+            if os.getppid() == orig_ppid:
+                continue
+            # ppid 变了 = 原来的父进程没了，我们被 init/launchd 收养了。
+            logger.error(
+                "父进程已消失（ppid %s -> %s）——大概率是 worker 被 kill -9 / OOM。"
+                "%.0f 秒后强制收掉本进程组（含 Chromium）。",
+                orig_ppid, os.getppid(), _PARENT_DEATH_GRACE)
+
+            # 先礼：让主循环自己退出、把浏览器关干净，少留一堆 Chromium 临时目录。
+            # 跨线程碰 asyncio 只能走 call_soon_threadsafe。
+            if worker is not None and loop is not None:
+                try:
+                    loop.call_soon_threadsafe(worker.request_stop, "parent-died")
+                except Exception:                              # noqa: BLE001
+                    pass
+
+            # 后兵：**无条件**硬杀。这里不 join、不等任何 future ——
+            # 优雅收尾能成最好，不成也绝不允许把看门狗自己卡住。
+            time.sleep(_PARENT_DEATH_GRACE)
+            logger.error("宽限期结束，强制收掉本进程组。")
+            _hard_kill_own_process_group()
+
+    t = threading.Thread(target=_watch, name="parent-death-watchdog", daemon=True)
+    t.start()
+    logger.info("父进程死亡看门狗已启动（父 pid=%s，每 %.0fs 查一次）",
+                orig_ppid, _PARENT_WATCH_INTERVAL)
+    return t
 
 
 # ==================== 入口 ====================
