@@ -132,7 +132,7 @@ async def test_ddl_shape_and_first_partitions(pgdb, pgconn):
     assert parts[0][1] is None                       # MINVALUE
     assert len(parts) >= 1 + R.EVENT_FUTURE_PARTITIONS
 
-    # 每个分区都必须自带 source_id 唯一索引。父表上建不了（PG 16 要求唯一约束
+    # 每个分区都必须自带 source_id 唯一索引。父表上建不了（声明式分区要求唯一约束
     # 必须包含分区键 seq），LIKE 父表又会静默漏掉它 —— 所以这是硬闸门。
     for name, *_ in parts:
         defs = [r["indexdef"] for r in await pgconn.fetch(
@@ -141,7 +141,7 @@ async def test_ddl_shape_and_first_partitions(pgdb, pgconn):
         assert any("UNIQUE" in d and "source_id" in d for d in defs), (name, defs)
         assert any("recorded_at" in d for d in defs), (name, defs)
 
-    # 计划 §2.1 的 UNIQUE INDEX ON <父表> (source_id) 在 PG 16 上是不合法的
+    # 计划 §2.1 的 UNIQUE INDEX ON <父表> (source_id) 在任何 PG 版本上都不合法
     with pytest.raises(asyncpg.FeatureNotSupportedError):
         await pgconn.execute(
             "CREATE UNIQUE INDEX x_parent_src ON scraper.scrape_events (source_id)")

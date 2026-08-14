@@ -39,7 +39,11 @@ Server (FastAPI)                          Worker (可部署多台)
 ### 1. 环境要求
 
 - Python 3.10+（本地开发建议锁定 Python 3.12——3.13/3.14 上 `curl_cffi`/`lxml`/`selectolax`/`asyncpg` 常没有预编译 wheel，会掉进源码编译）
-- PostgreSQL 16+，**建库时必须带 `LC_COLLATE=C LC_CTYPE=C`**（见下）
+- PostgreSQL **14+**（硬性下限，`tools/preflight.py` 会拦；需要声明式分区与 `FOR UPDATE SKIP LOCKED`）。
+  **实测通过：16.x 与 17.x** —— 17 上黄金基线 86 步逐字节一致、pytest 与 16 同为 867 passed。
+  没有理由的话建新库直接上 17。
+- **建库时必须带 `LC_COLLATE=C LC_CTYPE=C`**（见下）。PG 17 新增了 builtin locale provider，
+  **不要**用 `--locale-provider=builtin`，保持默认的 libc（`datlocprovider=c`）
 - TPS 代理（帐密认证，每次请求自动换 IP）
 - 服务器最低 1C / 2GB / 20GB SSD，外加一个 PostgreSQL 实例（可同机）
 
@@ -117,7 +121,7 @@ journalctl -u amazon-scraper -f
 
 ### 5. 本地开发环境
 
-在本机（含 macOS）搭开发环境的完整步骤见 [`docs/local_macos_setup.md`](docs/local_macos_setup.md)：装 PostgreSQL 16、**建库时必须带 `LC_COLLATE=C LC_CTYPE=C`**（PG 的默认排序规则会导致分页/搜索/导出顺序与预期不一致，且建库时定死、事后只能重建库）、Python 3.12 虚拟环境、`pip install -r requirements-dev.txt`、设好 `PG_DSN` / `SCRAPER_INSTANCE_ID`、跑一遍 `tools/preflight.py` 体检，然后 golden 基线与 pytest 各跑一遍。
+在本机（含 macOS）搭开发环境的完整步骤见 [`docs/local_macos_setup.md`](docs/local_macos_setup.md)：装 PostgreSQL 17（16 亦可）、**建库时必须带 `LC_COLLATE=C LC_CTYPE=C`**（PG 的默认排序规则会导致分页/搜索/导出顺序与预期不一致，且建库时定死、事后只能重建库）、Python 3.12 虚拟环境、`pip install -r requirements-dev.txt`、设好 `PG_DSN` / `SCRAPER_INSTANCE_ID`、跑一遍 `tools/preflight.py` 体检，然后 golden 基线与 pytest 各跑一遍。
 
 > 该文档开头有一步"先 `git checkout` 到某迁移分支"已经过时——相关代码目前都已经在 `main` 分支上，不需要切分支。
 
@@ -790,6 +794,47 @@ DB_BACKEND=postgres pytest tests/ -q          # PostgreSQL 后端（含 tests/pg
 - `tools/smoke_local.py` 是一个不依赖真实代理/Amazon 的端到端冒烟脚本（上传 → 拉任务 → 提交结果 → 查询 → 事件流契约校验），适合部署后快速验证：`python3 tools/smoke_local.py`。
 
 ## 性能基线
+
+### 为什么要**多开 worker**，而不是把单个 worker 的并发调大
+
+**结论：单个 worker 进程的吞吐上限由 CPU 解析速度决定，与并发数无关。**
+
+`parse_product` 是**同步调用**，直接跑在 worker 的事件循环里
+（`worker/engine.py` 里那处 `self.parser.parse_product(...)`），`worker/` 全树
+没有任何 `to_thread` / `run_in_executor` / 线程池。实测（475 KB 的商品页，
+selectolax 引擎）：
+
+```
+parse_product 平均耗时           126.5 ms   ← 纯 CPU
+单核纯解析吞吐上限               ≈ 474 个/分钟
+```
+
+于是在**一个进程内**提高并发度完全不起作用 —— 实测同一个事件循环里
+`gather` 16 路解析：
+
+```
+顺序 16 次        2.02s
+gather 16 路      1.93s     加速比 1.05x   ← 等于没有并行
+4 进程并行 16 次   0.67s     加速比 3.01x   ← 多进程才真的并行
+```
+
+原因是 asyncio 的并发只对**等待**有效（HTTP 往返、代理延迟）。解析是计算，
+一个协程解析的那 126 ms 里，同进程内**其余协程全部冻结** —— 包括那些响应
+已经回来、只等着被解析的。所以：
+
+| 配置 | 结果 |
+|---|---|
+| 1 worker，并发 32 | ≈ 500/min —— 已经顶到单核解析上限，此时瓶颈是 CPU 不是网络 |
+| 1 worker，并发 256 | **不会更快**。多出来的并发只增加内存、session 数与调度开销；单次解析把循环占住的时间还会拉大延迟抖动，反而更容易触发 AIMD 降速与超时 |
+| 8 worker，各并发 32 | 8 个进程 = 8 个事件循环 = 真正吃满多核，吞吐随核数线性放大且稳定 |
+
+**怎么定参数**：worker 进程数 ≈ CPU 核数（留 1 核给 server/PG）；单个 worker
+的并发只要够把网络等待填满即可，`32` 已经绰绰有余，再往上只有坏处。
+想验证自己机器的上限，把上面那段解析耗时在目标机器上测一遍：
+`60 / 单次解析秒数` 就是**单个 worker 进程**的理论天花板。
+
+---
+
 
 > 以下为 SQLite 后端在一次实测（DMIT VPS 1C/2GB + 10 worker，2026-05）中的快照，架构此后有过多处调整（如 Session 管理改为每协程独立），未重新测过，仅供数量级参考，不代表当前版本的实测结果。
 
