@@ -141,7 +141,7 @@ async def _pg_checks(dsn: str, skip_slow: bool):
         ver = await conn.fetchval("SHOW server_version")
         major = int(str(ver).split(".")[0])
         (ok if major >= 14 else fail)(
-            "PG 版本", f"{ver}（需 ≥ 14：声明式分区 + FOR UPDATE SKIP LOCKED）")
+            "PG 版本", f"{ver}（需 ≥ 14：声明式分区 + FOR UPDATE SKIP LOCKED；实测 16.x / 17.x 均通过）")
 
         trgm = await conn.fetchval(
             "SELECT extversion FROM pg_extension WHERE extname='pg_trgm'")

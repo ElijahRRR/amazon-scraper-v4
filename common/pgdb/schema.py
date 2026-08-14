@@ -287,7 +287,8 @@ DDL_INDEXES: List[str] = [
     "CREATE INDEX IF NOT EXISTS idx_screenshots_batch ON screenshots(batch_id)",
     # media.py:_get_done_screenshot_paths 的第二次 load() 不带 batch 过滤，
     # 而 screenshots 上原本没有任何以 asin 打头的索引（只有 UNIQUE(batch_id,asin)，
-    # PG 16 无 skip scan）→ 每次 /api/results/{asin} 都吃一次全表扫。
+    # PG 16/17 无 B-tree skip scan —— 那是 PG 18 才有的，所以这条部分索引在 17 上
+    # 依然必需）→ 否则每次 /api/results/{asin} 都吃一次全表扫。
     # 部分索引：status='done' 是该查询的固定谓词，索引只收这一部分。
     "CREATE INDEX IF NOT EXISTS idx_screenshots_asin_done "
     "ON screenshots(asin) WHERE status = 'done'",
@@ -408,7 +409,8 @@ CLEARED_TABLES = ["asin_changes", "asin_data", "batch_asins",
 #
 # 与 `.agent/pg_migration_plan.md` §2.1 的两处**实测修正**（见 §3.1/§3.2）：
 #   1. 计划里的 ``CREATE UNIQUE INDEX ON scraper.scrape_events (source_id)``
-#      在 PG 16 上直接报错：
+#      直接报错（**声明式分区自 PG 11 起的固有规则**，不是某个版本的限制；
+#      PG 17 未放宽，实测 17.10 上仍然拒绝，tests/pgdb/test_relay.py 有反向断言）：
 #        FeatureNotSupportedError: unique constraint on partitioned table must
 #        include all partitioning columns
 #      改成**逐分区**建唯一索引（见 EVENT_PARTITION_SOURCE_ID_INDEX_SQL）。
@@ -619,7 +621,8 @@ def event_partition_name(index: int) -> str:
 def event_partition_source_id_index(index: int) -> str:
     """逐分区的 source_id 唯一索引名。
 
-    ⚠ 这一条不能建在父表上（PG 16 会以 FeatureNotSupportedError 拒绝，
+    ⚠ 这一条不能建在父表上（会以 FeatureNotSupportedError 拒绝 —— 声明式分区的
+      固有规则，PG 11+ 均如此，17 未放宽；
     因为唯一约束必须包含分区键 seq）。所以每个分区自己带一条。
     """
     return f"{event_partition_name(index)}_source_id_key"
@@ -678,7 +681,7 @@ def event_next_partition_sql(index: int, lo: int, hi: int) -> List[str]:
 
       抄父表则天然只带父表有的东西（pkey、marketplace CHECK、recorded_at 索引），
       分区局部的 range CHECK 结构上不可能被继承 —— 这一类 bug 被根除，而不是被
-      逐条排除。代价是父表上没有 source_id 唯一索引（PG 16 不允许：唯一约束必须
+      逐条排除。代价是父表上没有 source_id 唯一索引（声明式分区不允许：唯一约束必须
       包含分区键 seq），所以那一条显式补建。``_create_partition`` 的硬闸门会同时
       核对「有 source_id 唯一索引」与「有且只有一条自己的 range CHECK」。
     * 先手工挂上等价的 CHECK，ATTACH 时就能跳过全表校验扫描。

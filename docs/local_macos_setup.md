@@ -27,11 +27,12 @@ ls requirements-dev.txt tools/preflight.py docs/local_macos_setup.md
 ## 1. PostgreSQL
 
 ```bash
-brew install postgresql@16
-brew services start postgresql@16
+# 17 与 16 都实测通过（黄金基线 86 步逐字节一致）。新装建议直接用 17。
+brew install postgresql@17
+brew services start postgresql@17
 
 # Apple Silicon；Intel 机把 /opt/homebrew 换成 /usr/local
-echo 'export PATH="/opt/homebrew/opt/postgresql@16/bin:$PATH"' >> ~/.zshrc
+echo 'export PATH="/opt/homebrew/opt/postgresql@17/bin:$PATH"' >> ~/.zshrc
 source ~/.zshrc
 psql --version        # 应显示 16.x
 ```
@@ -196,7 +197,7 @@ worker 跑起来后回到第 6 步，这次 `parse_engine` 应该是 `selectolax
 | `Could not open requirements file: 'requirements-dev.txt'` | 还在 `main` 上。回到第 0 步切分支 |
 | `can't open file '.../tools/preflight.py'` | 同上 |
 | `pip install` 卡在编译 `lxml`/`curl_cffi` 然后报错 | venv 的 Python 太新（3.13/3.14）没有 wheel。按第 2 步用 3.12 重建 |
-| `ConnectionRefusedError: 5432` | PG 没起。`brew services start postgresql@16` |
+| `ConnectionRefusedError: 5432` | PG 没起。`brew services start postgresql@17` |
 | `role "scraper" does not exist` | 第 1 步的 `createuser` 没跑 |
 | `/api/export/incremental` 返回 404「批次不存在」 | 路由顺序坏了。跑 preflight 会直接指出来 |
 | 增量导出返回 503 `event_stream_unavailable` | `DB_BACKEND` 不是 `postgres`，或事件流表没建 |
