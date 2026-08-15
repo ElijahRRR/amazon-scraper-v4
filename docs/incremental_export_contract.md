@@ -57,6 +57,7 @@ null）。这是**纯追加**，按 `docs/erpapi_contract.md` §3.2「往成功�
 | 2 | `fast.currency` 恒 `"USD"` | 采集侧**不采币种**，这是适配器补的常量。要真实币种需先在采集侧加抓取 |
 | 3 | `fast.stock_state` 值域 = `in_stock` / `out_of_stock` / `unknown` | 三值封闭集 |
 | 3b | `fast.stock_count` / `fast.delivery_days` / `fast.shipping` 的 `null` 与 `0` **不是一回事** | `null` = 这次没采到；`0` = 采到了且确实是 0（`stock_count=0` 即缺货；`shipping=0.0` 即**确认免运费**）。适配器绝不用 0 表示「没取到」，与 `price` 同一条原则。消费侧请分开处理，别用 `or 0` 兜底 |
+| 3c | `slow.variant.theme` 是**维度名**不是取值 | 形如 `"color_name/size_name"`，顺序即 Amazon `dimensions` 数组的顺序（不排序）。采集侧拿不到维度名、只产出裸值（`"Red; L"`）时，`theme` 为 `null` —— 那种情况我们确实不知道维度叫什么，编一个出来会被下游当真维度去分组。⚠ **2026-08-14 之前 `theme` 对所有真实记录恒为 `null`**（适配器自带的解析按 `:` 切，而采集侧用的是 `=`）；修复后开始有值，消费侧若此前把 `theme` 当恒空处理需要复查 |
 | 4 | `slow.weight` / `slow.dimensions` = `{package, item}` 对象 | 采集侧两个值分别是包装与本体，不合并 |
 | 5 | 游标掉出保留窗口 → **409 `cursor_below_retention`** | 消费侧须实现「告警 + 全量对账 + 停」 |
 
@@ -172,6 +173,8 @@ X-Export-Token: <token>
     "weight":     { "package": null, "item": null },
     "dimensions": { "package": null, "item": null },
     "variant": null                              // 或 {parent_asin, theme}
+                                                 // theme = 变体**维度名**，如
+                                                 // "color_name/size_name"；见下
   },
 
   "fast": {

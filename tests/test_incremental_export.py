@@ -444,6 +444,83 @@ class ContractTests(unittest.TestCase):
             len({repr(v) for v in got.values()}), 3,
             f"FREE / 没采到 / 具体金额 必须是三个不同的值，实际 {got}")
 
+    # ---------------- slow.variant.theme（变体维度名） ----------------
+    #
+    # 这一族守的是一个**曾经恒为 null** 的字段。`_variant` 原先自带一份
+    # 格式写错的解析：按 `:` 切，而采集侧 `worker/parser.py:_parse_twister`
+    # 拼的是 `"; ".join("%s=%s" % (dim, val))` —— 分隔符是 `=`。
+    # 于是 `if ":" in seg` 对每一段都为假，theme 对**所有真实记录**恒为 null，
+    # 而 parent_asin 照常有值、`variant` 对象不是 None，从响应上看不出任何异常。
+    #
+    # 用真实格式做输入是这几条用例的全部意义：夹具里只要写成 "Color:Red"，
+    # 这个 bug 就能一直绿着活下去（原先的夹具正是这么写的）。
+    def _submit_variant(self, c, asin, variant_attributes, batch, parent="B0PARENT01"):
+        c.post("/api/upload",
+               files={"file": ("v.txt", f"{asin}\n".encode(), "text/plain")},
+               data={"batch_name": batch, "zip_code": "10001"})
+        t = c.get("/api/tasks/pull",
+                  params={"worker_id": f"w-{batch}", "count": 1}).json()["tasks"][0]
+        c.post("/api/tasks/result", json={
+            "task_id": t["id"], "batch_id": t["batch_id"],
+            "worker_id": f"w-{batch}", "lease_epoch": t["lease_epoch"],
+            "success": True, "asin": t["asin"], "title": "Variant Probe",
+            "brand": "B", "category_tree": "Home > Tools",
+            "image_urls": "https://m.media-amazon.com/images/I/71A._AC_SL1500_.jpg",
+            "current_price": "19.99", "stock_status": "In Stock",
+            "parent_asin": parent, "variant_attributes": variant_attributes,
+            "crawl_time": "2026-08-05T10:00:00Z", "site": "US",
+            "zip_code": "10001"})
+        _drain(c)
+        recs = c.get("/api/export/incremental",
+                     params={"cursor": 0, "limit": 500}, headers=self._hdr()
+                     ).json()["records"]
+        hit = [r for r in recs if r["asin"] == asin]
+        self.assertTrue(hit, f"样本 {asin} 没进事件流")
+        return hit[0]["slow"]["variant"]
+
+    def test_theme_uses_the_real_producer_format(self):
+        """**这条对应 theme 恒为 null 那个 bug。**
+
+        输入是 `worker/parser.py:_parse_twister` 真正会产出的串。
+        """
+        with _server_with_relay() as (c, _):
+            v = self._submit_variant(
+                c, "B0VARTHM01", "color_name=Red; size_name=L", "var_theme")
+
+        self.assertEqual(v["parent_asin"], "B0PARENT01")
+        self.assertEqual(
+            v["theme"], "color_name/size_name",
+            "theme 没解析出来 —— 采集侧用的是 `=` 分隔（color_name=Red），"
+            "别再按 `:` 切；正确的解析在 common/slowhash.parse_variant_attributes")
+
+    def test_theme_keeps_the_producer_dimension_order(self):
+        """维度顺序按采集侧的 `dimensions` 数组来，不排序。
+
+        `color/size` 与 `size/color` 描述同一族，但前者才是页面上的次序；
+        排序会把这个信息抹掉。
+        """
+        with _server_with_relay() as (c, _):
+            v = self._submit_variant(
+                c, "B0VARORD01", "size_name=L; color_name=Red", "var_order")
+        self.assertEqual(v["theme"], "size_name/color_name")
+
+    def test_single_dimension_variant(self):
+        with _server_with_relay() as (c, _):
+            v = self._submit_variant(c, "B0VARONE01", "color_name=Blue", "var_one")
+        self.assertEqual(v["theme"], "color_name")
+
+    def test_values_without_dimension_names_give_null_theme(self):
+        """采集侧拿不到维度名时只产出裸值（`"Red; L"`）——那时 theme 必须是 null。
+
+        编一个维度名出来比留空更糟：下游会拿它当真的维度去分组。
+        """
+        with _server_with_relay() as (c, _):
+            v = self._submit_variant(c, "B0VARBAR01", "Red; L", "var_bare")
+        self.assertEqual(v["parent_asin"], "B0PARENT01")
+        self.assertIsNone(
+            v["theme"],
+            "只有值没有维度名时不该编出 theme —— 那些裸值落在 slowhash 的无键槽里")
+
     def test_slow_hash_is_16_hex_per_contract(self):
         """契约 v1：slow_hash 是 sha256 前 16 位。内部存的是 'v1:<64 位>'。"""
         with _server_with_relay() as (c, _):

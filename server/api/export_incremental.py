@@ -69,7 +69,7 @@ from fastapi import APIRouter, Header, Query
 from fastapi.responses import JSONResponse
 
 from common.core.completeness import completeness_ok
-from common.slowhash import split_multivalue
+from common.slowhash import parse_variant_attributes, split_multivalue
 from server.api import sync as _sync
 
 logger = logging.getLogger(__name__)
@@ -283,16 +283,45 @@ def _iso_seconds(dt: Any) -> Optional[str]:
 def _variant(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """slow.variant = {parent_asin, theme}。
 
-    theme 取变体维度名（"Color/Size"），不是取值 —— 取值属于**这一个**变体，
-    维度才是这个变体族共有的慢变属性。采集侧存的是 "Color:Red|Size:M" 形态。
+    theme 取变体**维度名**（``"color_name/size_name"``），不是取值 —— 取值属于
+    **这一个**变体，维度才是这个变体族共有的慢变属性。
+
+    ------------------------------------------------------------------
+    这里曾经自带一份**格式写错**的解析，导致 theme 恒为 null
+    ------------------------------------------------------------------
+    原实现是 ``seg.split(":", 1)[0] for seg in re.split(r"[|;]", raw) if ":" in seg``，
+    docstring 还写着「采集侧存的是 ``"Color:Red|Size:M"`` 形态」。**采集侧从来
+    没有产出过那个形态**：``worker/parser.py:_parse_twister`` 拼的是
+
+        "; ".join("%s=%s" % (dim, val) ...)   ->  "color_name=Red; size_name=L"
+
+    分隔符是 ``=`` 不是 ``:``，于是 ``if ":" in seg`` 对每一段都为假 ⇒ keys 恒空
+    ⇒ **theme 对所有真实记录恒为 null**。而 parent_asin 照常有值，所以
+    ``variant`` 对象本身不是 None，从响应上看不出任何异常 —— 下游只会读成
+    「这个商品没有变体维度」。
+
+    根因是仓库里记过的同一种错法（`.agent/MIGRATION_STATUS.md` §5.5 的 V2/V4）：
+    **抄了一份该共用的东西，然后两份各自演化**。正确的那份一直都在 ——
+    ``common/slowhash.parse_variant_attributes``，它连采集侧的两种形态都在
+    注释里标了 file:line。所以这里不是去「修对分隔符」，而是**改成复用它**。
+
+    两种形态的处理：
+      * ``"color_name=Red; size_name=L"``  -> theme ``"color_name/size_name"``
+      * ``"Red; L"``（采集侧拿不到维度名时的回退）-> 值落进 slowhash 的无键槽
+        ``""``，**theme 仍为 None** —— 我们确实不知道维度叫什么，
+        编一个出来比留空更糟。
+
+    维度顺序**保持采集侧的顺序**（``dimensions`` 数组的顺序），不排序：
+    ``color/size`` 与 ``size/color`` 描述的是同一族，但前者才是页面上的次序。
+    ``parse_variant_attributes`` 返回的 dict 按输入序插入，直接迭代即可。
     """
     parent = _clean(payload.get("parent_asin"))
-    raw = _clean(payload.get("variant_attributes"))
+    attrs = parse_variant_attributes(payload.get("variant_attributes"))
     theme = None
-    if raw:
-        keys = [seg.split(":", 1)[0].strip()
-                for seg in re.split(r"[|;]", raw) if ":" in seg]
-        theme = "/".join([k for k in keys if k]) or None
+    if attrs:
+        # 排除无键槽 ""（回退形态的裸值），它不是维度名
+        keys = [k for k in attrs if k]
+        theme = "/".join(keys) or None
     if parent is None and theme is None:
         return None
     return {"parent_asin": parent, "theme": theme}

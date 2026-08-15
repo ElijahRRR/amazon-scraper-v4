@@ -2879,7 +2879,7 @@
               "task_id": 1,
               "title": "Golden Test Product B0GOLDEN01",
               "upc_list": "012345678905",
-              "variant_attributes": "Color:Red",
+              "variant_attributes": "color_name=Red; size_name=L",
               "variation_asins": "",
               "worker_id": "w-golden-01",
               "zip_code": "10001"
@@ -2929,7 +2929,7 @@
               "task_id": 3,
               "title": "Golden Test Product B0GOLDEN03",
               "upc_list": "012345678905",
-              "variant_attributes": "Color:Red",
+              "variant_attributes": "color_name=Red; size_name=L",
               "variation_asins": "",
               "worker_id": "w-golden-01",
               "zip_code": "10001"
@@ -2979,7 +2979,7 @@
               "task_id": 4,
               "title": "Golden Test Product B0GOLDEN03",
               "upc_list": "012345678905",
-              "variant_attributes": "Color:Red",
+              "variant_attributes": "color_name=Red; size_name=L",
               "variation_asins": "",
               "worker_id": "w-golden-01",
               "zip_code": "10001"
@@ -3078,7 +3078,7 @@
           "task_id": 2,
           "title": "Golden Test Product B0GOLDEN02",
           "upc_list": "012345678905",
-          "variant_attributes": "Color:Red",
+          "variant_attributes": "color_name=Red; size_name=L",
           "variation_asins": "",
           "worker_id": "w-golden-01",
           "zip_code": "10001"
@@ -3164,7 +3164,7 @@
           "task_id": 2,
           "title": "Golden Test Product B0GOLDEN02",
           "upc_list": "012345678905",
-          "variant_attributes": "Color:Red",
+          "variant_attributes": "color_name=Red; size_name=L",
           "variation_asins": "",
           "worker_id": "w-golden-01",
           "zip_code": "10001"
@@ -3259,7 +3259,7 @@
             "title_bullets_hash": "6d39ef571dc7bf88cb62e5ff8f857d8d",
             "upc_list": "012345678905",
             "updated_at": "<VOLATILE>",
-            "variant_attributes": "Color:Red",
+            "variant_attributes": "color_name=Red; size_name=L",
             "variation_asins": "",
             "zip_code": "10001"
           }
@@ -3337,7 +3337,7 @@
               "title_bullets_hash": "6d39ef571dc7bf88cb62e5ff8f857d8d",
               "upc_list": "012345678905",
               "updated_at": "<VOLATILE>",
-              "variant_attributes": "Color:Red",
+              "variant_attributes": "color_name=Red; size_name=L",
               "variation_asins": "",
               "zip_code": "10001"
             },
@@ -3394,7 +3394,7 @@
               "title_bullets_hash": "8a1d46aa03468120efb7aced9432780f",
               "upc_list": "012345678905",
               "updated_at": "<VOLATILE>",
-              "variant_attributes": "Color:Red",
+              "variant_attributes": "color_name=Red; size_name=L",
               "variation_asins": "",
               "zip_code": "10001"
             }
@@ -3476,7 +3476,7 @@
               "title_bullets_hash": "6d39ef571dc7bf88cb62e5ff8f857d8d",
               "upc_list": "012345678905",
               "updated_at": "<VOLATILE>",
-              "variant_attributes": "Color:Red",
+              "variant_attributes": "color_name=Red; size_name=L",
               "variation_asins": "",
               "zip_code": "10001"
             },
@@ -3533,7 +3533,7 @@
               "title_bullets_hash": "8a1d46aa03468120efb7aced9432780f",
               "upc_list": "012345678905",
               "updated_at": "<VOLATILE>",
-              "variant_attributes": "Color:Red",
+              "variant_attributes": "color_name=Red; size_name=L",
               "variation_asins": "",
               "zip_code": "10001"
             }
@@ -3616,7 +3616,7 @@
               "title_bullets_hash": "6f448695993640ef820990bf5c9bbc86",
               "upc_list": "012345678905",
               "updated_at": "<VOLATILE>",
-              "variant_attributes": "Color:Red",
+              "variant_attributes": "color_name=Red; size_name=L",
               "variation_asins": "",
               "zip_code": "10001"
             }
@@ -3700,7 +3700,7 @@
               "title_bullets_hash": "6d39ef571dc7bf88cb62e5ff8f857d8d",
               "upc_list": "012345678905",
               "updated_at": "<VOLATILE>",
-              "variant_attributes": "Color:Red",
+              "variant_attributes": "color_name=Red; size_name=L",
               "variation_asins": "",
               "zip_code": "10001"
             }
@@ -3782,7 +3782,7 @@
               "title_bullets_hash": "6d39ef571dc7bf88cb62e5ff8f857d8d",
               "upc_list": "012345678905",
               "updated_at": "<VOLATILE>",
-              "variant_attributes": "Color:Red",
+              "variant_attributes": "color_name=Red; size_name=L",
               "variation_asins": "",
               "zip_code": "10001"
             },
@@ -3839,7 +3839,7 @@
               "title_bullets_hash": "8a1d46aa03468120efb7aced9432780f",
               "upc_list": "012345678905",
               "updated_at": "<VOLATILE>",
-              "variant_attributes": "Color:Red",
+              "variant_attributes": "color_name=Red; size_name=L",
               "variation_asins": "",
               "zip_code": "10001"
             },
@@ -3896,7 +3896,7 @@
               "title_bullets_hash": "6f448695993640ef820990bf5c9bbc86",
               "upc_list": "012345678905",
               "updated_at": "<VOLATILE>",
-              "variant_attributes": "Color:Red",
+              "variant_attributes": "color_name=Red; size_name=L",
               "variation_asins": "",
               "zip_code": "10001"
             }
@@ -3978,7 +3978,7 @@
               "title_bullets_hash": "6d39ef571dc7bf88cb62e5ff8f857d8d",
               "upc_list": "012345678905",
               "updated_at": "<VOLATILE>",
-              "variant_attributes": "Color:Red",
+              "variant_attributes": "color_name=Red; size_name=L",
               "variation_asins": "",
               "zip_code": "10001"
             },
@@ -4035,7 +4035,7 @@
               "title_bullets_hash": "8a1d46aa03468120efb7aced9432780f",
               "upc_list": "012345678905",
               "updated_at": "<VOLATILE>",
-              "variant_attributes": "Color:Red",
+              "variant_attributes": "color_name=Red; size_name=L",
               "variation_asins": "",
               "zip_code": "10001"
             },
@@ -4092,7 +4092,7 @@
               "title_bullets_hash": "6f448695993640ef820990bf5c9bbc86",
               "upc_list": "012345678905",
               "updated_at": "<VOLATILE>",
-              "variant_attributes": "Color:Red",
+              "variant_attributes": "color_name=Red; size_name=L",
               "variation_asins": "",
               "zip_code": "10001"
             }
@@ -4174,7 +4174,7 @@
               "title_bullets_hash": "6d39ef571dc7bf88cb62e5ff8f857d8d",
               "upc_list": "012345678905",
               "updated_at": "<VOLATILE>",
-              "variant_attributes": "Color:Red",
+              "variant_attributes": "color_name=Red; size_name=L",
               "variation_asins": "",
               "zip_code": "10001"
             },
@@ -4231,7 +4231,7 @@
               "title_bullets_hash": "8a1d46aa03468120efb7aced9432780f",
               "upc_list": "012345678905",
               "updated_at": "<VOLATILE>",
-              "variant_attributes": "Color:Red",
+              "variant_attributes": "color_name=Red; size_name=L",
               "variation_asins": "",
               "zip_code": "10001"
             },
@@ -4288,7 +4288,7 @@
               "title_bullets_hash": "6f448695993640ef820990bf5c9bbc86",
               "upc_list": "012345678905",
               "updated_at": "<VOLATILE>",
-              "variant_attributes": "Color:Red",
+              "variant_attributes": "color_name=Red; size_name=L",
               "variation_asins": "",
               "zip_code": "10001"
             }
@@ -4378,7 +4378,7 @@
             "title_bullets_hash": "6f448695993640ef820990bf5c9bbc86",
             "upc_list": "012345678905",
             "updated_at": "<VOLATILE>",
-            "variant_attributes": "Color:Red",
+            "variant_attributes": "color_name=Red; size_name=L",
             "variation_asins": "",
             "zip_code": "10001"
           }
@@ -4512,7 +4512,7 @@
               "task_id": 5,
               "title": "Golden Test Product B0GOLDEN04 v2",
               "upc_list": "012345678905",
-              "variant_attributes": "Color:Red",
+              "variant_attributes": "color_name=Red; size_name=L",
               "variation_asins": "",
               "worker_id": "w-golden-01",
               "zip_code": "10001"
@@ -4611,7 +4611,7 @@
             "title_bullets_hash": "43c4f26c8f5afa0aa170eef0381bdb6b",
             "upc_list": "012345678905",
             "updated_at": "<VOLATILE>",
-            "variant_attributes": "Color:Red",
+            "variant_attributes": "color_name=Red; size_name=L",
             "variation_asins": "",
             "zip_code": "10001"
           }
@@ -4787,9 +4787,9 @@
         "body": {
           "__csv_lines__": [
             "ASIN (商品ID),商品标题,品牌,商品类型,制造商,产品型号,部件编号,原产国,是否为定制产品,畅销排名,商品原价,当前价格,BuyBox 价格,BuyBox 运费,总价,是否 FBA 发货,库存数量,库存状态,配送到达时间,配送时长,商品图片链接,五点描述,长描述,UPC 列表,变体属性,父体 ASIN,变体 ASIN 列表,根类目 ID,类目 ID 链,类目路径树,上架时间,包装尺寸,包装重量,商品本体尺寸,商品本体重量,产品链接,站点,配送邮编,商品采集时间,商品评分,评论数,卖家店铺ID,卖家店铺名,本批采集结果,数据来源,失败类型,失败详情,实际页面ASIN,重试次数,本批任务更新时间,产品库数据更新时间",
-            "B0GOLDEN01,Golden Test Product B0GOLDEN01,GoldenBrand,TestType,GoldenMfg,MDL-01,PN-01,China,No,#123 in Test,29.99,19.99,19.99,0.00,$19.99,Yes,42,In Stock,2026-08-10,3 days,https://m.media-amazon.com/images/I/71GOLDEN01._AC_SL1500_.jpg,point one|point two,a long description,012345678905,Color:Red,B0GOLDEN01,,root123,\"c1,c2\",Home > Test > Sub,2025-01-01,10 x 5 x 2 inches,1.5 pounds,9 x 4 x 1 inches,1.2 pounds,https://www.amazon.com/dp/B0GOLDEN01,US,10001,<TS>,4.5,128,AGOLDENSELLER,Golden Seller,成功,本次采集更新,,,,,<TS>,<TS>",
-            "B0GOLDEN02,Golden Test Product B0GOLDEN02,GoldenBrand,TestType,GoldenMfg,MDL-02,PN-02,China,No,#123 in Test,29.99,33.50,33.50,0.00,$33.50,Yes,9,In Stock,2026-08-10,3 days,https://m.media-amazon.com/images/I/71GOLDEN01._AC_SL1500_.jpg,point one|point two,a long description,012345678905,Color:Red,B0GOLDEN02,,root123,\"c1,c2\",Home > Test > Sub,2025-01-01,10 x 5 x 2 inches,1.5 pounds,9 x 4 x 1 inches,1.2 pounds,https://www.amazon.com/dp/B0GOLDEN02,US,10001,<TS>,4.5,128,AGOLDENSELLER,Golden Seller,成功,本次采集更新,,,,,<TS>,<TS>",
-            "B0GOLDEN03,Golden Test Product B0GOLDEN03,GoldenBrand,TestType,GoldenMfg,MDL-03,PN-03,China,No,#123 in Test,29.99,19.99,19.99,0.00,$19.99,Yes,42,In Stock,2026-08-10,3 days,https://m.media-amazon.com/images/I/71GOLDEN01._AC_SL1500_.jpg,point one|point two,a long description,012345678905,Color:Red,B0GOLDEN03,,root123,\"c1,c2\",Home > Test > Sub,2025-01-01,10 x 5 x 2 inches,1.5 pounds,9 x 4 x 1 inches,1.2 pounds,https://www.amazon.com/dp/B0GOLDEN03,US,10001,<TS>,4.5,128,AGOLDENSELLER,Golden Seller,成功,本次采集更新,,,,,<TS>,<TS>"
+            "B0GOLDEN01,Golden Test Product B0GOLDEN01,GoldenBrand,TestType,GoldenMfg,MDL-01,PN-01,China,No,#123 in Test,29.99,19.99,19.99,0.00,$19.99,Yes,42,In Stock,2026-08-10,3 days,https://m.media-amazon.com/images/I/71GOLDEN01._AC_SL1500_.jpg,point one|point two,a long description,012345678905,color_name=Red; size_name=L,B0GOLDEN01,,root123,\"c1,c2\",Home > Test > Sub,2025-01-01,10 x 5 x 2 inches,1.5 pounds,9 x 4 x 1 inches,1.2 pounds,https://www.amazon.com/dp/B0GOLDEN01,US,10001,<TS>,4.5,128,AGOLDENSELLER,Golden Seller,成功,本次采集更新,,,,,<TS>,<TS>",
+            "B0GOLDEN02,Golden Test Product B0GOLDEN02,GoldenBrand,TestType,GoldenMfg,MDL-02,PN-02,China,No,#123 in Test,29.99,33.50,33.50,0.00,$33.50,Yes,9,In Stock,2026-08-10,3 days,https://m.media-amazon.com/images/I/71GOLDEN01._AC_SL1500_.jpg,point one|point two,a long description,012345678905,color_name=Red; size_name=L,B0GOLDEN02,,root123,\"c1,c2\",Home > Test > Sub,2025-01-01,10 x 5 x 2 inches,1.5 pounds,9 x 4 x 1 inches,1.2 pounds,https://www.amazon.com/dp/B0GOLDEN02,US,10001,<TS>,4.5,128,AGOLDENSELLER,Golden Seller,成功,本次采集更新,,,,,<TS>,<TS>",
+            "B0GOLDEN03,Golden Test Product B0GOLDEN03,GoldenBrand,TestType,GoldenMfg,MDL-03,PN-03,China,No,#123 in Test,29.99,19.99,19.99,0.00,$19.99,Yes,42,In Stock,2026-08-10,3 days,https://m.media-amazon.com/images/I/71GOLDEN01._AC_SL1500_.jpg,point one|point two,a long description,012345678905,color_name=Red; size_name=L,B0GOLDEN03,,root123,\"c1,c2\",Home > Test > Sub,2025-01-01,10 x 5 x 2 inches,1.5 pounds,9 x 4 x 1 inches,1.2 pounds,https://www.amazon.com/dp/B0GOLDEN03,US,10001,<TS>,4.5,128,AGOLDENSELLER,Golden Seller,成功,本次采集更新,,,,,<TS>,<TS>"
           ]
         },
         "content_type": "text/csv",
@@ -4888,7 +4888,7 @@
                 "point one|point two",
                 "a long description",
                 "012345678905",
-                "Color:Red",
+                "color_name=Red; size_name=L",
                 "B0GOLDEN01",
                 null,
                 "root123",
@@ -4941,7 +4941,7 @@
                 "point one|point two",
                 "a long description",
                 "012345678905",
-                "Color:Red",
+                "color_name=Red; size_name=L",
                 "B0GOLDEN02",
                 null,
                 "root123",
@@ -4994,7 +4994,7 @@
                 "point one|point two",
                 "a long description",
                 "012345678905",
-                "Color:Red",
+                "color_name=Red; size_name=L",
                 "B0GOLDEN03",
                 null,
                 "root123",
@@ -5046,10 +5046,10 @@
         "body": {
           "__csv_lines__": [
             "ASIN (商品ID),商品标题,品牌,商品类型,制造商,产品型号,部件编号,原产国,是否为定制产品,畅销排名,商品原价,当前价格,BuyBox 价格,BuyBox 运费,总价,是否 FBA 发货,库存数量,库存状态,配送到达时间,配送时长,商品图片链接,五点描述,长描述,UPC 列表,变体属性,父体 ASIN,变体 ASIN 列表,根类目 ID,类目 ID 链,类目路径树,上架时间,包装尺寸,包装重量,商品本体尺寸,商品本体重量,产品链接,站点,配送邮编,商品采集时间,商品评分,评论数,卖家店铺ID,卖家店铺名",
-            "B0GOLDEN01,Golden Test Product B0GOLDEN01,GoldenBrand,TestType,GoldenMfg,MDL-01,PN-01,China,No,#123 in Test,29.99,19.99,19.99,0.00,$19.99,Yes,42,In Stock,2026-08-10,3 days,https://m.media-amazon.com/images/I/71GOLDEN01._AC_SL1500_.jpg,point one|point two,a long description,012345678905,Color:Red,B0GOLDEN01,,root123,\"c1,c2\",Home > Test > Sub,2025-01-01,10 x 5 x 2 inches,1.5 pounds,9 x 4 x 1 inches,1.2 pounds,https://www.amazon.com/dp/B0GOLDEN01,US,10001,<TS>,4.5,128,AGOLDENSELLER,Golden Seller",
-            "B0GOLDEN03,Golden Test Product B0GOLDEN03,GoldenBrand,TestType,GoldenMfg,MDL-03,PN-03,China,No,#123 in Test,29.99,19.99,19.99,0.00,$19.99,Yes,42,In Stock,2026-08-10,3 days,https://m.media-amazon.com/images/I/71GOLDEN01._AC_SL1500_.jpg,point one|point two,a long description,012345678905,Color:Red,B0GOLDEN03,,root123,\"c1,c2\",Home > Test > Sub,2025-01-01,10 x 5 x 2 inches,1.5 pounds,9 x 4 x 1 inches,1.2 pounds,https://www.amazon.com/dp/B0GOLDEN03,US,10001,<TS>,4.5,128,AGOLDENSELLER,Golden Seller",
-            "B0GOLDEN02,Golden Test Product B0GOLDEN02,GoldenBrand,TestType,GoldenMfg,MDL-02,PN-02,China,No,#123 in Test,29.99,33.50,33.50,0.00,$33.50,Yes,9,In Stock,2026-08-10,3 days,https://m.media-amazon.com/images/I/71GOLDEN01._AC_SL1500_.jpg,point one|point two,a long description,012345678905,Color:Red,B0GOLDEN02,,root123,\"c1,c2\",Home > Test > Sub,2025-01-01,10 x 5 x 2 inches,1.5 pounds,9 x 4 x 1 inches,1.2 pounds,https://www.amazon.com/dp/B0GOLDEN02,US,10001,<TS>,4.5,128,AGOLDENSELLER,Golden Seller",
-            "B0GOLDEN04,Golden Test Product B0GOLDEN04 v2,GoldenBrand,TestType,GoldenMfg,MDL-04,PN-04,China,No,#123 in Test,29.99,24.99,24.99,0.00,$24.99,Yes,7,In Stock,2026-08-10,3 days,https://m.media-amazon.com/images/I/71GOLDEN01._AC_SL1500_.jpg,point one|point two,a long description,012345678905,Color:Red,B0GOLDEN04,,root123,\"c1,c2\",Home > Test > Sub,2025-01-01,10 x 5 x 2 inches,1.5 pounds,9 x 4 x 1 inches,1.2 pounds,https://www.amazon.com/dp/B0GOLDEN04,US,10001,<TS>,4.5,128,AGOLDENSELLER,Golden Seller"
+            "B0GOLDEN01,Golden Test Product B0GOLDEN01,GoldenBrand,TestType,GoldenMfg,MDL-01,PN-01,China,No,#123 in Test,29.99,19.99,19.99,0.00,$19.99,Yes,42,In Stock,2026-08-10,3 days,https://m.media-amazon.com/images/I/71GOLDEN01._AC_SL1500_.jpg,point one|point two,a long description,012345678905,color_name=Red; size_name=L,B0GOLDEN01,,root123,\"c1,c2\",Home > Test > Sub,2025-01-01,10 x 5 x 2 inches,1.5 pounds,9 x 4 x 1 inches,1.2 pounds,https://www.amazon.com/dp/B0GOLDEN01,US,10001,<TS>,4.5,128,AGOLDENSELLER,Golden Seller",
+            "B0GOLDEN03,Golden Test Product B0GOLDEN03,GoldenBrand,TestType,GoldenMfg,MDL-03,PN-03,China,No,#123 in Test,29.99,19.99,19.99,0.00,$19.99,Yes,42,In Stock,2026-08-10,3 days,https://m.media-amazon.com/images/I/71GOLDEN01._AC_SL1500_.jpg,point one|point two,a long description,012345678905,color_name=Red; size_name=L,B0GOLDEN03,,root123,\"c1,c2\",Home > Test > Sub,2025-01-01,10 x 5 x 2 inches,1.5 pounds,9 x 4 x 1 inches,1.2 pounds,https://www.amazon.com/dp/B0GOLDEN03,US,10001,<TS>,4.5,128,AGOLDENSELLER,Golden Seller",
+            "B0GOLDEN02,Golden Test Product B0GOLDEN02,GoldenBrand,TestType,GoldenMfg,MDL-02,PN-02,China,No,#123 in Test,29.99,33.50,33.50,0.00,$33.50,Yes,9,In Stock,2026-08-10,3 days,https://m.media-amazon.com/images/I/71GOLDEN01._AC_SL1500_.jpg,point one|point two,a long description,012345678905,color_name=Red; size_name=L,B0GOLDEN02,,root123,\"c1,c2\",Home > Test > Sub,2025-01-01,10 x 5 x 2 inches,1.5 pounds,9 x 4 x 1 inches,1.2 pounds,https://www.amazon.com/dp/B0GOLDEN02,US,10001,<TS>,4.5,128,AGOLDENSELLER,Golden Seller",
+            "B0GOLDEN04,Golden Test Product B0GOLDEN04 v2,GoldenBrand,TestType,GoldenMfg,MDL-04,PN-04,China,No,#123 in Test,29.99,24.99,24.99,0.00,$24.99,Yes,7,In Stock,2026-08-10,3 days,https://m.media-amazon.com/images/I/71GOLDEN01._AC_SL1500_.jpg,point one|point two,a long description,012345678905,color_name=Red; size_name=L,B0GOLDEN04,,root123,\"c1,c2\",Home > Test > Sub,2025-01-01,10 x 5 x 2 inches,1.5 pounds,9 x 4 x 1 inches,1.2 pounds,https://www.amazon.com/dp/B0GOLDEN04,US,10001,<TS>,4.5,128,AGOLDENSELLER,Golden Seller"
           ]
         },
         "content_type": "text/csv",
@@ -5622,7 +5622,7 @@
               "title_bullets_hash": "43c4f26c8f5afa0aa170eef0381bdb6b",
               "upc_list": "012345678905",
               "updated_at": "<VOLATILE>",
-              "variant_attributes": "Color:Red",
+              "variant_attributes": "color_name=Red; size_name=L",
               "variation_asins": "",
               "zip_code": "10001"
             },
@@ -5679,7 +5679,7 @@
               "title_bullets_hash": "6d39ef571dc7bf88cb62e5ff8f857d8d",
               "upc_list": "012345678905",
               "updated_at": "<VOLATILE>",
-              "variant_attributes": "Color:Red",
+              "variant_attributes": "color_name=Red; size_name=L",
               "variation_asins": "",
               "zip_code": "10001"
             },
@@ -5736,7 +5736,7 @@
               "title_bullets_hash": "8a1d46aa03468120efb7aced9432780f",
               "upc_list": "012345678905",
               "updated_at": "<VOLATILE>",
-              "variant_attributes": "Color:Red",
+              "variant_attributes": "color_name=Red; size_name=L",
               "variation_asins": "",
               "zip_code": "10001"
             },
@@ -5793,7 +5793,7 @@
               "title_bullets_hash": "6f448695993640ef820990bf5c9bbc86",
               "upc_list": "012345678905",
               "updated_at": "<VOLATILE>",
-              "variant_attributes": "Color:Red",
+              "variant_attributes": "color_name=Red; size_name=L",
               "variation_asins": "",
               "zip_code": "10001"
             }
