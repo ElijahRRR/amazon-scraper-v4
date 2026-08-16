@@ -66,7 +66,14 @@ def _product(asin: str, *, price: str, stock: str, title_suffix: str = "") -> Di
         "ean_list": "",
         "parent_asin": asin,
         "variation_asins": "",
-        "variant_attributes": "Color:Red",
+        # ⚠ 必须用**采集侧真正产出**的形态。worker/parser.py:_parse_twister 拼的是
+        #     "; ".join("%s=%s" % (dim, val) ...)  ->  "color_name=Red; size_name=L"
+        # 这里以前写的是 "Color:Red"（冒号），而那个形态采集侧从未产出过。
+        # 代价是真的：server/api/export_incremental.py 的 _variant() 自带一份按
+        # `:` 切的解析，靠这个假夹具一直绿着，而线上 slow.variant.theme 对**所有**
+        # 真实记录恒为 null。夹具不真实 = 守卫形同虚设，这是 V2（分隔符）之后的
+        # 第二次同类事故。
+        "variant_attributes": "color_name=Red; size_name=L",
         "root_category_id": "root123",
         "category_ids": "c1,c2",
         "category_tree": "Home > Test > Sub",
