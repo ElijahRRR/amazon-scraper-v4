@@ -259,6 +259,8 @@ ASIN 只有一行，后采的覆盖先采的；而 `/api/results?batch_id=` 的 
    页面没有这一块时是 `null`（键恒在）。它**不进 `slow_hash`**（内容已在 title 里，
    再算一遍等于同一段文本数两次）。两个解析引擎共用同一份提取实现，
    否则同一商品会因为走了哪条引擎而给出不同答案。
+   副标题**也落库**（`asin_data.subtitle`），因此 `/api/results` 和 CSV/xlsx 导出
+   （列名「副标题」，在最右侧）也都有它。
 
    **运费在这里**：`fast.shipping`（float 或 null）+ `fast.shipping_raw`（原始串）。
    采集侧存的是字符串，三种形态映射到三个互不相同的结果 ——
@@ -268,6 +270,30 @@ ASIN 只有一行，后采的覆盖先采的；而 `/api/results?batch_id=` 的 
 3. **同步运维 API**（`server/api/sync.py`，`/api/v1/sync/*`，**仅 PostgreSQL 后端**）：读的是同一份事件流，但给的是内部原始事件形状 + 运维可观测性（relay 延迟、outbox 深度、保留期水位、`ack` 游标、强制裁剪通知）。完整契约见 [`docs/sync_contract.md`](docs/sync_contract.md)；面向 erpAPI 侧的业务端点（上传/状态/结果/失败明细）契约见 [`docs/erpapi_contract.md`](docs/erpapi_contract.md)。
 
 后两者依赖事件流，只有 PostgreSQL 后端提供；万一跑在 SQLite 回滚路径上，它们统一返回结构化 `503`（不是 404——404 容易被消费方误读成"暂无数据"，导致游标停滞）。
+
+### 升级到带 `subtitle` 列的版本（2026-08）
+
+`asin_data` 新增一列 `subtitle`。**不需要手工执行任何 SQL**，两个后端都在启动时
+自动补列，幂等、可反复跑：
+
+| 后端 | 补列方式 |
+|---|---|
+| PostgreSQL | `common/pgdb/schema.py:DDL_ALTERS` 的 `ALTER TABLE asin_data ADD COLUMN IF NOT EXISTS subtitle`，由 `init_tables()` 执行 |
+| SQLite | `common/database.py` 的 ALTER 阶梯里新增一条 |
+
+`CREATE TABLE IF NOT EXISTS` 对**已存在**的表是 no-op，所以老库只能靠上面这条
+ALTER 拿到新列 —— 这一条由 `tests/pgdb/test_schema_migration.py` 专门守着
+（它会把列 DROP 掉再跑 `init_tables()`，验证列回来了、列序对得上、老数据没被动）。
+
+**为什么新列必须排在最末尾**（在 `created_at` / `updated_at` 之后）：`ALTER TABLE
+ADD COLUMN` 只能追加到末尾，若在 DDL 里把它插在中间，**新建库**与**升级库**的
+物理列序就会分叉；而 `SELECT d.*` 没有 `response_model`，列序会整个泄进 API 响应
+—— 同一份代码两种响应，且 `verify_schema()` 只能对上其中一种。
+
+实测（PG 17 与 SQLite 各跑一遍）：先用旧代码建库、写入一行，再用新代码启动，
+新建库与升级库的列序**逐列相同**，老行原样保留、新列为 `NULL`。
+
+升级后既有商品的 `subtitle` 都是 `NULL`，下一轮采集才会填上。
 
 ### 首次部署 PostgreSQL 后端的验证清单
 

@@ -1059,6 +1059,9 @@ if r["status"] == "completed":      # ✅ 权威判据
 | 没有副标题时不留下孤零零的分隔符 | `…::test_missing_differentiator_leaves_no_dangling_separator` |
 | `title` 与 `subtitle` 共用一份提取、永不自相矛盾 | `…::SubtitleFieldTests::test_subtitle_and_title_never_contradict` |
 | `slow.subtitle` 进契约，没有就是 null（键恒在） | `tests/test_incremental_export.py::…::test_subtitle_*` |
+| `asin_data` 新列在老库上会被自动补上（`CREATE TABLE IF NOT EXISTS` 不补列） | `tests/pgdb/test_schema_migration.py::test_existing_table_gets_the_new_columns_back` |
+| 补列后列序仍与 `EXPECTED_COLUMNS` 一致、老数据不动 | `…::test_migration_preserves_existing_rows` |
+| 往后新增的列必须落在两份 DDL 的末尾（否则新建库/升级库列序分叉） | `tests/test_asin_data_field_table_guard.py::test_every_alter_added_column_sits_at_the_tail_of_both_ddls` |
 | 两个后端行为逐字节一致 | `python -m tests.golden.run verify` / `DB_BACKEND=postgres … verify` |
 
 **门禁**（改了本文覆盖的任何行为都要全绿）：

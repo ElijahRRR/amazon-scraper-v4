@@ -222,6 +222,8 @@ X-Export-Token: <token>
 * `subtitle` **不进 `slow_hash`**：它的内容已经在 `title` 里了，再算一遍等于
   同一段文本在哈希里数两次。所以副标题变了，`slow_hash` **会**变（经由 title）。
 * 键恒在。`null` 表示这一页没有这一块，与其余字段同一条空值纪律（见下）。
+* 它**也落库**（`asin_data.subtitle`），所以 `/api/results` 与 CSV/xlsx 导出
+  （列名「副标题」，在最右侧）同样有它。老库启动时自动补列，不需要手工 SQL。
 * 这是**追加**字段（§3.2 允许单方面加字段），`contract_version` 仍是 1。
   老事件也会拿到 —— 但注意：**2026-08 改版之前采的记录，副标题本来就在
   `#productTitle` 里**，那时 `subtitle` 是 `null` 而 `title` 是完整的。

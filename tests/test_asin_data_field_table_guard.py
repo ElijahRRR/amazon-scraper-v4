@@ -58,6 +58,34 @@ import unittest
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+def _sqlite_alter_added_columns() -> set:
+    """SQLite 侧只通过 `ALTER TABLE asin_data ADD COLUMN` 补上的列。
+
+    只认 asin_data 那几段（文件里还有 batches / tasks 的 ALTER 阶梯）。
+    """
+    with open(os.path.join(_REPO_ROOT, "common", "database.py"),
+              encoding="utf-8") as fh:
+        src = fh.read()
+    cols = set()
+    for m in re.finditer(
+            r'for col in \[([^\]]*)\]:\s*\n\s*try:\s*\n\s*await self\._db\.execute\('
+            r'f"ALTER TABLE asin_data ADD COLUMN', src):
+        cols |= {c.strip().strip('"\'') for c in m.group(1).split(",") if c.strip()}
+    return cols
+
+
+def _pg_alter_added_columns() -> set:
+    """PG 侧 `DDL_ALTERS` 里对 asin_data 的 ADD COLUMN。"""
+    from common.pgdb.schema import DDL_ALTERS
+    cols = set()
+    for stmt in DDL_ALTERS:
+        m = re.search(r'ALTER TABLE asin_data ADD COLUMN IF NOT EXISTS\s+"?(\w+)"?',
+                      stmt)
+        if m:
+            cols.add(m.group(1))
+    return cols
+
+
 # ==========================================================================
 # 显式白名单：四份清单之间**允许**存在的全部差异。
 # 每一条都要能说出「为什么它只在某几份里」。多一条少一条都要人来改这里。
@@ -77,6 +105,25 @@ _BASELINE_COLUMNS = frozenset({
     "baseline_stock_status",
     "baseline_title_bullets_hash",
     "baseline_updated_at",
+})
+
+#: **已登记的既有分叉**：这些列历史上是靠 ALTER 补的，但在两份 DDL 里被写在
+#: 表**中间**（``created_at`` / ``updated_at`` 之前）。后果是：一个从很老版本
+#: 一路 ALTER 上来的 SQLite 库，物理列序与新建库不同。
+#:
+#: 这不是本轮引入的，也**不修** —— 修它要重建表、要改
+#: ``EXPECTED_COLUMNS``、要重录黄金基线，而收益只对"存在这样一个老库"的
+#: 假设成立（PG 生产库是新建的，列序与 EXPECTED_COLUMNS 一致，已实测）。
+#: 登记在这里是为了让下面那条守卫**只管住往后新增的列**，同时把这个已知的
+#: 历史状态写在明处，而不是让守卫悄悄放行一整类问题。
+#:
+#: ⚠ 往这个集合里加名字 = 明知故犯。新列请一律追加到 DDL 末尾。
+_LEGACY_MID_TABLE_MIGRATIONS = frozenset({
+    "variant_attributes",
+    "baseline_price", "baseline_buybox_price", "baseline_stock_count",
+    "baseline_stock_status", "baseline_title_bullets_hash",
+    "baseline_updated_at",
+    "rating", "review_count", "seller_id", "seller_name",
 })
 
 #: DDL 有、``ASIN_DATA_FIELDS`` 没有的全部列。
@@ -241,8 +288,43 @@ class AsinDataFieldTableGuard(unittest.TestCase):
         from common.models import EXPORTABLE_FIELDS, _INTERNAL_FIELDS
         self.assertIn("title_bullets_hash", _INTERNAL_FIELDS)
         self.assertNotIn("title_bullets_hash", EXPORTABLE_FIELDS)
-        self.assertEqual(len(EXPORTABLE_FIELDS), 43)
+        # 43 -> 44：2026-08 新增 subtitle，它**是**导出面的字段（不是内部字段）。
+        # 这个数字不是形式主义：它逼着"往 AsinData 加字段"这件事必须是一次
+        # 有意识的编辑 —— 加错了（比如把本该内部的哈希列加进来）这里当场红。
+        self.assertEqual(len(EXPORTABLE_FIELDS), 44)
+        self.assertIn("subtitle", EXPORTABLE_FIELDS)
+        # subtitle 落在 total_price **之前**：total_price 是 EXPORTABLE_FIELDS
+        # 末尾追加的合成列，不是 dataclass 字段。既有列一列没动、没有重排。
         self.assertEqual(EXPORTABLE_FIELDS[-1], "total_price")
+        self.assertEqual(EXPORTABLE_FIELDS[-2], "subtitle")
+
+    # ---------------------------------------------------------------- 迁移面
+    def test_every_alter_added_column_sits_at_the_tail_of_both_ddls(self):
+        """老库靠 ALTER 升级，而 ALTER **只能追加到末尾**。
+
+        所以「只在 ALTER 阶梯里出现的列」必须同时是两份 DDL 的**末尾若干列**，
+        否则新建库与升级库的物理列序会分叉 —— 而 `SELECT d.*` 没有
+        response_model，列序整个泄进 erpAPI 的响应：同一份代码、两种响应，
+        且 `verify_schema` 只能对上其中一种。
+
+        这条守的是**规则**而不是某一个列名：以后再加列，放错位置就当场红。
+
+        ⚠ 排除 ``_LEGACY_MID_TABLE_MIGRATIONS``：那批列历史上就写在表中间，
+        是**已登记的既有状态**（见那个集合的注释）。本条只管住往后新增的列。
+        """
+        migrated = ((_sqlite_alter_added_columns() | _pg_alter_added_columns())
+                    - _LEGACY_MID_TABLE_MIGRATIONS)
+        self.assertTrue(migrated, "一条 ALTER 迁移都没抽到 —— 抽取逻辑坏了")
+        for name, ddl in (("sqlite", _sqlite_ddl_columns()),
+                          ("pg", _pg_ddl_columns())):
+            in_ddl = [c for c in ddl if c in migrated]
+            self.assertTrue(in_ddl, "%s DDL 里一个迁移列都没有" % name)
+            tail = ddl[len(ddl) - len(in_ddl):]
+            self.assertEqual(
+                sorted(tail), sorted(in_ddl),
+                "%s DDL 里的迁移列没有全部落在末尾：%r 之后还有别的列。"
+                "老库 ALTER 只能追加到末尾，放在中间会让新建库与升级库列序分叉"
+                % (name, in_ddl))
 
     def test_internal_fields_all_exist_on_the_dataclass(self):
         """``_INTERNAL_FIELDS`` 里不许再出现「排除一个不存在的字段」。

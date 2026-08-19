@@ -240,6 +240,10 @@ HEADER_MAP = {
     "review_count": "评论数",
     "seller_id": "卖家店铺ID",
     "seller_name": "卖家店铺名",
+    # 2026-08：Amazon 把商品标题拆成两段，后半段（Title Differentiators）
+    # 既拼进「商品标题」也单独成列。少了这一行，导出表头会直接写
+    # 英文键名 `subtitle`（_get_export_headers 的 `HEADER_MAP.get(f, f)` 兜底）。
+    "subtitle": "副标题",
 }
 
 EXPORT_COLUMN_ORDER = [

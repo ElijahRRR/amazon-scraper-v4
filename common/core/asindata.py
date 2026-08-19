@@ -138,6 +138,12 @@ ASIN_DATA_FIELDS = [
     "content_hash", "title_bullets_hash",
     # 评分 + 卖家信息（v3 后期新增）
     "rating", "review_count", "seller_id", "seller_name",
+    # 副标题（2026-08 Amazon 把标题拆成两段，后半段在
+    # div.dp-title-differentiators 里；worker/parser.py:_title_differentiator）。
+    # ⚠ 顺序必须与两份 DDL 一致 —— 本清单与 DDL 的列序由
+    # tests/test_asin_data_field_table_guard.py 逐位比对。新列只能落在末尾，
+    # 理由见 DDL 里的注释（老库靠 ALTER 追加）。
+    "subtitle",
 ]
 
 # asin_data 合法列名集合（含内部列）：iter_results 收窄投影时用作白名单，

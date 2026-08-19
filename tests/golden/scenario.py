@@ -42,6 +42,14 @@ def _product(asin: str, *, price: str, stock: str, title_suffix: str = "") -> Di
     return {
         "asin": asin,
         "title": f"Golden Test Product {asin}{title_suffix}",
+        # ⚠ 副标题必须**有值**，不能留空。2026-08 Amazon 把标题拆成两段
+        # （worker/parser.py:_title_differentiator），采集侧既把后半段拼进
+        # title 也单独给一份。夹具留空的话这一列在基线里恒为空串，
+        # 「有没有被原样存下来 / 有没有进导出」就都测不到 —— 一个恒空的列
+        # 与一个根本没落库的列，在基线里长得一模一样。
+        # 这正是 slow.variant.theme 那次事故的成因（夹具喂了采集侧从未产出过
+        # 的形态，守卫因此一直绿着），别再犯第二次。
+        "subtitle": "Snap-in Liner,Heavy Duty,Hotel Grade",
         "brand": "GoldenBrand",
         "product_type": "TestType",
         "manufacturer": "GoldenMfg",

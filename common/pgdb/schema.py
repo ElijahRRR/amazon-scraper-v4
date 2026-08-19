@@ -180,7 +180,13 @@ DDL_TABLES: List[str] = [
         seller_id                   text COLLATE "C",
         seller_name                 text COLLATE "C",
         created_at                  text COLLATE "C" DEFAULT {TS_DEFAULT},
-        updated_at                  text COLLATE "C" DEFAULT {TS_DEFAULT}
+        updated_at                  text COLLATE "C" DEFAULT {TS_DEFAULT},
+        -- 2026-08：副标题（Title Differentiators）。
+        -- ⚠ 必须是**最后一列**。老库走 init_tables 里那条
+        -- `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`，PG 的 ADD COLUMN 同样
+        -- 只追加到末尾；插在别处会让新建库与升级库的列序分叉，而
+        -- verify_schema 只能对上其中一种。
+        subtitle                    text COLLATE "C"
     );
     """,
 
@@ -336,6 +342,14 @@ UPDATE batches
 """
 
 # ------------------------------------------------------------------
+#: 建表之后跑的幂等 ALTER。**只给已存在的表补新列用**，新库上是 no-op
+#: （列已经在 CREATE TABLE 里）。每一条都必须带 IF NOT EXISTS 且可反复执行。
+#: ⚠ 新列一律 `ADD COLUMN`（追加到末尾），绝不改动既有列的顺序或类型 ——
+#: 列序是 API 契约（`SELECT d.*` 无 response_model）。
+DDL_ALTERS: List[str] = [
+    'ALTER TABLE asin_data ADD COLUMN IF NOT EXISTS subtitle text COLLATE "C"',
+]
+
 # 期望列序：verify_schema() 用它做硬闸门。
 # 来自 SQLite 新库（CREATE TABLE 的列 + ALTER 追加的列）的实际物理顺序。
 # ``SELECT *`` / ``SELECT d.*`` 没有 response_model 过滤，改这里 = 改 API。
@@ -363,6 +377,8 @@ EXPECTED_COLUMNS: Dict[str, List[str]] = {
         "baseline_stock_status", "baseline_title_bullets_hash",
         "baseline_updated_at", "rating", "review_count", "seller_id", "seller_name",
         "created_at", "updated_at",
+        # 2026-08 追加，见 DDL 里的说明：新列只能落在末尾。
+        "subtitle",
     ],
     "asin_changes": [
         "id", "asin", "batch_id", "change_type", "change_detail",
@@ -782,6 +798,18 @@ class SchemaMixin:
         await conn.execute(ASCII_LOWER_FN)
 
         for stmt in DDL_TABLES:
+            await conn.execute(stmt)
+
+        # ---- 老库升级：CREATE TABLE IF NOT EXISTS 不会给已存在的表加列 ----
+        # 这是 PG 侧**唯一**的一条 ALTER 迁移，与文件头「不移植 SQLite 那 27 条
+        # ALTER 阶梯」并不矛盾：那段拒绝的是 `ALTER ... except: pass` 的**阶梯**
+        # （裸 except 吞掉失败 -> 半张表悄悄建不出来）。这里是单条、带
+        # `IF NOT EXISTS`、真幂等、失败会照常抛的语句。
+        #
+        # 少了它，生产库（表早已存在）拿不到 subtitle 列，verify_schema 当场
+        # 拦下启动 —— 那反而是好结果；更坏的是有人把 strict 关掉，于是写入侧
+        # 按列名 bind 时才炸。
+        for stmt in DDL_ALTERS:
             await conn.execute(stmt)
         for stmt in DDL_INDEXES:
             await conn.execute(stmt)
