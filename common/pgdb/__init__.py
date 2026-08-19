@@ -76,6 +76,9 @@ PUBLIC_API = (
     # 截图路径辅助
     "_get_done_screenshot_path", "_get_done_screenshot_paths",
     "_hydrate_screenshot_paths",
+    # `/api/results?batch_id=` 的三列批次状态。与 _hydrate_screenshot_paths
+    # 同族：都是 get_results 之后的原地补齐，两个后端必须同结果。
+    "_hydrate_batch_task_status",
     # 结果读取
     "get_batch_failures", "get_results", "get_result_by_asin", "get_asin_changes",
     "iter_results", "find_asins_by_search", "get_batch_asin_set",

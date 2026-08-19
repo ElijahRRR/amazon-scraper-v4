@@ -99,13 +99,39 @@ def _ok(c, batch, task, price):
 
 
 def _fail(c, batch, task, error_type="timeout"):
-    """让任务**终态失败**。retry_count 拉满，免得它被重试掉。"""
-    for _ in range(4):
+    """让任务**真正**走到终态失败（retry 耗尽）。
+
+    ⚠ 两个坑，都踩过，都很安静：
+
+    1. **不能复用同一个 lease_epoch 反复提交。** 第一次被接受（非终态，
+       任务释放回 pending 且 lease_epoch +1），之后每一次都是 `stale`。
+       实测（PG，事件流）：
+
+           同一 epoch 提交 4 次 -> 事件 [(1,'stale'), (2,'stale'), (3,'stale')]
+                                   任务仍是 open，一次终态失败都没发生
+           每轮重新 pull        -> 事件 [(1,'parse_failed')]，任务 failed
+
+    2. **第一轮必须用传进来的那个 task。** 调用方的 `_push` 已经把任务
+       pull 走了（状态 processing、租约在手），这时再 pull 拿不到它 ——
+       直接 return 就等于一次失败都没提交。
+
+    也就是说：**非终态失败不发事件，终态失败发一条 `parse_failed`，
+    stale 提交每次发一条 `stale`**。拿 `outcome != "ok"` 当"终态失败"的判据
+    会被 stale 满足 —— 那正是本仓库最怕的"因为错误的理由而变绿"。
+    """
+    cur = task
+    for _ in range(6):
         c.post("/api/tasks/result", json={
-            "task_id": task["id"], "batch_id": task["batch_id"],
-            "worker_id": f"w-{batch}", "lease_epoch": task["lease_epoch"],
+            "task_id": cur["id"], "batch_id": cur["batch_id"],
+            "worker_id": f"w-{batch}", "lease_epoch": cur["lease_epoch"],
             "success": False, "error_type": error_type,
-            "error_detail": "synthetic failure for batch-records test"})
+            "error_detail": "synthetic failure for test"})
+        got = c.get("/api/tasks/pull",
+                    params={"worker_id": f"w-{batch}", "count": 20}).json()["tasks"]
+        mine = [t for t in got if t["asin"] == task["asin"]]
+        if not mine:
+            return          # 拉不到了 = 已经终态
+        cur = mine[0]
 
 
 @unittest.skipUnless(is_postgres(), "事件流是 PostgreSQL 专属")
@@ -118,8 +144,10 @@ class StaleRowTests(unittest.TestCase):
     def test_failed_asin_does_not_come_back_as_a_stale_row(self):
         """同一个 ASIN：第一批采成功（19.99），第二批采失败。
 
-        `/api/results?batch_id=<第二批>` 会返回 19.99 那一行，且**看不出**它
-        不是本批采的；本端点对第二批则一条成功记录都不给。
+        `/api/results?batch_id=<第二批>` 仍然会返回 19.99 那一行 —— 内容是
+        **上一批**的。它现在带 `batch_task_status=failed`，所以**看得出**
+        不是本批采的（那三列是后来补的，见下面的注释）；但要拿到"这一批
+        真正采到了什么"，只有本端点能给。
         """
         asin = "B0STALE001"
         with _server_with_relay() as (c, _):
@@ -140,10 +168,22 @@ class StaleRowTests(unittest.TestCase):
             self.assertEqual(
                 hit[0]["current_price"], "19.99",
                 "前置条件不成立：拿到的不是上一批那行")
-            self.assertNotIn(
-                "batch_task_status", hit[0],
-                "/api/results 若已经带上本次任务状态，这个洞就被堵上了 —— "
-                "那时本端点的存在理由需要重写，别让这条用例继续默默绿着")
+            # ⚠ 这里原本断言的是 `assertNotIn("batch_task_status", ...)` ——
+            # 一条**故意设的绊线**：`/api/results` 一旦带上本次任务状态，
+            # 这个洞就被堵上了一半，本端点的存在理由就得重写。
+            # 绊线按预期响了（补三列那一轮），所以这里如实改成新的现状：
+            #
+            #   现在能做到的：`batch_task_status` 让你**看得出**这行是旧的。
+            #   仍然做不到的：返回的**内容**还是上一次那行（19.99），
+            #                 而且这批里一次都没采过的 ASIN **整行不出现**
+            #                 （INNER JOIN asin_data，见
+            #                  tests/test_results_batch_status.py 的同名用例）。
+            #
+            # 也就是说本端点的理由从"没法分辨"变成了"分辨得出、但拿不到
+            # 这一批真正采到的东西"。
+            self.assertEqual(
+                hit[0]["batch_task_status"], "failed",
+                "/api/results 现在应当带上本次任务状态（补三列那一轮加的）")
 
             # —— 本端点：这一批没采成，就不给记录 ——
             body = c.get(PATH.format("stale_second"),
@@ -182,6 +222,12 @@ class StaleRowTests(unittest.TestCase):
 
         把它写成用例而不是注释 —— 若哪天 coverage 改成"只数成功的"，
         端点 docstring 就变成谎言，而调用方的告警判据会跟着错。
+
+        ⚠ **本条曾经因为错误的理由而绿。** 旧的 `_fail` 复用同一个
+        lease_epoch 反复提交，实际产生的是三条 `outcome='stale'` 事件、
+        任务根本没进终态；而断言写的是 `outcome != "ok"`，stale 照样满足。
+        修好 `_fail`（每轮重新 pull）之后才真的是 parse_failed。
+        断言也收紧成等于 `parse_failed`，不再是"不等于 ok"。
         """
         with _server_with_relay() as (c, _):
             tasks = _push(c, "cov_fail", ["B0COVFAIL1"])
@@ -193,9 +239,117 @@ class StaleRowTests(unittest.TestCase):
         self.assertEqual(body["coverage"], {"asin_total": 1,
                                             "asin_with_event": 1})
         self.assertTrue(body["records"], "终态失败该有一条事件")
-        self.assertNotEqual(
-            body["records"][0]["outcome"], "ok",
-            "失败的记录 outcome 不能是 ok —— 覆盖率算它、成功判据不算它")
+        self.assertEqual(
+            body["records"][0]["outcome"], "parse_failed",
+            "终态失败的 outcome 必须是 parse_failed。写成 `!= \"ok\"` 是不够的："
+            "stale 提交也满足，而那根本不是一次终态失败")
+
+
+@unittest.skipUnless(is_postgres(), "事件流是 PostgreSQL 专属")
+class RetryTimelineTests(unittest.TestCase):
+    """`docs/incremental_export_contract.md` §5.1 那张"什么时候发事件"的表。
+
+    文档里的每一行都在这里有断言，否则它就只是一段会过期的散文 ——
+    而消费侧的告警判据是照着它写的。
+    """
+
+    def _hdr(self):
+        return {"X-Export-Token": TOKEN}
+
+    def _events(self, c, batch):
+        return c.get(PATH.format(batch), headers=self._hdr()).json()["records"]
+
+    def test_non_terminal_failure_emits_nothing(self):
+        """还会重试的失败**不发事件**。
+
+        发了的话，一个最终会成功的 ASIN 会在流里留下 2~3 条
+        parse_failed 噪声，消费侧的失败率统计全错。
+        """
+        with _server_with_relay() as (c, _):
+            tasks = _push(c, "tl_one", ["B0TLONE001"])
+            t = tasks[0]
+            # **只提交一次**失败：retry_count 1 < 3，非终态
+            c.post("/api/tasks/result", json={
+                "task_id": t["id"], "batch_id": t["batch_id"],
+                "worker_id": "w-tl_one", "lease_epoch": t["lease_epoch"],
+                "success": False, "error_type": "timeout", "error_detail": "x"})
+            _drain(0)
+            recs = self._events(c, "tl_one")
+
+        self.assertEqual(recs, [], "非终态失败不该产生事件")
+
+    def test_terminal_failure_emits_exactly_one_parse_failed(self):
+        with _server_with_relay() as (c, _):
+            tasks = _push(c, "tl_term", ["B0TLTERM01"])
+            _fail(c, "tl_term", tasks[0])
+            _drain(1)
+            recs = self._events(c, "tl_term")
+
+        self.assertEqual([r["outcome"] for r in recs], ["parse_failed"],
+                         "终态失败应当恰好一条 parse_failed")
+
+    def test_stale_submission_emits_stale_not_a_failure(self):
+        """⚠ `stale` 也满足 `outcome != "ok"` —— 文档里专门警告过这一点。
+
+        它既不代表采集失败，也不代表数据可用；拿 `!= "ok"` 当失败判据
+        会把租约门挡掉的提交算成采集失败。
+        """
+        with _server_with_relay() as (c, _):
+            tasks = _push(c, "tl_stale", ["B0TLSTAL01"])
+            t = tasks[0]
+            # 先用正确 epoch 失败一次（任务释放、epoch +1），
+            # 再用**旧** epoch 提交 -> stale
+            c.post("/api/tasks/result", json={
+                "task_id": t["id"], "batch_id": t["batch_id"],
+                "worker_id": "w-tl_stale", "lease_epoch": t["lease_epoch"],
+                "success": False, "error_type": "timeout", "error_detail": "x"})
+            r = c.post("/api/tasks/result", json={
+                "task_id": t["id"], "batch_id": t["batch_id"],
+                "worker_id": "w-tl_stale", "lease_epoch": t["lease_epoch"],
+                "success": False, "error_type": "timeout", "error_detail": "x"})
+            self.assertTrue(r.json()["stale"], "前置条件不成立：这条没被判 stale")
+            _drain(1)
+            recs = self._events(c, "tl_stale")
+
+        self.assertEqual([r["outcome"] for r in recs], ["stale"],
+                         "租约过期的提交应当是 stale，不是 parse_failed")
+        self.assertNotEqual(recs[0]["outcome"], "ok")
+
+    def test_failed_then_success_leaves_both_records(self):
+        """终态失败 -> 自动重试 -> 成功：流里**两条**，后一条 cursor 更大。
+
+        这就是消费侧必须"按 (asin, zipcode) 取 cursor 最大那条"的原因。
+
+        重置用 `POST /api/batches/{name}/retry`（人工重试）而不是等
+        `auto_retry_failed_tasks` 那个 30 秒一轮 + 冷却下界的循环：两者把
+        任务放回 pending 的效果相同，而这里测的是**事件流的形状**，
+        不是定时器的节奏。定时器另有用例。
+        """
+        with _server_with_relay() as (c, _):
+            tasks = _push(c, "tl_both", ["B0TLBOTH01"])
+            _fail(c, "tl_both", tasks[0])
+            _drain(1)
+
+            reset = c.post("/api/batches/tl_both/retry").json()
+            self.assertEqual(reset.get("retried"), 1,
+                             f"前置条件不成立，任务没被放回 pending: {reset}")
+
+            # ⚠ worker_id 必须与 `_ok` 提交时用的一致（`w-<batch>`）：
+            # 租约门比对的是 (task_id, worker_id, lease_epoch)，换个 worker
+            # 提交会被判 stale —— 那时事件是 stale 而不是 ok，用例会以
+            # 一种看起来像"重试没生效"的方式红掉。
+            t2 = c.get("/api/tasks/pull",
+                       params={"worker_id": "w-tl_both", "count": 5}
+                       ).json()["tasks"][0]
+            _ok(c, "tl_both", t2, "42.00")
+            _drain(2)
+            recs = self._events(c, "tl_both")
+
+        self.assertEqual([r["outcome"] for r in recs], ["parse_failed", "ok"],
+                         "应当先一条 parse_failed 再一条 ok")
+        self.assertLess(recs[0]["cursor"], recs[1]["cursor"],
+                        "后发生的那条 cursor 必须更大")
+        self.assertAlmostEqual(recs[1]["fast"]["price"], 42.00, places=2)
 
 
 @unittest.skipUnless(is_postgres(), "事件流是 PostgreSQL 专属")

@@ -2102,6 +2102,47 @@ class Database:
             if item["screenshot_path"] is None:
                 item["screenshot_path"] = fallback.get(item["asin"])
 
+    async def _hydrate_batch_task_status(self, items: List[Dict], batch_id):
+        """`/api/results?batch_id=` 追加三列。**只在带 batch_id 时调用。**
+
+        与 common/pgdb/results_read.py 的同名方法**必须逐字段同结果** ——
+        它们是 PUBLIC_API 对等断言覆盖的一对。列名与 `iter_results`
+        （CSV/xlsx 批次导出走的那条）逐字相同：同一条信息两个出口，
+        名字分叉就等于逼消费侧写两套代码。
+
+        存在的理由见 PG 侧那份注释（旧行冒充本批结果）。
+
+        ⚠ `batch_has_asin_data` 在本端点恒为 1：驱动表是 `asin_data`、
+        INNER JOIN，能返回的行必然有 asin_data。给出它是为了让消费侧能用
+        同一套代码从 JSON 复算 CSV 的 `data_source`。
+
+        PG 侧用 `= ANY(?::text[])`（一个参数、绕开参数上限）；SQLite 没有
+        `= ANY`，走变长 IN。行集相同。分段是因为 SQLite 的
+        SQLITE_MAX_VARIABLE_NUMBER（老版本默认 999），而单页上限是 1000。
+        """
+        if not items:
+            return
+        asins = [it["asin"] for it in items if it.get("asin")]
+        rows = {}
+        for i in range(0, len(asins), 500):
+            chunk = asins[i:i + 500]
+            ph = ",".join("?" * len(chunk))
+            async with self._db.execute(
+                f"SELECT asin, status, updated_at FROM tasks "
+                f"WHERE batch_id = ? AND asin IN ({ph})",
+                [batch_id] + chunk
+            ) as c:
+                for r in await c.fetchall():
+                    # tasks 上 UNIQUE(batch_id, asin)，一个 ASIN 只可能一行
+                    rows[r["asin"]] = dict(r)
+
+        for item in items:
+            t = rows.get(item.get("asin"))
+            item["batch_task_status"] = t["status"] if t else None
+            item["batch_task_updated_at"] = t["updated_at"] if t else None
+            item["batch_has_asin_data"] = 1
+            item["batch_asin_data_updated_at"] = item.get("updated_at")
+
     async def save_results_batch(self, results: List[dict], batch_id: int = None) -> int:
         """批量保存结果"""
         saved = 0
@@ -2265,6 +2306,8 @@ class Database:
             items.reverse()
 
         await self._hydrate_screenshot_paths(items, batch_id)
+        if batch_id:
+            await self._hydrate_batch_task_status(items, batch_id)
 
         # 查询总数
         count_where = " AND ".join(

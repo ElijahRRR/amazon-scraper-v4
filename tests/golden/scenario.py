@@ -256,6 +256,18 @@ def run(rec: Recorder) -> None:
              params={"search": "Go"})  # < 3 字符走 LIKE 慢路径
     rec.call("results_filter_new", "GET", "/api/results", expect=200,
              params={"change_filter": "new"})
+    # 带 batch_id 的那条：**只有它**会带上三列批次状态
+    # （batch_task_status / batch_has_asin_data / batch_asin_data_updated_at）。
+    # 上面几步都不带 batch_id，响应里因此没有这三列 —— 两种形状都要钉住，
+    # 否则"不带 batch_id 时不加列"这条会悄悄退化。
+    #
+    # ⚠ 本场景里这三行的 batch_task_status 全是 "done"，**盖不到**真正要紧的
+    # 那种（旧行冒充本批结果 -> "failed"）：这一批唯一那个失败任务从没采成过，
+    # 没有 asin_data 行，而 get_results 是 INNER JOIN asin_data，整行不会出现。
+    # 那个场景由 tests/test_results_batch_status.py 覆盖（跨两个批次才造得出来，
+    # 而黄金场景是单向递进的、不适合塞这种交叉状态）。
+    rec.call("results_by_batch", "GET", "/api/results", expect=200,
+             params={"batch_id": ok_tasks[0]["batch_id"]})
     rec.call("result_detail", "GET", f"/api/results/{ok_tasks[0]['asin']}", expect=200)
     rec.call("result_detail_missing", "GET", "/api/results/B0NOTEXIST", expect=404)
     rec.call("change_stats", "GET", "/api/changes/stats", expect=200)

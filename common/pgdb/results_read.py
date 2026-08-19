@@ -264,6 +264,8 @@ class ResultsReadMixin:
 
         # 注意：读连接已经归还，_hydrate 内部还要再借一条（避免池内嵌套借用）
         await self._hydrate_screenshot_paths(items, batch_id)
+        if batch_id:
+            await self._hydrate_batch_task_status(items, batch_id)
 
         # 查询总数
         count_where = " AND ".join(
@@ -288,6 +290,62 @@ class ResultsReadMixin:
             "prev_cursor": prev_cursor,
             "total": total,
         }
+
+    #: `/api/results?batch_id=` 追加的三列。**名字必须与 `iter_results`
+    #: （CSV/xlsx 批次导出走的那条）逐字相同** —— 它们是同一条信息的两个出口，
+    #: 名字分叉就等于逼消费侧写两套代码。
+    #:
+    #: 为什么需要它们：`get_results` 的 SQL 是
+    #:     SELECT d.* FROM asin_data d JOIN batch_asins ba ON ... AND ba.batch_id = ?
+    #: `asin_data` 是**每个 ASIN 一行的最新态**，`batch_id` 只回答"属不属于这批"，
+    #: **不参与取哪一行**。这批采失败的 ASIN 只要以前采过就照样命中 JOIN，
+    #: 返回**上一次的旧行**，而 `SELECT d.*` 之外一个字段都没有能看出它的年龄。
+    #: 消费侧摄进自己的库、盖上一个新鲜的接收时间，陈旧数据就此看起来很新鲜，
+    #: 两侧都不报错。CSV/xlsx 出口早就有防护（`data_source` 列），JSON 没有。
+    #:
+    #: ⚠ `batch_has_asin_data` 在**本端点恒为 1**，这不是 bug 也不是占位：
+    #: 驱动表是 `asin_data`、走的是 INNER JOIN，能返回的行必然有 asin_data。
+    #: 给出它是为了让消费侧能用**同一套代码**从 JSON 复算出 CSV 的 `data_source`
+    #: （`server/api/export.py:_batch_status_export_values`）。
+    #: 真正的差别在另一头：`iter_results` 以 `batch_asins` 为驱动表 LEFT JOIN，
+    #: 所以 CSV 里**会出现**从没采过的 ASIN（那时该列是 0），而本端点
+    #: **整行都不会返回**。要查"这批有哪些 ASIN 一次都没采过"，用
+    #: `GET /api/export/batch/{name}/records` 的 `coverage`，或直接比对
+    #: `/api/batches/{name}/status` 的任务数。这条差异有用例钉着。
+
+    async def _hydrate_batch_task_status(self, items: List[Dict], batch_id):
+        """**原地修改** items，无返回值。只在带 `batch_id` 时调用。
+
+        一次查询取完整页，不是逐行查 —— 单页最多 1000 行，逐行就是 1000 次往返。
+
+        用 `= ANY(?::text[])` 而不是变长 `IN (?,?,...)`：一个参数、空数组也合法，
+        顺带绕开 asyncpg 的参数个数上限。与同文件的
+        `_get_done_screenshot_paths` 同一种写法（那里有更详细的说明）。
+        SQLite 侧没有 `= ANY`，走变长 IN —— 两边行集相同。
+        """
+        if not items:
+            return
+        asins = [it["asin"] for it in items if it.get("asin")]
+        rows = {}
+        if asins:
+            async with self.read() as rc, rc.execute(
+                "SELECT asin, status, updated_at FROM tasks "
+                "WHERE batch_id = ? AND asin = ANY(?::text[])",
+                (self.as_int(batch_id),
+                 [self.text_affinity(a) for a in asins])
+            ) as c:
+                for r in await c.fetchall():
+                    # 同一批次同一 ASIN 只可能有一行（tasks 上 UNIQUE(batch_id, asin)），
+                    # 不必去重
+                    rows[r["asin"]] = dict(r)
+
+        for item in items:
+            t = rows.get(item.get("asin"))
+            item["batch_task_status"] = t["status"] if t else None
+            item["batch_task_updated_at"] = t["updated_at"] if t else None
+            # 见上：本端点是 INNER JOIN asin_data，能返回的行必然有 asin_data
+            item["batch_has_asin_data"] = 1
+            item["batch_asin_data_updated_at"] = item.get("updated_at")
 
     async def get_batch_asin_set(self, batch_id) -> set:
         """一个批次里的 ASIN 集合（``DELETE /api/results`` 的 batch_id 分支）。
