@@ -629,6 +629,20 @@ EVENT_PARENT_INDEX_SQL = (
     "ON scraper.scrape_events (recorded_at)"
 )
 
+#: 按批次读事件流要用（`GET /api/export/batch/{batch_name}/records`）。
+#: 复合 (batch_id, seq) 而不是单列 batch_id：那个端点的分页谓词是
+#: `batch_id = $1 AND seq > $2 ORDER BY seq`，复合索引让它直接吃有序输出，
+#: 不必把一个批次的全部事件取出来再排。
+#:
+#: ⚠ 与 recorded_at 那条同样是**父表级**索引，因此同样必须在 p0 建好之后才建
+#: （父表 CREATE INDEX 只传播到**已存在**的分区，顺序反了 p0 就少这一条，
+#: 而 p0 还要当后续分区的 LIKE 模板 —— 于是每一个分区都少）。
+#: 调用点：relay.init_event_stream，紧跟在 EVENT_PARENT_INDEX_SQL 之后。
+EVENT_BATCH_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS scrape_events_batch_id_seq_idx "
+    "ON scraper.scrape_events (batch_id, seq)"
+)
+
 
 def event_partition_name(index: int) -> str:
     return f"{EVENT_PARTITION_PREFIX}{index}"

@@ -30,12 +30,13 @@
 | 8 | `POST /api/batches` | 提交采集批次（**JSON**） | **本轮新增**，与 #2 等价（§4.9） |
 | 9 | `GET /api/screenshots` | 列批次截图状态 + URL | **本轮新增**（§4.10） |
 | 10 | `GET /api/screenshots/{batch_name}/{asin}` | 取单张截图，状态码可区分 | **本轮新增**（§4.10） |
+| 11 | `GET /api/export/batch/{batch_name}/records` | 按批次拿**这一批真正采到的**数据 | **本轮新增**（§4.11） |
 
 > 曾经的第 6 个端点 `GET /api/batches/{batch_name}/errors`（失败明细旧接口）
 > 已经**删除**，不是废弃——`失败明细`统一走 `GET /api/batches/{batch_id}/failures`
 > （§4.4）。历史细节见 §5.4。
 
-十个端点在本仓库**全部存在**，路由声明位置：
+十一个端点在本仓库**全部存在**，路由声明位置：
 
 | 端点 | 声明处 |
 |---|---|
@@ -49,6 +50,7 @@
 | `POST /api/batches` | `server/api/batches.py:api_create_batch` |
 | `GET /api/screenshots` | `server/api/screenshots.py:api_screenshots` |
 | `GET /api/screenshots/{batch_name}/{asin}` | `server/api/screenshots.py:api_screenshot_file` |
+| `GET /api/export/batch/{batch_name}/records` | `server/api/export_incremental.py:export_batch_records` |
 
 ---
 
@@ -111,13 +113,13 @@ body 不泄漏任何异常细节，这是有意的。
 
 ### 1.3 错误码封闭集
 
-所有机器读的 `error` 码登记在 `server/api/sync.py:132-149` 的 `ERROR_CODES`：
+所有机器读的 `error` 码登记在 `server/api/sync.py` 的 `ERROR_CODES`：
 
 ```
-ack_ahead_of_stream, batch_name_conflict, conflicting_zip_for_asin,
-cursor_ahead_of_stream, cursor_below_retention, event_stream_unavailable,
-export_token_not_configured, gen_mismatch, internal_error,
-invalid_export_token, invalid_parameter, range_too_wide,
+ack_ahead_of_stream, batch_name_conflict, batch_not_found,
+conflicting_zip_for_asin, cursor_ahead_of_stream, cursor_below_retention,
+event_stream_unavailable, export_token_not_configured, gen_mismatch,
+internal_error, invalid_export_token, invalid_parameter, range_too_wide,
 screenshot_failed, screenshot_pending
 ```
 
@@ -182,7 +184,7 @@ status.status == "completed"
   （`docs/incremental_export_contract.md` 里已登记 3 处待补进沃尔玛侧 §5 的空白，
   它们是「填补原文未定义的空白」，不改变已写死的行为，因此**仍是 v1**。）
 
-### 3.2 本文档覆盖的 erpAPI 端点（#2 ~ #10）
+### 3.2 本文档覆盖的 erpAPI 端点（#2 ~ #11）
 
 一经本文发布即为对外契约。具体地：
 
@@ -742,6 +744,101 @@ xlsx B 列的方式一致：一列几万行里有一格脏数据就整批失败�
 
 ---
 
+### 4.11 `GET /api/export/batch/{batch_name}/records` —— 按批次拿**这一批真正采到的**数据（本轮新增）
+
+**先说它补的是什么洞。** §4.3 的 `GET /api/results?batch_id=` 底层是：
+
+```sql
+SELECT d.* FROM asin_data d
+JOIN batch_asins ba ON ba.asin = d.asin AND ba.batch_id = ?
+```
+
+`asin_data` 是**每个 ASIN 一行的最新态**，`batch_id` 只回答「属不属于这批」，
+**不参与取哪一行**。于是这批采失败的 ASIN —— 只要它以前采过 —— 照样命中
+JOIN，返回的是**上一次的旧行**，而响应里**没有任何字段**能让你看出它的年龄
+（`SELECT d.*` 之外只补了截图路径）。摄进你自己的库、盖上一个新鲜的接收时间，
+陈旧数据就此看起来很新鲜，**两侧都不会报错**。
+
+CSV/xlsx 批次导出**有**防护（`data_source` 列会写「历史产品库数据，本次未更新」，
+见 §4.3 与 `server/api/export.py`），但那是文件出口，脚本消费不了。
+
+本端点从**事件流**读，语义上没有这个洞：`scraper.scrape_events` 的每一行都是
+**一次真实发生过的采集**，没采成就没有行。
+
+**请求**
+
+```
+GET /api/export/batch/{batch_name}/records?cursor=0&limit=500
+X-Export-Token: <token>          # 与 §4.8 同一个 token，规则一致
+```
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `cursor` | `0` | **独占**下界，返回 cursor 大于它的记录 |
+| `limit` | `500` | 上限 1000（超出 → 422） |
+
+**响应**
+
+```json
+{
+  "contract_version": 1,
+  "batch": {"id": 12, "name": "job_20260819", "status": "completed",
+            "created_at": "2026-08-19 10:00:00"},
+  "coverage": {"asin_total": 500, "asin_with_event": 498},
+  "records": [ /* 与 §4.8 逐字段相同的 record */ ],
+  "next_cursor": 34567,
+  "has_more": false,
+  "retention_min_cursor": 676,
+  "max_cursor": 34567
+}
+```
+
+* `records[]` 与 §4.8 **完全同构** —— 两个端点共用同一个 `_to_record`，
+  由 `tests/test_batch_records_export.py::test_records_are_byte_identical_to_the_global_stream`
+  钉住。
+* `coverage` 让你不必再发一次请求就能判断这批齐没齐：
+  `asin_total` 是这批入过队的 ASIN 数（含没采成的），`asin_with_event` 是
+  **整批**出现过事件的去重 ASIN 数（与分页无关）。
+  ⚠ 两者相等**不等于**「这批都成功了」——`outcome='not_found'` 也算有事件。
+  成功与否看每条记录的 `outcome`。
+
+**状态码**
+
+| 码 | 含义 | 该怎么办 |
+|---|---|---|
+| 200 | 正常（**包括批次存在但一条事件都没有** → `records: []`） | — |
+| 401 | `X-Export-Token` 缺失或不匹配 | 修配置 |
+| 404 | `batch_not_found`，**只有这一个含义：批次名不存在** | 别重试 |
+| 422 | `limit` 越界 / `cursor` 超 bigint | 修参数 |
+| 503 | `event_stream_unavailable`（事件流是 PostgreSQL 专属） | 稍后再来 |
+
+404 在这一族端点里只有一个含义是**刻意**的：批次存在但还没采完若也回 404，
+消费方会把它读成「暂无数据」并静默停摆（同 §4.8 的理由）。
+
+**⚠ 两个游标不可互换**
+
+本端点的 `next_cursor` 与 §4.8 的数值同源于事件流的 `seq`，但定义域不同：
+本端点是「这个批次内部」，§4.8 是「全局」。把本端点的 `next_cursor` 喂进
+`/api/export/incremental` **不会报错**，会**静默跳过**中间所有别的批次的事件。
+
+**保留期**
+
+事件流有保留期，老批次的事件会被裁掉。本端点**不**回 409（那是全量流的语义），
+而是照实回 200 + 一个可能不完整的集合，并给出 `retention_min_cursor`。
+`coverage` 对不上且批次早于保留窗口 ⇒ 被裁过。
+
+**现成的消费脚本**：`tools/consume_batch.py`（只用标准库，拷走即用）
+
+```bash
+python3 tools/consume_batch.py batch job_20260819 \
+    --server http://host:8899 --token "$EXPORT_TOKEN" --out ./out --screenshots
+```
+
+它会拉全量分页、按 `outcome`/`zip_verify` 过滤、按 `(asin, zipcode)` 去重取最新，
+写出 `.jsonl` + `.csv`，并顺带把该批次已截好的图下到 `out/screenshots/<batch>/`。
+
+---
+
 ## 5. 与旧系统的差异 —— 哪些规避动作**现在可以拆掉了**
 
 > 这一节逐条对应 erpAPI 给来的旧坑清单。**这些约束是旧数据库的限制，
@@ -1054,8 +1151,16 @@ if r["status"] == "completed":      # ✅ 权威判据
 | 截图列表给的 `url` 真的能打，且只在 `done` 时非 null | `tests/test_screenshot_api.py::ScreenshotListTests` |
 | 同 ASIN 多邮编：截图按批次隔离、增量导出保留两份、快照只有一行 | `tests/test_multi_zip_same_asin.py` |
 | 一次推送里同 ASIN 给两个邮编 → 400（不静默丢一个） | `…::test_two_zips_for_one_asin_in_one_push_is_rejected` |
+| `/api/results?batch_id=` **确实**会把旧行当本批结果返回（本端点的存在理由） | `tests/test_batch_records_export.py::…::test_failed_asin_does_not_come_back_as_a_stale_row` |
+| 按批次取记录**不会**返回这批没采成的 ASIN | `…::test_failed_asin_does_not_come_back_as_a_stale_row` |
+| 别的批次的事件一条都不混进来（含 `coverage`） | `…::test_records_are_scoped_to_the_batch` |
+| 按批次与全量流对同一行给出**同一个** record | `…::test_records_are_byte_identical_to_the_global_stream` |
+| 404 只表示批次名不存在；空批次是 200 + `[]` | `…::test_unknown_batch_is_404_but_empty_batch_is_200` |
+| 终态失败**也算**有事件（`coverage` 的语义） | `…::test_terminal_failure_still_counts_as_covered` |
+| 消费脚本只落 `outcome=ok` 且邮编可信的记录 | `…::ConsumerScriptTests` |
+| `zip_verify=mismatch` 丢弃、`unverified` 保留 | `…::test_mismatch_zip_is_dropped_but_unverified_is_kept` |
 | 标题被拆两段后要拼回去（2026-08 Title Differentiators） | `tests/test_title_differentiators.py::TitleDifferentiatorTests` |
-| 分隔符 `" | "` 与 Amazon 自己拼的串逐字节相同 | `…::test_separator_is_amazons_own_not_ours` |
+| 分隔符 `" \| "` 与 Amazon 自己拼的串逐字节相同 | `…::test_separator_is_amazons_own_not_ours` |
 | 没有副标题时不留下孤零零的分隔符 | `…::test_missing_differentiator_leaves_no_dangling_separator` |
 | `title` 与 `subtitle` 共用一份提取、永不自相矛盾 | `…::SubtitleFieldTests::test_subtitle_and_title_never_contradict` |
 | `slow.subtitle` 进契约，没有就是 null（键恒在） | `tests/test_incremental_export.py::…::test_subtitle_*` |
