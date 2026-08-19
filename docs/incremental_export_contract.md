@@ -285,6 +285,65 @@ GET /api/export/incremental  ->  404 {"detail":"批次不存在: incremental"}
 
 ---
 
+## 5.1 同一个 ASIN 会先来一条 `parse_failed`、过一会儿再来一条 `ok`
+
+这不是异常，是**正常的重试时间线**。不知道这件事的消费方会踩两个坑：
+把 `parse_failed` 当"这个 ASIN 采不了"写进自己的库，或者反过来，
+以为流里每个 ASIN 只会出现一次。
+
+### 什么时候发事件
+
+采集侧有三层重试，**只有终态才发事件**（实测，PG 事件流）：
+
+| 提交 | 发事件吗 | `outcome` |
+|---|---|---|
+| 失败但还会重试（`retry_count < 3`） | **不发** | — |
+| 失败且重试耗尽（`retry_count = 3`） | 发一条 | `parse_failed` |
+| 自动重试之后成功 | 发一条 | `ok` |
+| 租约过期的提交（worker 拿着旧 `lease_epoch`） | 每次发一条 | `stale` |
+
+⚠ 最后一行值得单说：`stale` 也满足 `outcome != "ok"`。**别拿
+`outcome != "ok"` 当"这次采失败了"的判据** —— `stale` 只是说"这条提交被
+租约门挡掉了"，它既不代表采集失败，也不代表数据可用。要判失败看
+`outcome == "parse_failed"` / `"not_found"` / `"blocked"`。
+
+### 时间线
+
+以默认配置（`max_retries=3`、`auto_retry_cycles=2`、
+`auto_retry_delay_minutes=1`）为例：
+
+```
+t0        worker 连续 3 次失败            -> 任务 failed（终态）
+          ├─ 前 2 次：不发事件
+          └─ 第 3 次：发 seq=N   outcome=parse_failed
+
+t0+~1min  auto_retry_failed_tasks 把它重置回 pending
+          （30 秒一轮的循环 + updated_at 至少早于 delay_minutes）
+          任务重新被 pull、这次采成功
+                                         -> 发 seq=M   outcome=ok   (M > N)
+
+最坏情况   3 次 × (1 + 2 轮自动重试) = 9 次尝试才彻底放弃
+```
+
+`auto_retry_delay_minutes` 是**冷却下界**不是精确延迟：判据是
+`updated_at < now - delay_minutes`，而扫描 30 秒一轮，所以实际首次重试
+落在 `delay ~ delay+30s` 之间。
+
+### 消费侧该怎么做
+
+1. **按 `(asin, zipcode)` 分组、取 `cursor` 最大的那条**，不要看到
+   `parse_failed` 就下结论 —— 后面很可能跟着一条 `ok`。
+2. `outcome != "ok"` 的记录**只进快照表，不要 upsert 商品**（§契约正文）：
+   它的 `slow`/`fast` 基本是空的，那是"本次没采到"，不是"值变成空了"。
+   拿它覆盖已有数据 = 用一次失败把好数据擦掉。
+3. 要"这个 ASIN 到底最终成没成"，等批次结束再看，或者用
+   `GET /api/export/batch/{name}/records` 的 `coverage` 与逐条 `outcome`。
+
+`variant_offset` 这一类**不参与自动重试**（`NO_AUTO_RETRY_ERROR_TYPES`）——
+它是稳定的页面事实，重试只是浪费配额。那种 `parse_failed` 后面不会跟 `ok`。
+
+---
+
 ## 6. 同源的另一个出口：按批次取记录
 
 `GET /api/export/batch/{batch_name}/records` 读**同一张表**、用**同一个

@@ -385,6 +385,48 @@ status.status == "completed"
 | `prev_cursor` | 上一页的游标（`direction=prev` 用）= 本页第一行的 `id` |
 | `total` | **不含游标谓词**的全集计数。翻页途中恒定不变，可以直接拿去算进度条 |
 
+#### 带 `batch_id` 时**多四个字段**：这一行是不是本批采的
+
+⚠ **先理解这个端点在做什么**，否则下面四个字段没法用对：
+
+```sql
+SELECT d.* FROM asin_data d
+JOIN batch_asins ba ON ba.asin = d.asin AND ba.batch_id = ?
+```
+
+`asin_data` 是**每个 ASIN 一行的最新态**，`batch_id` 只回答「属不属于这批」，
+**不参与取哪一行**。所以这批采失败的 ASIN —— 只要它以前采过 —— 照样命中
+JOIN，返回的是**上一次的旧行**。带上 `batch_id` 时追加下面四个字段，
+就是为了让你**看得出**这件事：
+
+| 字段 | 含义 |
+|---|---|
+| `batch_task_status` | 这个 ASIN 在**本批次**里的任务状态：`done` / `failed` / `processing` / `pending`；批次里没有这个任务时是 `null` |
+| `batch_task_updated_at` | 该任务最后一次变更的时间 |
+| `batch_asin_data_updated_at` | **这一行数据**的时间（= `updated_at`）。与上一列一比就知道数据比任务旧多少 |
+| `batch_has_asin_data` | 见下，本端点**恒为 1** |
+
+判据（与 CSV/xlsx 导出的 `data_source` 列同一套逻辑）：
+
+```python
+if row["batch_task_status"] == "done":   # 本次采集更新
+elif row["batch_task_status"]:           # 历史产品库数据，本次未更新 ← 就是陈旧行
+```
+
+**不带 `batch_id` 时这四个字段不出现**（不是 `null`，是没有这个键）。
+没有批次就没有「本次任务」可言，给 `null` 只会让人以为「这批没跑过」。
+
+⚠ **`batch_has_asin_data` 在本端点恒为 1**，这不是占位符：驱动表是
+`asin_data`、走 INNER JOIN，能返回的行必然有 `asin_data`。给出它是为了让你
+用**同一套代码**从 JSON 复算 CSV 的 `data_source`。
+
+⚠⚠ **真正的差别在另一头**：CSV/xlsx 批次导出以 `batch_asins` 为驱动表
+LEFT JOIN，所以这批里**一次都没采过**的 ASIN 会出现在 CSV 里
+（`batch_has_asin_data = 0`）；而本端点**整行都不会返回** —— 连"缺了一个"
+都看不出来。要知道这批有哪些 ASIN 一次都没采过，用
+`GET /api/export/batch/{name}/records` 的 `coverage`（§4.11），
+或比对 `/api/batches/{name}/status` 的任务数。
+
 `items[].screenshot_path` 是形如 `/static/screenshots/<batch_name>/<asin>.png`
 的相对路径，或 `null`（无截图）。占位串 `"none"` / `"null"` / 空串会被统一成
 `null`（`common/core/asindata.py:22-29`），所以**只需判 `null` 一种缺失形态**。
@@ -1167,6 +1209,13 @@ if r["status"] == "completed":      # ✅ 权威判据
 | `asin_data` 新列在老库上会被自动补上（`CREATE TABLE IF NOT EXISTS` 不补列） | `tests/pgdb/test_schema_migration.py::test_existing_table_gets_the_new_columns_back` |
 | 补列后列序仍与 `EXPECTED_COLUMNS` 一致、老数据不动 | `…::test_migration_preserves_existing_rows` |
 | 往后新增的列必须落在两份 DDL 的末尾（否则新建库/升级库列序分叉） | `tests/test_asin_data_field_table_guard.py::test_every_alter_added_column_sits_at_the_tail_of_both_ddls` |
+| `/api/results?batch_id=` 带上本次任务状态，陈旧行能被识别 | `tests/test_results_batch_status.py::test_stale_row_is_now_distinguishable` |
+| 不带 `batch_id` 时**不加**这四个字段 | `…::test_fields_absent_without_batch_id` |
+| 本端点 INNER JOIN，从没采过的 ASIN 整行不出现（故 `batch_has_asin_data` 恒 1） | `…::test_never_scraped_asin_is_absent_entirely` |
+| 每个可能让批次完成的写点都给完成检测入队（截图 done/fail、两个结果端点） | `tests/test_completion_check_enqueue.py` |
+| 入队失败绝不影响采集主路径 | `…::test_enqueue_failure_never_breaks_the_write_path` |
+| 非终态失败不发事件；终态失败发 `parse_failed`；stale 提交发 `stale` | `tests/test_batch_records_export.py::RetryTimelineTests` |
+| 终态失败 → 重试 → 成功：流里两条，后一条 cursor 更大 | `…::test_failed_then_success_leaves_both_records` |
 | 两个后端行为逐字节一致 | `python -m tests.golden.run verify` / `DB_BACKEND=postgres … verify` |
 
 **门禁**（改了本文覆盖的任何行为都要全绿）：

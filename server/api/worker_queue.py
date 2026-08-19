@@ -19,11 +19,18 @@
    `srv._worker_registry.clear()` 等），三个 PG 夹具还
    `monkeypatch.setattr(srv, "db", pgdb)` —— 名字搬走 = 补丁打空 = 样本漂移。
 
-2. **`_completion_check_set.add`（`api_submit_batch` 里那处）是全仓唯一的
-   HTTP 层写点**，其余读写都在 `app.py` 的 `_completion_watcher` 后台协程里。
-   它必须写成 `_srv()._completion_check_set.add(...)`：from-import 拿到的是
+2. **`_completion_check_set` 的 HTTP 层写点全部收口在
+   `_mark_for_completion_check()` 一个函数里**，其余读写都在 `app.py` 的
+   `_completion_watcher` 后台协程里。
+   它必须写成 `_s._completion_check_set.add(...)`：from-import 拿到的是
    同一个 set 对象没错，但夹具会**整体替换**这个属性，快照下来的旧 set
    之后没人读，完成通知静默失效。
+
+   曾经只有 `api_submit_batch` 一处入队，于是「任务采完但截图还没完」的
+   批次要靠 `_timeout_loop` 那个 30 秒 / `LIMIT 30` 的兜底扫描才收尾 ——
+   而 `LIMIT 30` 是硬截断，同时 running 的批次超过 30 个时后面的会被饿死。
+   现在**每一个可能让批次完成的写点**都入队：两个结果端点 + 截图 done/fail。
+   收口成一个函数是为了让"又加了一个写点却忘了入队"这件事有个显眼的去处。
 
 3. **`_register_worker` / `_rollback_quietly` / `_normalize_asin` /
    `_safe_fs_component` 留在 `app.py`**（前两个直接读写全局，后两个另有
@@ -127,6 +134,45 @@ async def api_pull_tasks(request: Request,
     return {"tasks": tasks}
 
 
+def _mark_for_completion_check(_s, batch_id, where: str) -> None:
+    """把 batch_id 标记为「需要检查是否完成」。
+
+    ------------------------------------------------------------------
+    为什么每个"可能让批次完成"的写点都要调它
+    ------------------------------------------------------------------
+    一个批次算完成，要**任务采完 + 截图也完**（`get_batch_completion_status`）。
+    在这之前只有 `api_submit_batch` 一处入队，于是：
+
+      * 最后一张截图上传完成 -> 批次其实已经完成了，但没有人入队；
+      * 只能等 `_timeout_loop` 那个 **30 秒一轮、`LIMIT 30`** 的兜底扫描。
+
+    兜底扫描有两个问题，第二个是真的会丢：
+      1. 完成通知/回调最坏晚 30 秒；
+      2. `LIMIT 30` 是**硬截断** —— 同时 running 的批次超过 30 个时，
+         排在后面的批次这一轮根本不会被检查。它按
+         `updated_at DESC, id DESC` 取前 30，一个长期 running 的老批次
+         会被新批次一直挤在窗口外，**饿死**。
+
+    所以这里给每个写点补上入队。兜底扫描保留不动 —— 它守的是另一种场景
+    （服务重启、内存 set 丢失）。
+
+    ------------------------------------------------------------------
+    ⚠ 必须 `_s._completion_check_set`，不能 from-import
+    ------------------------------------------------------------------
+    夹具会**整体替换** `server.app` 上这个属性（见本文件承重约束 1/2）。
+    from-import 拿到的是快照下来的旧 set，之后没人读，完成通知静默失效。
+
+    任何异常都吞掉只 log：通知机制绝不允许污染采集主路径 —— worker 提交
+    结果/截图失败会触发重试，而重试解决不了"入队失败"这种问题。
+    """
+    if not batch_id:
+        return
+    try:
+        _s._completion_check_set.add(batch_id)
+    except Exception as e:                                     # noqa: BLE001
+        _s.logger.warning(f"完成检测入队异常（{where}，不影响采集）: {e}")
+
+
 @router.post("/api/tasks/release")
 async def api_release_tasks(request: Request):
     _s = _srv()
@@ -179,10 +225,15 @@ async def api_submit_result(request: Request):
                 data.get("error_type", ""), data.get("error_detail", ""))
         if worker_id in _s._worker_registry and result.get("accepted"):
             _s._worker_registry[worker_id]["results_submitted"] += 1
+        # 与 /api/tasks/result/batch 同样入队。这条是 worker 的**回退路径**
+        # （批量接口连续失败时走 `_submit_batch_fallback`，worker/engine.py:2021），
+        # 恰恰是批量接口不好使的时候才走到 —— 那时更不该让完成检测只剩兜底扫描。
+        _mark_for_completion_check(_s, batch_id, "result")
         return {"ok": result.get("accepted", False), "stale": result.get("stale", False)}
     else:
         # 无 task_id 的直接写入（兼容）
         saved = await _s.db.save_result(data, batch_id)
+        _mark_for_completion_check(_s, batch_id, "result(no-task_id)")
         return {"ok": saved, "stale": False}
 
 
@@ -222,13 +273,13 @@ async def api_submit_batch(request: Request):
 
     # 防御性入队：本次写入涉及的 batch_id 标记为"需要检查是否完成"。
     # set.add 是 O(1) 内存操作，不会影响 worker 提交响应。
-    # 任何异常都吞掉只 log，绝不让通知机制污染采集主路径。
     try:
         touched = {item["batch_id"] for item in batch_items if item.get("batch_id")}
-        for bid in touched:
-            _s._completion_check_set.add(bid)
-    except Exception as e:
-        _s.logger.warning(f"完成检测入队异常（不影响采集）: {e}")
+    except Exception as e:                                     # noqa: BLE001
+        _s.logger.warning(f"完成检测入队异常（result/batch 取 batch_id，不影响采集）: {e}")
+        touched = set()
+    for bid in touched:
+        _mark_for_completion_check(_s, bid, "result/batch")
 
     return {**result, "total": len(results)}
 
@@ -285,6 +336,9 @@ async def api_upload_screenshot(request: Request,
         except OSError:
             pass
         raise HTTPException(409, f"截图状态不存在: {asin}@{batch_name}")
+    # 截图是批次完成的**第二个**条件（任务采完 + 截图也完）。最后一张截图
+    # 落地往往就是批次真正完成的那一刻，不入队就只能等 30 秒兜底扫描。
+    _mark_for_completion_check(_s, batch_id, "screenshot")
     return {"ok": True, "path": rel_path}
 
 
@@ -302,4 +356,7 @@ async def api_screenshot_fail(request: Request):
     updated = await _s.db.update_screenshot_status(asin, batch["id"], "failed", error=error)
     if not updated:
         raise HTTPException(409, f"截图状态不存在: {asin}@{batch_name}")
+    # failed 与 done 一样是**终态**：它同样能让"截图还没完"变成"截图完了"。
+    # 漏掉它，一个最后一张截图失败的批次要靠兜底扫描才收尾。
+    _mark_for_completion_check(_s, batch["id"], "screenshot/fail")
     return {"ok": True}

@@ -239,6 +239,14 @@ ASIN 只有一行，后采的覆盖先采的；而 `/api/results?batch_id=` 的 
   - 走 `pg_trgm` GIN 表达式索引，百万级数据下 5-50ms 量级（比 LIKE 全表扫快 ~1000 倍）
   - 短查询（<3 字符）自动 fallback 到 LIKE 路径保证正确性
 - **分页**：keyset cursor 分页，单页上限 1000（近期从 200 上调）
+- **带 `batch_id` 时多四个字段**：`batch_task_status` / `batch_task_updated_at` /
+  `batch_asin_data_updated_at` / `batch_has_asin_data`。
+  这个端点底层是 `SELECT d.* FROM asin_data d JOIN batch_asins ...`，
+  `asin_data` 是**每个 ASIN 一行的最新态**，`batch_id` 只是成员过滤器、
+  **不参与取哪一行** —— 所以这批采失败的 ASIN（只要以前采过）会返回**上一次的旧行**。
+  `batch_task_status != "done"` 就是"这行不是本批采的"。不带 `batch_id` 时这四个键
+  **不出现**。⚠️ 从没采过的 ASIN 在这个端点**整行不返回**（INNER JOIN），
+  要查覆盖率用 `GET /api/export/batch/{name}/records` 的 `coverage`。
 - **选中删除**：勾选行 checkbox，点击"删除选中"（同时删除关联截图文件）
 - **清空数据**：根据当前筛选条件智能删除
   - 选了批次 → 只删该批次数据
