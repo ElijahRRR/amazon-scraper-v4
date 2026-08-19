@@ -150,6 +150,7 @@ from common.pgdb.schema import (
     EVENT_META_ZIP_VERIFY,
     EVENT_OUTCOMES,
     EVENT_OWN_RANGE_CHECK_SQL,
+    EVENT_BATCH_INDEX_SQL,
     EVENT_PARENT_INDEX_SQL,
     EVENT_PARSE_ENGINES,
     EVENT_PARTITION_PREFIX,
@@ -1032,6 +1033,7 @@ class EventStreamMixin:
         for stmt in event_create_first_partition_sql():
             await conn.execute(stmt)
         await conn.execute(EVENT_PARENT_INDEX_SQL)
+        await conn.execute(EVENT_BATCH_INDEX_SQL)
 
         await self._assert_event_columns(conn)
         await self._bootstrap_identity(conn)

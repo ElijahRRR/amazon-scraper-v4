@@ -257,9 +257,40 @@ ASIN 只有一行，后采的覆盖先采的；而 `/api/results?batch_id=` 的 
    `"FREE"` → `0.0`（**确认免运费**）、`"$5.99"` → `5.99`、`"N/A"` → `null`
    （**这次没采到**，落地价算不出来）。⚠️ `null` ≠ `0`，**别写 `shipping or 0`**：
    把没采到当 0 的话落地价照样算得出来、看着也正常，只是偏小，两侧都不报错。
-3. **同步运维 API**（`server/api/sync.py`，`/api/v1/sync/*`，**仅 PostgreSQL 后端**）：读的是同一份事件流，但给的是内部原始事件形状 + 运维可观测性（relay 延迟、outbox 深度、保留期水位、`ack` 游标、强制裁剪通知）。完整契约见 [`docs/sync_contract.md`](docs/sync_contract.md)；面向 erpAPI 侧的业务端点（上传/状态/结果/失败明细）契约见 [`docs/erpapi_contract.md`](docs/erpapi_contract.md)。
+3. **按批次取记录**（`server/api/export_incremental.py`，`GET /api/export/batch/{batch_name}/records`，**仅 PostgreSQL 后端**）：回答"我刚推的这一批，到底采到了什么"。读**同一份事件流**、用**同一个** `_to_record`，所以 `records[]` 与上一条逐字段相同；差别只在 `WHERE batch_id = $1 AND seq > $2` 与游标的定义域。
 
-后两者依赖事件流，只有 PostgreSQL 后端提供；万一跑在 SQLite 回滚路径上，它们统一返回结构化 `503`（不是 404——404 容易被消费方误读成"暂无数据"，导致游标停滞）。
+   **它补的是一个会静默给出陈旧数据的洞。** `GET /api/results?batch_id=` 底层是
+   `SELECT d.* FROM asin_data d JOIN batch_asins ba ...` —— `asin_data` 是每个 ASIN
+   一行的**最新态**，`batch_id` 只是成员过滤器，**不参与取哪一行**。这批采失败的
+   ASIN，只要它以前采过，照样命中 JOIN 返回**上一次的旧行**，而 JSON 响应里
+   没有任何字段能看出年龄（CSV/xlsx 导出有 `data_source` 列，JSON 没有）。
+   本端点读事件流，每一行都是**一次真实发生过的采集**，没采成就没有行。
+
+   响应还带 `coverage: {asin_total, asin_with_event}`，一眼看出这批有没有 ASIN
+   一次事件都没有。⚠️ 两者相等**不等于**都成功了 —— `not_found` 也算有事件，
+   成功与否看每条记录的 `outcome`。
+   ⚠️ **游标不可与上一条互换**：数值同源于 `seq`，喂错了不会报错，会**静默跳过**
+   中间所有别的批次的事件。
+
+   现成消费脚本 `tools/consume_batch.py`（只用标准库，拷走即用）：
+
+   ```bash
+   # 拿这一批的数据 + 截图
+   python3 tools/consume_batch.py batch job_20260819 \
+       --server http://host:8899 --token "$EXPORT_TOKEN" --out ./out --screenshots
+
+   # 持续增量同步（游标存盘，可随时中断续跑）
+   python3 tools/consume_batch.py sync \
+       --server http://host:8899 --token "$EXPORT_TOKEN" --out ./out
+   ```
+
+   它按 `outcome` / `zip_verify` 过滤、按 **`(asin, zipcode)`** 去重取最新
+   （同一 ASIN 的两个邮编是两条事实，只按 asin 归并会互相覆盖），
+   写出 `.jsonl` + `.csv`，并把该批次已截好的图下到 `out/screenshots/<batch>/`。
+
+4. **同步运维 API**（`server/api/sync.py`，`/api/v1/sync/*`，**仅 PostgreSQL 后端**）：读的是同一份事件流，但给的是内部原始事件形状 + 运维可观测性（relay 延迟、outbox 深度、保留期水位、`ack` 游标、强制裁剪通知）。完整契约见 [`docs/sync_contract.md`](docs/sync_contract.md)；面向 erpAPI 侧的业务端点（上传/状态/结果/失败明细）契约见 [`docs/erpapi_contract.md`](docs/erpapi_contract.md)。
+
+后三者依赖事件流，只有 PostgreSQL 后端提供；万一跑在 SQLite 回滚路径上，它们统一返回结构化 `503`（不是 404——404 容易被消费方误读成"暂无数据"，导致游标停滞）。
 
 ### 首次部署 PostgreSQL 后端的验证清单
 
@@ -456,6 +487,9 @@ amazon-scraper-v4/
     preflight.py          # 上机环境体检：PG 连通性/建表/排序规则/磁盘/依赖，
                           # 外加路由顺序一项（判定逻辑来自 server/routing.py，
                           # 不是第二份实现）
+    consume_batch.py      # 消费端脚本（只用标准库，拷到任何机器即用）：
+                          #   batch <name>  拉某批次真正采到的数据 + 截图
+                          #   sync          全局增量同步，游标存盘
     desc_glue_check.py    # 单个解析 bug（<br> 不产生分隔符）的修复验证工具
   docs/
     erpapi_contract.md            # erpAPI 侧业务端点契约

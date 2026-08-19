@@ -550,3 +550,165 @@ async def export_incremental(
         "next_cursor": next_cursor,
         "has_more": has_more,
     })
+
+
+# ============================================================ 按批次取记录
+
+#: 单次分页上限。与全量流用同一个 MAX_LIMIT —— 两个端点回同一种 record，
+#: 单页体量该由 record 大小决定，而不是由"哪个 URL"决定。
+BATCH_DEFAULT_LIMIT = DEFAULT_LIMIT
+
+
+@router.get("/api/export/batch/{batch_name}/records")
+async def export_batch_records(
+    batch_name: str,
+    cursor: int = Query(0, ge=0, description="独占下界，返回 cursor 大于它的记录；从头拉传 0"),
+    limit: int = Query(BATCH_DEFAULT_LIMIT, ge=1, le=MAX_LIMIT),
+    x_export_token: Optional[str] = Header(None, alias="X-Export-Token"),
+):
+    """**这一批次真正采到了什么** —— 逐次采集事件，不是"最新态"。
+
+    ------------------------------------------------------------------
+    为什么需要这个端点（它补的是一个会静默给出陈旧数据的洞）
+    ------------------------------------------------------------------
+    此前"按批次拿数据"只有两条路，都读 ``asin_data``：
+
+        SELECT d.* FROM asin_data d
+        JOIN batch_asins ba ON ba.asin = d.asin AND ba.batch_id = ?
+
+    ``asin_data`` 是**每个 ASIN 一行的最新态**，``batch_id`` 只回答"属不属于
+    这批"，**不参与取哪一行**。于是这批采失败的 ASIN——只要它以前采过——
+    照样命中 JOIN，返回**上一次的旧行**：
+
+      * ``/api/results?batch_id=`` 只 ``SELECT d.*``，**不带任何本次任务状态**，
+        消费侧拿到的是一行看不出年龄的商品数据。摄进自己的库、盖上一个新鲜的
+        接收时间，陈旧数据就此看起来很新鲜 —— 而且两侧都不会报错。
+      * CSV/xlsx 批次导出有防护（``server/api/export.py:174`` 的
+        ``data_source`` 列会写"历史产品库数据，本次未更新"），但那是文件出口，
+        脚本消费不了。
+
+    本端点从**事件流**读，语义上就没有这个洞：``scraper.scrape_events`` 的
+    每一行都是**一次真实发生过的采集**，没采成就没有行。不存在"旧行冒充新行"。
+
+    ------------------------------------------------------------------
+    与 ``/api/export/incremental`` 的关系
+    ------------------------------------------------------------------
+    同一张表、同一套快照纪律、**同一个 ``_to_record``**（刻意共用：两个端点对
+    同一行必须逐字段给出同一个答案；再抄一份就是本仓库 V2/V4 那个老毛病）。
+    差别只在取哪些行、以及游标的定义域：
+
+      * ``/incremental``：``WHERE seq > $1``，游标是**全局**的，用于持续同步。
+      * 本端点：``WHERE batch_id = $1 AND seq > $2``，游标只在**这个批次内部**
+        有意义。**两个游标不可互换**，别拿本端点的 ``next_cursor`` 去喂
+        ``/incremental``（数值同源于 ``seq``，喂进去不会报错，会**静默跳过**
+        中间所有别的批次的事件）。
+
+    所以本端点不是增量同步的替代品，它回答的是另一个问题：
+    "我刚推的这一批，到底采到了什么。"
+
+    ------------------------------------------------------------------
+    覆盖率自查（``coverage``）
+    ------------------------------------------------------------------
+    响应里带 ``coverage``，让调用方**不必再发一次请求**就能判断这批齐没齐：
+
+        asin_total       这批入过队的 ASIN 数（``batch_asins``，含失败的）
+        asin_with_event  本次分页游标走到此处为止、出现过事件的去重 ASIN 数
+
+    ``asin_with_event`` 是**整批**的口径（一次聚合查询算的，与分页无关），
+    不是当前这一页的。两者相等 ⇒ 每个 ASIN 至少有过一次采集事件；
+    不等 ⇒ 差额那些 ASIN 一次都没采成（或事件已被保留期裁掉，见下）。
+
+    ⚠ ``asin_total == asin_with_event`` **不等于"这批都成功了"**：一个
+    ``outcome='not_found'`` 的事件也算"有事件"。要判成功看每条记录的
+    ``outcome``。
+
+    ------------------------------------------------------------------
+    保留期
+    ------------------------------------------------------------------
+    事件流有保留期，老批次的事件会被裁掉。本端点**不**回 409
+    （那是全量流的语义：游标掉出窗口 ⇒ 数据丢了 ⇒ 全量对账），而是照实回
+    200 + 一个可能不完整的集合，并把 ``retention_min_cursor`` 一并给出。
+    判据交给调用方：``coverage`` 对不上且批次早于保留窗口 ⇒ 被裁过。
+
+    永不用 404 表达"这批没有数据"——批次存在但一条事件都没有，回
+    ``200 + records: []``。404 **只**表示批次名不存在（见文件头第 3 条：
+    404 会被读成"暂无数据"而静默停摆，所以它必须只有一个含义）。
+    """
+    denied = _check_token(x_export_token)
+    if denied is not None:
+        return denied
+
+    unavailable = _sync._unavailable()
+    if unavailable is not None:
+        return unavailable
+
+    if cursor > _sync.MAX_BIGINT:
+        return _sync._err(422, "invalid_parameter",
+                          f"cursor 超出 bigint 上限：{cursor}")
+
+    batch = await _sync._database().get_batch_by_name(batch_name)
+    if not batch:
+        return _sync._err(404, "batch_not_found", f"批次不存在: {batch_name}",
+                          batch_name=batch_name)
+    batch_id = int(batch["id"])
+
+    try:
+        async with _sync._snapshot() as conn:
+            meta = await _sync._read_meta(conn)
+            min_raw, max_raw = await _sync._bounds(conn)
+            rows = await conn.fetch(
+                f"SELECT {_sync._RECORD_SELECT} FROM scraper.scrape_events "
+                "WHERE batch_id = $1 AND seq > $2 ORDER BY seq LIMIT $3",
+                batch_id, cursor, limit + 1)
+            # 覆盖率的两个数**必须在同一个快照里算**，否则它们来自两个时刻，
+            # 而 asin_with_event > asin_total 这种不可能的组合会出现在一个
+            # 被当作告警判据的字段上。
+            #
+            # 所以分母这里直接查 batch_asins，而不是走 db.get_batch_asin_set()
+            # ——后者会另借一条连接、另开一个时刻。表名不带 schema 是对的：
+            # 连接池把 search_path 钉死成 public（common/pgdb/pool.py:830），
+            # 业务表都在那儿；事件流才需要 scraper. 前缀。
+            #
+            # batch_asins 记的是"这一批**入过队**的 ASIN"，任务失败与否它都在
+            # （common/pgdb/results_read.py:290）。正因如此它才是覆盖率的分母。
+            asin_total = await conn.fetchval(
+                "SELECT count(DISTINCT asin) FROM batch_asins WHERE batch_id = $1",
+                batch_id)
+            asin_with_event = await conn.fetchval(
+                "SELECT count(DISTINCT asin) FROM scraper.scrape_events "
+                "WHERE batch_id = $1", batch_id)
+    except _sync._PoolUnavailable:
+        return _sync._err(503, "event_stream_unavailable", "连接池尚未就绪。")
+    except Exception as exc:                                   # noqa: BLE001
+        if _sync._schema_missing(exc):
+            return _sync._err(503, "event_stream_unavailable",
+                              f"事件流表还没建好: {type(exc).__name__}")
+        raise
+
+    min_available, max_seq = _sync._window(
+        min_raw, max_raw, _sync._as_int(meta.get("max_seq_ever")))
+
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    records = [_to_record(dict(r)) for r in rows]
+    # 与全量流同一条纪律：游标只推进到**真正投递过的那一条**，空页不推进。
+    next_cursor = records[-1]["cursor"] if records else cursor
+
+    return JSONResponse(content={
+        "contract_version": CONTRACT_VERSION,
+        "batch": {
+            "id": batch_id,
+            "name": batch.get("name"),
+            "status": batch.get("status"),
+            "created_at": batch.get("created_at"),
+        },
+        "coverage": {
+            "asin_total": int(asin_total or 0),
+            "asin_with_event": int(asin_with_event or 0),
+        },
+        "records": records,
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+        "retention_min_cursor": min_available,
+        "max_cursor": max_seq,
+    })
