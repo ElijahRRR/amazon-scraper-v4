@@ -200,6 +200,9 @@ let state = {
     prevCursor: null,
     cursorStack: [],
     currentStartCursor: null,
+    // 首屏那次拿到的 total。翻页时服务端不再回 total（with_total=false），
+    // 沿用这个值 —— 它在整个翻页过程中本来就恒定不变。
+    total: null,
 };
 
 // 初始化
@@ -267,7 +270,25 @@ async function loadResults(cursor = null, direction = 'next') {
     state.search = rawSearch.split(/[\n,]+/).map(s => s.trim()).filter(s => s).join(',');
     state.changeFilter = document.getElementById('changeFilter').value;
 
-    let url = `/api/results?limit=50&change_filter=${state.changeFilter}&direction=${direction}`;
+    // 只要这张表真正渲染的列。默认的 SELECT d.* 是 56 列，其中
+    // bullet_points / image_urls / long_description 这三个大块头这张表一个都
+    // 不显示 —— 实测 100 万行的库上单页 274 KB -> 17.8 KB。
+    // 加列的时候记得同步这里，漏了就是那一列渲染成 undefined。
+    // （服务端还会强制补 id / asin / screenshot_path / updated_at，不用写。）
+    const UI_FIELDS = [
+        'asin', 'title', 'brand', 'current_price', 'buybox_price',
+        'rating', 'review_count', 'seller_id', 'seller_name',
+        'stock_count', 'stock_status', 'is_fba', 'delivery_date',
+        'crawl_time', 'screenshot_path'
+    ].join(',');
+
+    // total 是全表 COUNT，随行数线性增长，而翻页途中它恒定不变 ——
+    // 只在首屏要一次。cursor 非空 = 在翻页，直接省掉。
+    const needTotal = !cursor;
+
+    let url = `/api/results?limit=50&change_filter=${state.changeFilter}&direction=${direction}`
+            + `&fields=${UI_FIELDS}`;
+    if (!needTotal) url += '&with_total=false';
     if (state.batchId) url += `&batch_id=${state.batchId}`;
     if (state.search) url += `&search=${encodeURIComponent(state.search)}`;
     if (cursor) url += `&cursor=${cursor}`;
@@ -276,8 +297,12 @@ async function loadResults(cursor = null, direction = 'next') {
         const resp = await fetch(url);
         const data = await resp.json();
 
-        document.getElementById('resultTotal').textContent = data.total;
-        document.getElementById('stat-total').textContent = data.total;
+        // 翻页时服务端不再回 total（null）——沿用首屏那次的值，别把计数刷成空
+        if (data.total !== null && data.total !== undefined) {
+            state.total = data.total;
+        }
+        document.getElementById('resultTotal').textContent = state.total ?? '-';
+        document.getElementById('stat-total').textContent = state.total ?? '-';
 
         state.nextCursor = data.next_cursor;
         state.prevCursor = data.prev_cursor;
