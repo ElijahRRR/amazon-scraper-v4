@@ -252,6 +252,14 @@ ASIN 只有一行，后采的覆盖先采的；而 `/api/results?batch_id=` 的 
 1. **UI 导出**（`server/api/export.py`，`GET /api/export/*`）：网页点"导出"按钮走的路径，弹窗选择格式（Excel/CSV）、字段（全选/仅价格库存/自定义勾选）、范围（当前批次 + 变动筛选）；支持流式导出，百万级数据不 OOM。导出列含**变体属性**（`color_name=X; size_name=Y`）/ 父体 ASIN / 变体 ASIN 列表；原 **EAN 列已下线**（amazon.com 实测 100% 为空，`ean_list` 已经不在可导出字段集合里），槽位由「变体属性」顶上。
 2. **增量导出契约**（`server/api/export_incremental.py`，`GET /api/export/incremental`，**仅 PostgreSQL 后端**）：面向下游 catalog_sync（沃尔玛侧）的固定契约 v1，cursor+limit 分页，可选 `X-Export-Token` 请求头鉴权（`EXPORT_TOKEN`/`EXPORT_REQUIRE_TOKEN` 控制是否强制）。完整字段定义与不变量见 [`docs/incremental_export_contract.md`](docs/incremental_export_contract.md)。
 
+   **副标题在这里**：`slow.subtitle`。2026-08 Amazon 把商品标题拆成两个元素
+   （`span#productTitle` + `div.dp-title-differentiators`），采集侧用 **Amazon 自己的
+   分隔符 `" | "`** 把两段拼回 `slow.title`，**同时**把后半段单独给一份。
+   内容重复是有意的：省得消费侧自己按 `" | "` 切标题 —— 标题正文里本来就可能出现 `|`。
+   页面没有这一块时是 `null`（键恒在）。它**不进 `slow_hash`**（内容已在 title 里，
+   再算一遍等于同一段文本数两次）。两个解析引擎共用同一份提取实现，
+   否则同一商品会因为走了哪条引擎而给出不同答案。
+
    **运费在这里**：`fast.shipping`（float 或 null）+ `fast.shipping_raw`（原始串）。
    采集侧存的是字符串，三种形态映射到三个互不相同的结果 ——
    `"FREE"` → `0.0`（**确认免运费**）、`"$5.99"` → `5.99`、`"N/A"` → `null`

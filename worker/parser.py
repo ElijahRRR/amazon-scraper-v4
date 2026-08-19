@@ -355,6 +355,12 @@ class AmazonParser:
 
         # 逐字段提取：多层 fallback
         result["title"] = jsonld.get("title") or self._slx_parse_title(tree)
+        # 副标题单独成字段。它**已经**被拼进 title 了，这里再给一份是为了让
+        # 消费侧不必去猜 " | " 后面那截从哪来、也不必自己按分隔符切
+        # （标题正文里本来就可能出现 "|"）。
+        # 没有这一块时写 "N/A" —— 与本文件其余"本次没取到"的字段同一种表达，
+        # 由导出侧的 `_clean` 归一成 null（server/api/export_incremental.py）。
+        result["subtitle"] = self._title_differentiator(tree) or "N/A"
         # P4-1：`zip_code` 恒为**请求**邮编（_default_result 已经写好）。
         # 观测值在 result["_zip_observed"]，判定在 result["_zip_verify"]。
 
@@ -520,6 +526,46 @@ class AmazonParser:
                          '//*[contains(@class, "dp-title-differentiators")]')
 
     @classmethod
+    def _title_differentiator(cls, tree) -> Optional[str]:
+        """副标题（Title Differentiators）。没有这一块 -> ``None``。
+
+        **两个解析引擎共用这一个实现**，纪律与 `_join_title_parts` 完全相同，
+        而且这里更要紧：`title` 与 `subtitle` 是**同一段文本的两个出口**
+        （拼进标题 / 单独成字段）。分成两份提取的话，两个出口会各自漂移，
+        于是出现 `title` 里有后半段、`subtitle` 却是 null 这种自相矛盾的记录
+        —— 消费侧无从判断该信哪个。
+
+        引擎分派放在这里、只此一处：选择器、空白归一、"没有就是 None"
+        这三条判断因此只存在一份。
+          * selectolax 的 tree 有 `css_first`；
+          * lxml 的没有，走 xpath。
+        用能力判断而不是 `isinstance`，免得为了个类型判断把两个解析库
+        都 import 进来（本模块刻意让 lxml 是可选依赖）。
+
+        ⚠ **取元素再收全部子孙文本**，不要图省事用 `.../text()` 或
+        `string(...)`：前者只拿容器的直接文本节点（文案在子 `<span>` 里
+        -> 恒空），后者会让 `tree.xpath()` 返回一个**字符串**而不是列表，
+        `_get_text` 的 `result[0]` 于是取到第一个字符。两条都是"静默变短"，
+        与本次要修的是同一种病。
+        """
+        try:
+            if hasattr(tree, "css_first"):                      # selectolax
+                node = tree.css_first(cls._TITLE_DIFF_CSS)
+                raw = node.text() if node is not None else None
+            else:                                               # lxml
+                nodes = tree.xpath(cls._TITLE_DIFF_XPATH)
+                raw = nodes[0].text_content() if nodes else None
+        except Exception:                                       # noqa: BLE001
+            return None
+        if raw is None:
+            return None
+        # 空白折叠成单空格：两个引擎对同一段 HTML 会给出不同的原始空白
+        # （selectolax 保留标签间换行/缩进，lxml 的 text_content 也保留），
+        # 不折叠的话同一张页面在两条路径上会产出两个不同的 subtitle。
+        text = " ".join(raw.split())
+        return text or None
+
+    @classmethod
     def _join_title_parts(cls, main: Optional[str],
                           differentiator: Optional[str]) -> str:
         """(主标题, 后半段) -> 完整标题。**两个解析引擎共用这一个实现。**
@@ -574,9 +620,9 @@ class AmazonParser:
                 'h1 > span',
             ])
             if visible:
-                # 2026-08 改版：后半段在兄弟节点里，见 `_join_title_parts` 上方注释
-                diff = self._slx_text(tree, [self._TITLE_DIFF_CSS])
-                return self._join_title_parts(visible, diff)
+                # 2026-08 改版：后半段在兄弟节点里，见 `_title_differentiator`
+                return self._join_title_parts(
+                    visible, self._title_differentiator(tree))
             if meta:
                 content = meta.attributes.get('content', '')
                 return content.strip() if content else "N/A"
@@ -1186,6 +1232,7 @@ class AmazonParser:
 
         # 逐字段提取（JSON-LD 优先，CSS/XPath 补充）
         result["title"] = jsonld.get("title") or self._parse_title(tree)
+        result["subtitle"] = self._title_differentiator(tree) or "N/A"
         # P4-1：同 selectolax 路径，`zip_code` 恒为请求邮编。
 
         # 商品可售状态检测
@@ -1703,6 +1750,11 @@ class AmazonParser:
             "_completeness": 0,          # 0 == 未测量（契约 §6.4）
             "_parse_engine": None,       # 没有任何引擎跑起来时保持 None
             "title": "N/A",
+            # subtitle 与 title 同源（同一段 Title Differentiators）。404 页上
+            # 两者都不可得，所以这里跟着写占位符。注意它**不是** asin_data 的列
+            # （见 common/core/asindata.py:ASIN_DATA_FIELDS），写入侧按列名取值，
+            # 多这一个键不会落库，只进事件流 payload。
+            "subtitle": "N/A",
             "brand": "N/A",
             "product_type": "N/A",
             "manufacturer": "N/A",
@@ -2301,21 +2353,9 @@ class AmazonParser:
             ])
             if not visible:
                 return meta[0].strip() if meta else "N/A"
-            # 2026-08 改版：后半段在兄弟节点里，见 `_join_title_parts` 上方注释。
-            #
-            # ⚠ 这里**不能**走 `_get_text`，两条路都不行，实测过：
-            #   * `.../text()` 只拿容器的直接文本节点，而文案在子 `<span>` 里
-            #     -> 恒空；
-            #   * `string(...)` 让 `tree.xpath()` 返回的是**一个字符串**而不是
-            #     列表，`_get_text` 的 `result[0]` 于是取到**第一个字符**
-            #     （那是个空格，strip 后为空）-> 同样恒空。
-            # 取元素再 `text_content()`：子孙文本全收，与 selectolax 的
-            # `node.text(strip=True)` 同口径，两个引擎才会给出同一个 title。
-            diff = None
-            nodes = tree.xpath(self._TITLE_DIFF_XPATH)
-            if nodes:
-                diff = " ".join(nodes[0].text_content().split())
-            return self._join_title_parts(visible, diff)
+            # 2026-08 改版：后半段在兄弟节点里，见 `_title_differentiator`
+            return self._join_title_parts(
+                visible, self._title_differentiator(tree))
         except Exception:
             return "N/A"
 

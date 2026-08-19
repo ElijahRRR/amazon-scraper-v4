@@ -364,6 +364,22 @@ def _to_record(row: Dict[str, Any]) -> Dict[str, Any]:
         "slow": {
             # ---- 契约必填 ----
             "title": _clean(payload.get("title")),
+            # subtitle 是**追加**字段（契约 §3.2 允许单方面加字段，仍是 v1）。
+            #
+            # 它是 Amazon 2026-08 起放在 `div.dp-title-differentiators` 里的那段
+            # 副标题（worker/parser.py:_title_differentiator）。同一段文本**也**
+            # 被拼进了 `title`（用 Amazon 自己的分隔符 " | "），这里再单独给一份
+            # 是为了让消费侧不必去猜分隔符后面那截从哪来、也不必自己按 " | " 切
+            # —— 标题正文里本来就可能出现 "|"，按它切会切错。
+            #
+            # 页面上没有这一块时是 **null**，不是空串：与本契约其余字段同一条
+            # 纪律（"没采到"必须与"值就是空"可区分）。
+            #
+            # ⚠ **不进 slow_hash**，这是有意的：它的内容已经在 `title` 里了
+            # （common/slowhash.py:REVIEW_HASH_FIELDS 含 title），再算一遍等于
+            # 同一段文本在哈希里数两次 —— 变更判定不会更准，只会让"改了一个字段
+            # 却动了两个输入"这件事更难解释。
+            "subtitle": _clean(payload.get("subtitle")),
             "brand": _clean(payload.get("brand")),
             "category_path": _category_path(payload),
             "images": _split_list("image_urls", payload.get("image_urls")),

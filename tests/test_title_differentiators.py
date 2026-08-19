@@ -81,6 +81,13 @@ def _both(body: str):
             p._parse_title(lhtml.fromstring(_page(body))))
 
 
+def _both_subtitle(body: str):
+    """副标题提取，两个引擎各跑一遍。"""
+    p = AmazonParser()
+    return (p._title_differentiator(HTMLParser(_page(body))),
+            p._title_differentiator(lhtml.fromstring(_page(body))))
+
+
 class TitleDifferentiatorTests(unittest.TestCase):
     """**这一组对应"标题静默变短"那个 bug。**"""
 
@@ -151,6 +158,80 @@ class TitleDifferentiatorTests(unittest.TestCase):
         for name, got in (("selectolax", slx), ("lxml", lx)):
             self.assertIn("First", got, name)
             self.assertIn("Second", got, name)
+
+
+class SubtitleFieldTests(unittest.TestCase):
+    """副标题单独成字段（`slow.subtitle`）。
+
+    它与 `title` 是**同一段文本的两个出口**，所以提取必须只有一份实现——
+    分成两份的话会漂移成 `title` 里有后半段、`subtitle` 却是 null 这种
+    自相矛盾的记录，而消费侧无从判断该信哪个。
+    """
+
+    def test_subtitle_is_extracted(self):
+        a, b = _both_subtitle(_REAL_TITLE_SECTION)
+        expected = ("10.9 Grade Alloy Steel Metric Hex Button Head Cap Screws, "
+                    "Nuts and Flat Washers, Black Zinc Plated Screw Set for "
+                    "3D Printing")
+        self.assertEqual(a, expected, "selectolax")
+        self.assertEqual(b, expected, "lxml")
+
+    def test_absent_differentiator_is_none_not_empty_string(self):
+        """没有这一块 -> `None`。
+
+        空串会被导出侧的 `_clean` 归一成 null，看起来"也对"，但它把
+        「页面上没有副标题」和「副标题是空的」混成了一件事。本仓库对
+        这类区分是硬要求（见 `_price` / `_int` 的 docstring）。
+        """
+        for got in _both_subtitle(_REAL_NO_DIFF_SECTION):
+            self.assertIsNone(got)
+
+    def test_both_engines_agree_on_subtitle(self):
+        for body in (_REAL_TITLE_SECTION, _REAL_NO_DIFF_SECTION):
+            a, b = _both_subtitle(body)
+            self.assertEqual(a, b)
+
+    def test_subtitle_and_title_never_contradict(self):
+        """`subtitle` 非空 <=> `title` 里含有它。**同源的两个出口不许打架。**
+
+        这一条是本组的核心：它直接钉住"共用一份提取"这件事本身。
+        任何一侧改成自己找 DOM，两边就可能对同一张页面给出不同答案。
+        """
+        for body in (_REAL_TITLE_SECTION, _REAL_NO_DIFF_SECTION):
+            for title, sub in ((_both(body)[0], _both_subtitle(body)[0]),
+                               (_both(body)[1], _both_subtitle(body)[1])):
+                if sub is None:
+                    self.assertNotIn(" | ", title,
+                                     "没有副标题却拼出了分隔符")
+                else:
+                    self.assertIn(sub, title,
+                                  "副标题不在标题里 —— 两个出口漂移了")
+
+    def test_whitespace_is_collapsed_identically_on_both_engines(self):
+        """两个引擎对同一段 HTML 的原始空白不同（标签间的换行/缩进）。
+
+        不折叠的话同一张页面在两条路径上会产出两个不同的 subtitle 串，
+        下游一比对就是"变了"。
+        """
+        body = ('<div id="titleSection"><h1 id="title">'
+                '<span id="productTitle">Main</span></h1>'
+                '<div class="a-section dp-title-differentiators">\n'
+                '   <span>Alpha</span>\n\n   <span>Beta</span>\n'
+                '</div></div>')
+        a, b = _both_subtitle(body)
+        self.assertEqual(a, b)
+        self.assertEqual(a, "Alpha Beta")
+
+    def test_result_dict_carries_subtitle_placeholder_when_absent(self):
+        """组装出来的结果字典里 subtitle 用 "N/A" 占位。
+
+        与本仓库其余"本次没取到"的字段同一种表达，由导出侧 `_clean`
+        归一成 null。写 `None` 会让"这次没采到"和"值是空"在事件流 payload
+        里分不开（worker/engine.py:94 那段注释讲的就是这个）。
+        """
+        nf = AmazonParser()._default_result("B0NOTFOUN1", "10001")
+        self.assertIn("subtitle", nf, "404 占位结果里少了 subtitle 键")
+        self.assertEqual(nf["subtitle"], "N/A")
 
 
 class JoinHelperTests(unittest.TestCase):

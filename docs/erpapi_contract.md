@@ -1054,6 +1054,11 @@ if r["status"] == "completed":      # ✅ 权威判据
 | 截图列表给的 `url` 真的能打，且只在 `done` 时非 null | `tests/test_screenshot_api.py::ScreenshotListTests` |
 | 同 ASIN 多邮编：截图按批次隔离、增量导出保留两份、快照只有一行 | `tests/test_multi_zip_same_asin.py` |
 | 一次推送里同 ASIN 给两个邮编 → 400（不静默丢一个） | `…::test_two_zips_for_one_asin_in_one_push_is_rejected` |
+| 标题被拆两段后要拼回去（2026-08 Title Differentiators） | `tests/test_title_differentiators.py::TitleDifferentiatorTests` |
+| 分隔符 `" | "` 与 Amazon 自己拼的串逐字节相同 | `…::test_separator_is_amazons_own_not_ours` |
+| 没有副标题时不留下孤零零的分隔符 | `…::test_missing_differentiator_leaves_no_dangling_separator` |
+| `title` 与 `subtitle` 共用一份提取、永不自相矛盾 | `…::SubtitleFieldTests::test_subtitle_and_title_never_contradict` |
+| `slow.subtitle` 进契约，没有就是 null（键恒在） | `tests/test_incremental_export.py::…::test_subtitle_*` |
 | 两个后端行为逐字节一致 | `python -m tests.golden.run verify` / `DB_BACKEND=postgres … verify` |
 
 **门禁**（改了本文覆盖的任何行为都要全绿）：

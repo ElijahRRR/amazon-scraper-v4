@@ -454,6 +454,59 @@ class ContractTests(unittest.TestCase):
     #
     # 用真实格式做输入是这几条用例的全部意义：夹具里只要写成 "Color:Red"，
     # 这个 bug 就能一直绿着活下去（原先的夹具正是这么写的）。
+    # ---------------- slow.subtitle（Title Differentiators） ----------------
+    # 2026-08 Amazon 把标题拆成两段，后半段进了 div.dp-title-differentiators。
+    # 采集侧把它拼进 title（用 Amazon 自己的分隔符 " | "）**并且**单独给一份，
+    # 让消费侧不必按 " | " 切 —— 标题正文里本来就可能出现 "|"。
+    def _submit_subtitle(self, c, asin, subtitle, batch):
+        """提交一条只在 subtitle 上有差别的结果，返回它的 slow 块。"""
+        c.post("/api/upload",
+               files={"file": ("s.txt", f"{asin}\n".encode(), "text/plain")},
+               data={"batch_name": batch, "zip_code": "10001"})
+        t = c.get("/api/tasks/pull",
+                  params={"worker_id": f"w-{batch}", "count": 1}).json()["tasks"][0]
+        body = {
+            "task_id": t["id"], "batch_id": t["batch_id"],
+            "worker_id": f"w-{batch}", "lease_epoch": t["lease_epoch"],
+            "success": True, "asin": t["asin"],
+            "title": "Main Title | Sub Part", "brand": "B",
+            "category_tree": "Home > Tools",
+            "current_price": "19.99", "stock_status": "In Stock",
+            "crawl_time": "2026-08-05T10:00:00Z", "site": "US",
+            "zip_code": "10001",
+        }
+        if subtitle is not None:
+            body["subtitle"] = subtitle
+        c.post("/api/tasks/result", json=body)
+        _drain(c)
+        recs = c.get("/api/export/incremental",
+                     params={"cursor": 0, "limit": 500}, headers=self._hdr()
+                     ).json()["records"]
+        hit = [r for r in recs if r["asin"] == asin]
+        self.assertTrue(hit, f"样本 {asin} 没进事件流")
+        return hit[0]["slow"]
+
+    def test_subtitle_reaches_the_contract(self):
+        with _server_with_relay() as (c, _):
+            slow = self._submit_subtitle(c, "B0SUBTTL01", "Sub Part", "sub_ok")
+        self.assertEqual(slow["subtitle"], "Sub Part")
+
+    def test_subtitle_placeholder_becomes_null(self):
+        """采集侧的 "N/A"（本次没取到）在契约里必须是 null，不是字符串。"""
+        with _server_with_relay() as (c, _):
+            slow = self._submit_subtitle(c, "B0SUBTNA01", "N/A", "sub_na")
+        self.assertIsNone(slow["subtitle"])
+
+    def test_subtitle_key_exists_even_when_the_page_had_none(self):
+        """键恒在。缺键与 null 是两回事：前者让消费侧分不清
+
+        「这个采集器不产出副标题」和「这一页没有副标题」。
+        """
+        with _server_with_relay() as (c, _):
+            slow = self._submit_subtitle(c, "B0SUBTMIS1", None, "sub_missing")
+        self.assertIn("subtitle", slow)
+        self.assertIsNone(slow["subtitle"])
+
     def _submit_variant(self, c, asin, variant_attributes, batch, parent="B0PARENT01"):
         c.post("/api/upload",
                files={"file": ("v.txt", f"{asin}\n".encode(), "text/plain")},
