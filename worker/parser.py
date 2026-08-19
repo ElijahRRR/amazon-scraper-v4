@@ -355,6 +355,12 @@ class AmazonParser:
 
         # 逐字段提取：多层 fallback
         result["title"] = jsonld.get("title") or self._slx_parse_title(tree)
+        # 副标题单独成字段。它**已经**被拼进 title 了，这里再给一份是为了让
+        # 消费侧不必去猜 " | " 后面那截从哪来、也不必自己按分隔符切
+        # （标题正文里本来就可能出现 "|"）。
+        # 没有这一块时写 "N/A" —— 与本文件其余"本次没取到"的字段同一种表达，
+        # 由导出侧的 `_clean` 归一成 null（server/api/export_incremental.py）。
+        result["subtitle"] = self._title_differentiator(tree) or "N/A"
         # P4-1：`zip_code` 恒为**请求**邮编（_default_result 已经写好）。
         # 观测值在 result["_zip_observed"]，判定在 result["_zip_verify"]。
 
@@ -469,6 +475,117 @@ class AmazonParser:
 
         return result
 
+    # ---- 标题：主标题 + Title Differentiators ----
+    #
+    # 2026-08 Amazon 改版：商品标题被**拆成两个元素**。以前 `#productTitle`
+    # 一个元素装完整标题，现在它只装前半段，后半段挪进了一个兄弟节点：
+    #
+    #     <div id="titleSection">
+    #       <h1 id="title">
+    #         <span id="productTitle">River Dream Waffle No Hook Shower Curtain
+    #                                 with Liner,Graphite Grey,71x74</span>
+    #       </h1>
+    #       <!-- Title Differentiators for Desktop -->
+    #       <div class="a-section dp-title-differentiators">
+    #         <span class="a-size-base a-color-secondary">Snap-in Liner,Heavy Duty,
+    #               Hotel Grade,Mesh Top Window,...</span>
+    #       </div>
+    #     </div>
+    #
+    # 于是 title 静默变短，**而且看起来完全正常**——不是空、不是 N/A、不报错，
+    # 只是少了后半段。这类改版最难发现，所以下面每一条判断都写清楚依据。
+    #
+    # 分隔符是 `" | "`，不是我们自己编的：同一张页面里 Amazon 自己也把两段拼
+    # 成一个串，用的就是它（实测 B0F3JKMZLN，2026-08-19）——
+    #
+    #   <title>Amazon.com: 710PCS M3 Screw Assortment Kit, ... Screw Kits
+    #          | 10.9 Grade Alloy Steel ... for 3D Printing : Industrial & Scientific</title>
+    #   <input id="productTitle" value="710PCS ... Screw Kits | 10.9 Grade ... Printing"/>
+    #
+    # 与用户报的历史值也逐字对上：改版前采到的就是 `...,71x74 | Snap-in Liner,...`。
+    #
+    # ⚠ **不能改读那两个"已经拼好"的源**，虽然看着更省事：
+    #   * `<title>` / `meta[name="title"]` 带 `Amazon.com: ` 前缀和 ` : 类目` 后缀，
+    #     得再剥一层，而那层文案随语言/类目变化；
+    #   * 那个 hidden input 属于"举报低价"弹窗表单，**不是每页都有**
+    #     （实测 B07FZ8S74R Echo Dot 就没有）。
+    # 所以真源是可见 DOM 的两段，我们自己按 Amazon 的分隔符拼。
+    #
+    # ⚠ differentiators **是可选的**（Echo Dot 那页整块都不存在）。没有时
+    # 必须原样返回主标题，**不许留下孤零零的分隔符**——`"标题 | "` 这种尾巴
+    # 会进 slow_hash，把一次解析瑕疵变成一次"慢变字段变了"的假变更。
+
+    #: Amazon 自己拼这两段用的分隔符。
+    TITLE_PART_SEPARATOR = " | "
+
+    #: differentiators 容器。**限定在 `#titleSection` 之内**：这个 class 名
+    #: 足够通用，页面别处（推荐位、变体卡片）出现同名容器时不该被当成本商品的
+    #: 标题后半段。实测本商品页只出现一次，限定是防御性的。
+    _TITLE_DIFF_CSS = "#titleSection .dp-title-differentiators"
+    _TITLE_DIFF_XPATH = ('//*[@id="titleSection"]'
+                         '//*[contains(@class, "dp-title-differentiators")]')
+
+    @classmethod
+    def _title_differentiator(cls, tree) -> Optional[str]:
+        """副标题（Title Differentiators）。没有这一块 -> ``None``。
+
+        **两个解析引擎共用这一个实现**，纪律与 `_join_title_parts` 完全相同，
+        而且这里更要紧：`title` 与 `subtitle` 是**同一段文本的两个出口**
+        （拼进标题 / 单独成字段）。分成两份提取的话，两个出口会各自漂移，
+        于是出现 `title` 里有后半段、`subtitle` 却是 null 这种自相矛盾的记录
+        —— 消费侧无从判断该信哪个。
+
+        引擎分派放在这里、只此一处：选择器、空白归一、"没有就是 None"
+        这三条判断因此只存在一份。
+          * selectolax 的 tree 有 `css_first`；
+          * lxml 的没有，走 xpath。
+        用能力判断而不是 `isinstance`，免得为了个类型判断把两个解析库
+        都 import 进来（本模块刻意让 lxml 是可选依赖）。
+
+        ⚠ **取元素再收全部子孙文本**，不要图省事用 `.../text()` 或
+        `string(...)`：前者只拿容器的直接文本节点（文案在子 `<span>` 里
+        -> 恒空），后者会让 `tree.xpath()` 返回一个**字符串**而不是列表，
+        `_get_text` 的 `result[0]` 于是取到第一个字符。两条都是"静默变短"，
+        与本次要修的是同一种病。
+        """
+        try:
+            if hasattr(tree, "css_first"):                      # selectolax
+                node = tree.css_first(cls._TITLE_DIFF_CSS)
+                raw = node.text() if node is not None else None
+            else:                                               # lxml
+                nodes = tree.xpath(cls._TITLE_DIFF_XPATH)
+                raw = nodes[0].text_content() if nodes else None
+        except Exception:                                       # noqa: BLE001
+            return None
+        if raw is None:
+            return None
+        # 空白折叠成单空格：两个引擎对同一段 HTML 会给出不同的原始空白
+        # （selectolax 保留标签间换行/缩进，lxml 的 text_content 也保留），
+        # 不折叠的话同一张页面在两条路径上会产出两个不同的 subtitle。
+        text = " ".join(raw.split())
+        return text or None
+
+    @classmethod
+    def _join_title_parts(cls, main: Optional[str],
+                          differentiator: Optional[str]) -> str:
+        """(主标题, 后半段) -> 完整标题。**两个解析引擎共用这一个实现。**
+
+        共用不是风格问题：selectolax 与 lxml 两条路径必须对同一张页面给出
+        **同一个** title，否则同一个商品会因为走了哪条引擎而产生不同的
+        slow_hash，看起来像"标题变了"。本仓库 .agent/MIGRATION_STATUS.md §5.5
+        记的 V2/V4 两次事故都是"抄了一份该共用的东西然后各自演化"。
+        """
+        m = (main or "").strip()
+        d = (differentiator or "").strip()
+        if not m:
+            return d or "N/A"
+        if not d:
+            return m
+        # 后半段已经被前半段包住（Amazon 偶尔两处都给全量）时不要拼两遍
+        if d in m:
+            return m
+        return m + cls.TITLE_PART_SEPARATOR + d
+
     # ---- selectolax 辅助 ----
 
     def _slx_text(self, tree, selectors: List[str]) -> Optional[str]:
@@ -496,11 +613,16 @@ class AmazonParser:
         try:
             meta = tree.css_first('meta[name="title"]')
             visible = self._slx_text(tree, [
+                # `span#productTitle` 必须带上标签名：同一张页面里还有一个
+                # `<input id="productTitle">`（举报低价弹窗），裸 `#productTitle`
+                # 可能选中它。
                 'span#productTitle',
                 'h1 > span',
             ])
             if visible:
-                return visible
+                # 2026-08 改版：后半段在兄弟节点里，见 `_title_differentiator`
+                return self._join_title_parts(
+                    visible, self._title_differentiator(tree))
             if meta:
                 content = meta.attributes.get('content', '')
                 return content.strip() if content else "N/A"
@@ -1110,6 +1232,7 @@ class AmazonParser:
 
         # 逐字段提取（JSON-LD 优先，CSS/XPath 补充）
         result["title"] = jsonld.get("title") or self._parse_title(tree)
+        result["subtitle"] = self._title_differentiator(tree) or "N/A"
         # P4-1：同 selectolax 路径，`zip_code` 恒为请求邮编。
 
         # 商品可售状态检测
@@ -1627,6 +1750,11 @@ class AmazonParser:
             "_completeness": 0,          # 0 == 未测量（契约 §6.4）
             "_parse_engine": None,       # 没有任何引擎跑起来时保持 None
             "title": "N/A",
+            # subtitle 与 title 同源（同一段 Title Differentiators）。404 页上
+            # 两者都不可得，所以这里跟着写占位符。注意它**不是** asin_data 的列
+            # （见 common/core/asindata.py:ASIN_DATA_FIELDS），写入侧按列名取值，
+            # 多这一个键不会落库，只进事件流 payload。
+            "subtitle": "N/A",
             "brand": "N/A",
             "product_type": "N/A",
             "manufacturer": "N/A",
@@ -2223,7 +2351,11 @@ class AmazonParser:
                 '//span[@id="productTitle"]/text()',
                 '//h1/span/text()',
             ])
-            return visible if visible else (meta[0].strip() if meta else "N/A")
+            if not visible:
+                return meta[0].strip() if meta else "N/A"
+            # 2026-08 改版：后半段在兄弟节点里，见 `_title_differentiator`
+            return self._join_title_parts(
+                visible, self._title_differentiator(tree))
         except Exception:
             return "N/A"
 

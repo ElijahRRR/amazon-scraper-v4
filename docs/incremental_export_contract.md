@@ -165,6 +165,8 @@ X-Export-Token: <token>
 
   "slow": {
     "title": "Incr B0INCR0000",
+    "subtitle": null,                            // 副标题；页面没有这一块 -> null
+                                                 // 内容**已包含在 title 里**，见下
     "brand": "IncrBrand",
     "category_path": ["Home", "Tools", "Wrenches"],
     "images": ["https://m.media-amazon.com/images/I/71ABC._AC_SL1500_.jpg"],
@@ -202,6 +204,30 @@ X-Export-Token: <token>
   "recorded_at": "2026-08-05T16:04:27Z"
 }
 ```
+
+### `slow.subtitle` —— 副标题（Title Differentiators）
+
+2026-08 起 Amazon 把商品标题拆成两个元素：`span#productTitle` 装前半段，
+`div.dp-title-differentiators` 装后半段。采集侧把两段用 **Amazon 自己的
+分隔符 `" | "`** 拼成 `slow.title`，**同时**把后半段单独放进 `slow.subtitle`。
+
+| 页面 | `slow.title` | `slow.subtitle` |
+|---|---|---|
+| 有 differentiators | `"前半段 | 后半段"` | `"后半段"` |
+| 没有 | `"前半段"` | `null` |
+
+* **内容是重复的**，这是有意的：给 `subtitle` 是为了让你不必自己按 `" | "`
+  切 `title` —— 标题正文里本来就可能出现 `|`，按它切会切错。
+  要完整标题用 `title`，要只看副标题用 `subtitle`，**不要拿 title 减 subtitle**。
+* `subtitle` **不进 `slow_hash`**：它的内容已经在 `title` 里了，再算一遍等于
+  同一段文本在哈希里数两次。所以副标题变了，`slow_hash` **会**变（经由 title）。
+* 键恒在。`null` 表示这一页没有这一块，与其余字段同一条空值纪律（见下）。
+* 它**也落库**（`asin_data.subtitle`），所以 `/api/results` 与 CSV/xlsx 导出
+  （列名「副标题」，在最右侧）同样有它。老库启动时自动补列，不需要手工 SQL。
+* 这是**追加**字段（§3.2 允许单方面加字段），`contract_version` 仍是 1。
+  老事件也会拿到 —— 但注意：**2026-08 改版之前采的记录，副标题本来就在
+  `#productTitle` 里**，那时 `subtitle` 是 `null` 而 `title` 是完整的。
+  所以 `subtitle` 为 null **不代表**这个商品没有副标题，只代表这条记录没单独拆出来。
 
 **空值语义（重要）**：`null` 与 `[]` 一律表示「**本次采集没取到**」，
 **不表示「该商品没有这个属性」**。软降级页会把面包屑、详情表整块剥掉，

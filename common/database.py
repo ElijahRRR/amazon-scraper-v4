@@ -314,7 +314,13 @@ class Database:
                 seller_id TEXT,
                 seller_name TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                -- 2026-08：副标题（Title Differentiators）。
+                -- ⚠ 必须是**最后一列**（在 created_at/updated_at 之后）：老库靠
+                -- 下面那条 ALTER 升级，而 ALTER 只能追加到末尾。插在 title 后面
+                -- 会让新建库与升级库的物理列序分叉，而 `SELECT d.*` 没有
+                -- response_model，列序整个泄进 erpAPI 的响应。
+                subtitle TEXT
             );
 
             -- 变动记录表（预计算，按类型索引，支持高效筛选）
@@ -478,6 +484,14 @@ class Database:
         # 迁移：asin_data 表添加变体属性字段（多属性产品：本 ASIN 自己的属性值，
         # 形如 "color_name=Red; size_name=L"；非变体产品为空）
         for col in ["variant_attributes"]:
+            try:
+                await self._db.execute(f"ALTER TABLE asin_data ADD COLUMN {col} TEXT")
+                logger.info(f"数据库迁移: asin_data 表新增 {col} 列")
+            except Exception:
+                pass
+
+        # 迁移：asin_data 表添加副标题（2026-08 Amazon Title Differentiators）
+        for col in ["subtitle"]:
             try:
                 await self._db.execute(f"ALTER TABLE asin_data ADD COLUMN {col} TEXT")
                 logger.info(f"数据库迁移: asin_data 表新增 {col} 列")

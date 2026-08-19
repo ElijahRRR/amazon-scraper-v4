@@ -90,6 +90,12 @@ class AsinData:
     seller_name: str = ""
     created_at: str = ""
     updated_at: str = ""
+    # 副标题（2026-08 Amazon Title Differentiators）。放在最后与两份 DDL 的
+    # 物理列序一致 —— 老库靠 ALTER 追加，只能落在末尾。
+    # ⚠ 本 dataclass 的字段顺序**就是** `EXPORTABLE_FIELDS` 的顺序，而后者是
+    # `/api/export/fields` 与所有导出文件的表头顺序（黄金基线的一步）。
+    # 落在末尾 = 导出多一列在最右边，既有列一列没动、没有重排。
+    subtitle: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
