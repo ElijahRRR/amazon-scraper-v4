@@ -137,6 +137,11 @@ ERROR_CODES = frozenset({
     # 一条显式断言看守。登记在这里是为了让「错误码封闭集」名副其实：
     # 一个对外发出去的机器读码不在册，这个集合就只是半个真源。
     "batch_name_conflict",
+    # `GET /api/export/batch/{batch_name}/records` 的唯一 404 含义：**批次名不存在**。
+    # 批次存在但一条事件都没有回 `200 + records: []` —— 404 在这一族端点里
+    # 只能有一个含义，否则消费方分不清"打错名字"和"还没采"（见
+    # export_incremental.py 文件头第 3 条）。
+    "batch_not_found",
     # `POST /api/batches`（JSON 推送）里，同一次请求给同一个 ASIN 两个**不同**
     # 邮编 -> 400。库里表达不了（`tasks` 是 UNIQUE(batch_id, asin)，一个批次里
     # 一个 ASIN 只能有一个邮编），所以明确拒绝而不是静默取第一个。
