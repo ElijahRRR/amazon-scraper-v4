@@ -239,6 +239,12 @@ ASIN 只有一行，后采的覆盖先采的；而 `/api/results?batch_id=` 的 
   - 走 `pg_trgm` GIN 表达式索引，百万级数据下 5-50ms 量级（比 LIKE 全表扫快 ~1000 倍）
   - 短查询（<3 字符）自动 fallback 到 LIKE 路径保证正确性
 - **分页**：keyset cursor 分页，单页上限 1000（近期从 200 上调）
+- **两个减负开关**（默认都关，不传就是原行为）：`fields=a,b,c` 只返回指定列、
+  `with_total=false` 不算全表 COUNT。本端点没有 `response_model`，**82% 的耗时在
+  Python 序列化上**，所以这两个开关冲的是响应体而不是 SQL。
+  实测 100 万行、单页 50 行：默认 `60.9ms / 274.2KB` → 窄投影 `52.1ms / 20.0KB`
+  → 再关掉 total `2.7ms / 20.0KB`。采集结果页已经默认用上（首屏要 total，翻页不要）。
+  ⚠️ 服务端会强制补 `id`/`asin`/`screenshot_path`/`updated_at`；非法列名 **422 拒绝**。
 - **带 `batch_id` 时多四个字段**：`batch_task_status` / `batch_task_updated_at` /
   `batch_asin_data_updated_at` / `batch_has_asin_data`。
   这个端点底层是 `SELECT d.* FROM asin_data d JOIN batch_asins ...`，

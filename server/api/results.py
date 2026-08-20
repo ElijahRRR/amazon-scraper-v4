@@ -72,6 +72,10 @@ import re
 import openpyxl
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 
+# `fields=` 的列名白名单。与 iter_results 的投影白名单**同一个对象** ——
+# 两处对"什么是合法列名"必须给出同一个答案。
+from common.core.asindata import _ASIN_DATA_COLUMN_SET
+
 
 def _srv():
     from server import app as _s
@@ -148,13 +152,69 @@ router = APIRouter()
 MAX_PAGE_LIMIT = 1000
 
 
+#: `fields=` 一次最多接受多少个列名。防的是「拼一个超长 query string 让服务端
+#: 去做无意义的集合运算」，不是功能限制 —— asin_data 一共也才 56 列。
+MAX_FIELDS = 64
+
+
 @router.get("/api/results")
 async def api_results(batch_id: int = None,
                       cursor: int = None,
                       limit: int = Query(50, le=MAX_PAGE_LIMIT),
                       search: str = None,
                       change_filter: str = "all",
-                      direction: str = "next"):
+                      direction: str = "next",
+                      fields: str = None,
+                      with_total: bool = True):
+    """
+    `fields` / `with_total` 是**可选的减负开关**，两个都默认关闭（= 保持原行为）。
+
+    上面 MAX_PAGE_LIMIT 那段实测记着「82% 的账在 Python 序列化上」。这两个参数
+    冲的就是那 82%，它们**不优化 SQL**：
+
+        实测 100 万行、单页 50 行、宽列有真实内容：
+          SELECT d.*（56 列）+ count      54.4 ms    274.2 KB
+          只取 UI 渲染的 15 列              1.2 ms     17.8 KB
+          其中 COUNT(*) 那一条             48.4 ms
+
+    `fields=a,b,c` —— 只返回这些列。**必须默认全给**：`items[]` 的列集是对外
+    契约（docs/erpapi_contract.md §3.2 允许单方面**加**字段、不许删），
+    窄投影只能是调用方显式要的。
+
+    ⚠ 服务端会**强制补上** `id` / `asin` / `screenshot_path` / `updated_at`，
+    即使你没点名 —— 翻页游标与截图路径归一化都要它们。所以返回的键**可能比你
+    要的多**，别按"键集恰好等于我要的"来写解析。
+
+    `with_total=false` —— 不算 `total`，响应里 `total` 是 `null`。
+    它是**全表 COUNT**，随行数线性增长，而翻页途中值恒定不变：只在首屏要一次
+    就够了。
+
+    非法列名 -> **422 拒绝，不静默丢弃**。与 `limit` 超限那条同一个纪律
+    （见上面 MAX_PAGE_LIMIT 的注释）：静默丢弃会让调用方把「这个字段没返回」
+    读成「这个字段是空的」。
+    """
+    cols = None
+    if fields is not None:
+        cols = [f.strip() for f in fields.split(",") if f.strip()]
+        if not cols:
+            raise HTTPException(422, {
+                "error": "invalid_parameter",
+                "message": "fields 给了但一个列名都没有。不想筛就别传这个参数。",
+                "parameter": "fields"})
+        if len(cols) > MAX_FIELDS:
+            raise HTTPException(422, {
+                "error": "invalid_parameter",
+                "message": f"fields 最多 {MAX_FIELDS} 个列名，收到 {len(cols)} 个。",
+                "parameter": "fields"})
+        unknown = sorted(set(cols) - _ASIN_DATA_COLUMN_SET)
+        if unknown:
+            raise HTTPException(422, {
+                "error": "invalid_parameter",
+                "message": (f"未知列名: {', '.join(unknown)}。"
+                            "拼错的列名会被静默丢弃的话，你会把「没返回」读成「是空的」。"),
+                "parameter": "fields",
+                "unknown_fields": unknown})
+
     result = await _srv().db.get_results(
         batch_id=batch_id,
         cursor_id=cursor,
@@ -162,6 +222,8 @@ async def api_results(batch_id: int = None,
         search=search,
         change_filter=change_filter,
         direction=direction,
+        columns=cols,
+        with_total=with_total,
     )
     return result
 

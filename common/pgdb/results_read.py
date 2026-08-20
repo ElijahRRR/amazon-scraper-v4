@@ -138,13 +138,63 @@ class ResultsReadMixin:
     async def get_results(self, batch_id: int = None, cursor_id: int = None,
                           limit: int = 50, search: str = None,
                           change_filter: str = "all",
-                          direction: str = "next") -> Dict:
+                          direction: str = "next",
+                          columns: List[str] = None,
+                          with_total: bool = True) -> Dict:
         """
         获取结果列表（keyset 分页）
         change_filter: all / price_stock / title_bullets / new
         direction: next (向后翻页) / prev (向前翻页)
-        返回: {"items": [...], "has_more": bool, "next_cursor": int, "prev_cursor": int, "total": int}
+        columns: 只取这些列（None = 全部 56 列，**默认行为不变**）
+        with_total: 算不算 total（False -> total 为 None，**默认行为不变**）
+        返回: {"items": [...], "has_more": bool, "next_cursor": int, "prev_cursor": int, "total": int|None}
+
+        ------------------------------------------------------------------
+        columns / with_total 是干什么的
+        ------------------------------------------------------------------
+        `server/api/results.py` 头部那段实测记着「**82% 的账在 Python 序列化
+        上**」。这两个参数就是冲那 82% 去的 —— 它们**不优化 SQL**，
+        优化的是"要吐多大一坨"。
+
+        实测（100 万行、单页 50 行、long_description 等宽列有真实内容）：
+
+            默认 SELECT d.*（56 列）+ count      60.9 ms    274.2 KB
+            首屏：窄投影 + 算 total              52.1 ms     20.0 KB
+            翻页：窄投影 + 不算 total             2.7 ms     20.0 KB
+            其中 COUNT(*) 那一条                 48.4 ms
+
+        采集结果页只渲染 15 个字段，而 `bullet_points`(24KB) / `image_urls`(22KB)
+        / `long_description` 这三个它一个都不显示 —— 274 KB 里约 250 KB 是白发
+        的，还要过公网再让浏览器 parse。
+
+        `total` 是**全表 COUNT**，随行数线性增长且**每次翻页都重算一遍**，
+        而它的值在整个翻页过程中恒定不变。前端只在首屏需要它。
+
+        ------------------------------------------------------------------
+        ⚠ 两个都必须**默认关闭**
+        ------------------------------------------------------------------
+        `items[]` 的列集是对外契约（docs/erpapi_contract.md §3.2：可以单方面
+        **加**字段，不可以删）。所以默认必须是今天这 56 列、必须照算 total；
+        窄投影与省 count 只能是**调用方显式要求**的行为。
+
+        ⚠ `columns` 非空时会**强制补上四列**，即使调用方没要：
+            id             next_cursor / prev_cursor 取的就是它，少了翻页直接断
+            asin           `_hydrate_screenshot_paths` 的查找键
+            screenshot_path 同上（它要就地归一化这一列）
+            updated_at     `_hydrate_batch_task_status` 的 batch_asin_data_updated_at
+        少任何一个都是"看起来能用、翻两页或点开截图才炸"的那种坏法。
         """
+        proj = None
+        if columns:
+            # 白名单过滤：列名会拼进 SQL。端点层已经拒绝过非法列名（422），
+            # 这里是第二道 —— db 层不假设调用方一定是那个端点。
+            wanted = [c for c in dict.fromkeys(columns) if c in _ASIN_DATA_COLUMN_SET]
+            if wanted:
+                for forced in ("id", "asin", "screenshot_path", "updated_at"):
+                    if forced not in wanted:
+                        wanted.append(forced)
+                proj = ", ".join(f"d.{c}" for c in wanted)
+
         join_parts = []
         count_join_parts = []
         join_params: list = []
@@ -243,7 +293,7 @@ class ResultsReadMixin:
 
         # 查询数据（d.id 是 PK，非空且无并列，不需要 NULLS 位置和 tiebreaker）
         sql = f"""
-            SELECT d.* FROM asin_data d
+            SELECT {proj or 'd.*'} FROM asin_data d
             {join_clause}
             WHERE {where_clause}
             ORDER BY d.id {order}
@@ -276,9 +326,13 @@ class ResultsReadMixin:
             count_where_parts = [p for p in where_parts if "d.id" not in p]
             count_where = " AND ".join(count_where_parts) if count_where_parts else "1=1"
 
-        count_sql = f"SELECT COUNT(*) FROM asin_data d {count_join_clause} WHERE {count_where}"
-        async with self.read() as rc, rc.execute(count_sql, count_params) as c:
-            total = (await c.fetchone())[0]
+        # with_total=False -> 整条 count 都不发。它随行数线性增长、且翻页途中
+        # 值恒定不变，前端只在首屏要它。
+        total = None
+        if with_total:
+            count_sql = f"SELECT COUNT(*) FROM asin_data d {count_join_clause} WHERE {count_where}"
+            async with self.read() as rc, rc.execute(count_sql, count_params) as c:
+                total = (await c.fetchone())[0]
 
         next_cursor = items[-1]["id"] if items else None
         prev_cursor = items[0]["id"] if items else None

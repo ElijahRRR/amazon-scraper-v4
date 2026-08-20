@@ -1264,6 +1264,7 @@
                 "summary": "Api Delete Results"
               },
               "get": {
+                "description": "`fields` / `with_total` 是**可选的减负开关**，两个都默认关闭（= 保持原行为）。\n\n上面 MAX_PAGE_LIMIT 那段实测记着「82% 的账在 Python 序列化上」。这两个参数\n冲的就是那 82%，它们**不优化 SQL**：\n\n    实测 100 万行、单页 50 行、宽列有真实内容：\n      SELECT d.*（56 列）+ count      54.4 ms    274.2 KB\n      只取 UI 渲染的 15 列              1.2 ms     17.8 KB\n      其中 COUNT(*) 那一条             48.4 ms\n\n`fields=a,b,c` —— 只返回这些列。**必须默认全给**：`items[]` 的列集是对外\n契约（docs/erpapi_contract.md §3.2 允许单方面**加**字段、不许删），\n窄投影只能是调用方显式要的。\n\n⚠ 服务端会**强制补上** `id` / `asin` / `screenshot_path` / `updated_at`，\n即使你没点名 —— 翻页游标与截图路径归一化都要它们。所以返回的键**可能比你\n要的多**，别按\"键集恰好等于我要的\"来写解析。\n\n`with_total=false` —— 不算 `total`，响应里 `total` 是 `null`。\n它是**全表 COUNT**，随行数线性增长，而翻页途中值恒定不变：只在首屏要一次\n就够了。\n\n非法列名 -> **422 拒绝，不静默丢弃**。与 `limit` 超限那条同一个纪律\n（见上面 MAX_PAGE_LIMIT 的注释）：静默丢弃会让调用方把「这个字段没返回」\n读成「这个字段是空的」。",
                 "operationId": "api_results_api_results_get",
                 "parameters": [
                   {
@@ -1322,6 +1323,25 @@
                       "default": "next",
                       "title": "Direction",
                       "type": "string"
+                    }
+                  },
+                  {
+                    "in": "query",
+                    "name": "fields",
+                    "required": false,
+                    "schema": {
+                      "title": "Fields",
+                      "type": "string"
+                    }
+                  },
+                  {
+                    "in": "query",
+                    "name": "with_total",
+                    "required": false,
+                    "schema": {
+                      "default": true,
+                      "title": "With Total",
+                      "type": "boolean"
                     }
                   }
                 ],
@@ -4536,6 +4556,217 @@
       }
     },
     {
+      "name": "results_narrow_fields",
+      "request": {
+        "data": null,
+        "files": null,
+        "json": null,
+        "method": "GET",
+        "params": {
+          "fields": "asin,title,current_price",
+          "limit": 2
+        },
+        "path": "/api/results"
+      },
+      "response": {
+        "body": {
+          "has_more": true,
+          "items": [
+            {
+              "asin": "B0GOLDEN02",
+              "current_price": "33.50",
+              "id": 3,
+              "screenshot_path": null,
+              "title": "Golden Test Product B0GOLDEN02",
+              "updated_at": "<VOLATILE>"
+            },
+            {
+              "asin": "B0GOLDEN03",
+              "current_price": "19.99",
+              "id": 2,
+              "screenshot_path": null,
+              "title": "Golden Test Product B0GOLDEN03",
+              "updated_at": "<VOLATILE>"
+            }
+          ],
+          "next_cursor": 2,
+          "prev_cursor": 3,
+          "total": 3
+        },
+        "content_type": "application/json",
+        "status": 200
+      }
+    },
+    {
+      "name": "results_without_total",
+      "request": {
+        "data": null,
+        "files": null,
+        "json": null,
+        "method": "GET",
+        "params": {
+          "limit": 2,
+          "with_total": "false"
+        },
+        "path": "/api/results"
+      },
+      "response": {
+        "body": {
+          "has_more": true,
+          "items": [
+            {
+              "asin": "B0GOLDEN02",
+              "baseline_buybox_price": "33.50",
+              "baseline_price": "33.50",
+              "baseline_stock_count": "9",
+              "baseline_stock_status": "In Stock",
+              "baseline_title_bullets_hash": "6d39ef571dc7bf88cb62e5ff8f857d8d",
+              "baseline_updated_at": "<VOLATILE>",
+              "best_sellers_rank": "#123 in Test",
+              "brand": "GoldenBrand",
+              "bullet_points": "point one|point two",
+              "buybox_price": "33.50",
+              "buybox_shipping": "0.00",
+              "category_ids": "c1,c2",
+              "category_tree": "Home > Test > Sub",
+              "content_hash": "d608fc205fbfe478665c624edc858f1d",
+              "country_of_origin": "China",
+              "crawl_time": "<VOLATILE>",
+              "created_at": "<VOLATILE>",
+              "current_price": "33.50",
+              "delivery_date": "2026-08-10",
+              "delivery_time": "3 days",
+              "ean_list": "",
+              "first_available_date": "2025-01-01",
+              "id": 3,
+              "image_urls": "https://m.media-amazon.com/images/I/71GOLDEN01._AC_SL1500_.jpg",
+              "is_customized": "No",
+              "is_fba": "Yes",
+              "item_dimensions": "9 x 4 x 1 inches",
+              "item_weight": "1.2 pounds",
+              "long_description": "a long description",
+              "manufacturer": "GoldenMfg",
+              "model_number": "MDL-02",
+              "original_price": "29.99",
+              "package_dimensions": "10 x 5 x 2 inches",
+              "package_weight": "1.5 pounds",
+              "parent_asin": "B0GOLDEN02",
+              "part_number": "PN-02",
+              "product_type": "TestType",
+              "product_url": "https://www.amazon.com/dp/B0GOLDEN02",
+              "rating": "4.5",
+              "review_count": "128",
+              "root_category_id": "root123",
+              "screenshot_path": null,
+              "seller_id": "AGOLDENSELLER",
+              "seller_name": "Golden Seller",
+              "site": "US",
+              "stock_count": "9",
+              "stock_status": "In Stock",
+              "subtitle": "Snap-in Liner,Heavy Duty,Hotel Grade",
+              "title": "Golden Test Product B0GOLDEN02",
+              "title_bullets_hash": "6d39ef571dc7bf88cb62e5ff8f857d8d",
+              "upc_list": "012345678905",
+              "updated_at": "<VOLATILE>",
+              "variant_attributes": "color_name=Red; size_name=L",
+              "variation_asins": "",
+              "zip_code": "10001"
+            },
+            {
+              "asin": "B0GOLDEN03",
+              "baseline_buybox_price": "19.99",
+              "baseline_price": "19.99",
+              "baseline_stock_count": "42",
+              "baseline_stock_status": "In Stock",
+              "baseline_title_bullets_hash": "8a1d46aa03468120efb7aced9432780f",
+              "baseline_updated_at": "<VOLATILE>",
+              "best_sellers_rank": "#123 in Test",
+              "brand": "GoldenBrand",
+              "bullet_points": "point one|point two",
+              "buybox_price": "19.99",
+              "buybox_shipping": "0.00",
+              "category_ids": "c1,c2",
+              "category_tree": "Home > Test > Sub",
+              "content_hash": "6dcb11422913c415fd1de87e070f36ea",
+              "country_of_origin": "China",
+              "crawl_time": "<VOLATILE>",
+              "created_at": "<VOLATILE>",
+              "current_price": "19.99",
+              "delivery_date": "2026-08-10",
+              "delivery_time": "3 days",
+              "ean_list": "",
+              "first_available_date": "2025-01-01",
+              "id": 2,
+              "image_urls": "https://m.media-amazon.com/images/I/71GOLDEN01._AC_SL1500_.jpg",
+              "is_customized": "No",
+              "is_fba": "Yes",
+              "item_dimensions": "9 x 4 x 1 inches",
+              "item_weight": "1.2 pounds",
+              "long_description": "a long description",
+              "manufacturer": "GoldenMfg",
+              "model_number": "MDL-03",
+              "original_price": "29.99",
+              "package_dimensions": "10 x 5 x 2 inches",
+              "package_weight": "1.5 pounds",
+              "parent_asin": "B0GOLDEN03",
+              "part_number": "PN-03",
+              "product_type": "TestType",
+              "product_url": "https://www.amazon.com/dp/B0GOLDEN03",
+              "rating": "4.5",
+              "review_count": "128",
+              "root_category_id": "root123",
+              "screenshot_path": null,
+              "seller_id": "AGOLDENSELLER",
+              "seller_name": "Golden Seller",
+              "site": "US",
+              "stock_count": "42",
+              "stock_status": "In Stock",
+              "subtitle": "Snap-in Liner,Heavy Duty,Hotel Grade",
+              "title": "Golden Test Product B0GOLDEN03",
+              "title_bullets_hash": "8a1d46aa03468120efb7aced9432780f",
+              "upc_list": "012345678905",
+              "updated_at": "<VOLATILE>",
+              "variant_attributes": "color_name=Red; size_name=L",
+              "variation_asins": "",
+              "zip_code": "10001"
+            }
+          ],
+          "next_cursor": 2,
+          "prev_cursor": 3,
+          "total": null
+        },
+        "content_type": "application/json",
+        "status": 200
+      }
+    },
+    {
+      "name": "results_bad_field",
+      "request": {
+        "data": null,
+        "files": null,
+        "json": null,
+        "method": "GET",
+        "params": {
+          "fields": "title,no_such_column"
+        },
+        "path": "/api/results"
+      },
+      "response": {
+        "body": {
+          "detail": {
+            "error": "invalid_parameter",
+            "message": "未知列名: no_such_column。拼错的列名会被静默丢弃的话，你会把「没返回」读成「是空的」。",
+            "parameter": "fields",
+            "unknown_fields": [
+              "no_such_column"
+            ]
+          }
+        },
+        "content_type": "application/json",
+        "status": 422
+      }
+    },
+    {
       "name": "result_detail",
       "request": {
         "data": null,
@@ -5697,7 +5928,7 @@
           "__html__": {
             "has_jinja_error": false,
             "has_traceback": false,
-            "size_bucket": 26
+            "size_bucket": 27
           }
         },
         "content_type": "text/html",

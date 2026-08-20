@@ -363,6 +363,8 @@ status.status == "completed"
 | `search` | str | `null` | 服务端截到 500 字符，逗号分隔最多 10 个词，每词截到 100 字符；多词是 OR；匹配 asin/title/brand |
 | `change_filter` | str | `"all"` | `all` / `price_stock` / `title_bullets` / `new` |
 | `direction` | str | `"next"` | ⚠ **只有 `next` 和 `prev` 两个值有定义**，见下 |
+| `fields` | str | `null`（= 全部列） | 逗号分隔的列名。**非法列名 422 拒绝，不静默丢弃** |
+| `with_total` | bool | `true` | `false` → 不算 `total`（响应里是 `null`） |
 
 > ⚠ **`direction` 的非法值不会报错**。实现是
 > `order = "DESC" if direction == "next" else "ASC"`（`common/pgdb/results_read.py:242`），
@@ -384,6 +386,34 @@ status.status == "completed"
 | `next_cursor` | 下一页的游标（`direction=next` 用）= 本页最后一行的 `id` |
 | `prev_cursor` | 上一页的游标（`direction=prev` 用）= 本页第一行的 `id` |
 | `total` | **不含游标谓词**的全集计数。翻页途中恒定不变，可以直接拿去算进度条 |
+
+#### 两个减负开关：`fields` 与 `with_total`
+
+**默认都关着，不传就是今天的行为。** 它们冲的是响应体，不是 SQL ——
+本端点没有 `response_model`，走 FastAPI 的通用 `jsonable_encoder` →
+`json.dumps`，**82% 的耗时在 Python 序列化上**（`server/api/results.py`
+头部有完整实测）。
+
+实测（100 万行、单页 50 行、`long_description` 等宽列有真实内容）：
+
+| | 耗时 | 响应体 |
+|---|---|---|
+| 默认（56 列 + count） | 60.9 ms | 274.2 KB |
+| `fields=`（15 列）+ count | 52.1 ms | 20.0 KB |
+| `fields=` + `with_total=false` | **2.7 ms** | **20.0 KB** |
+
+`fields=asin,title,current_price` —— 只返回这些列。
+
+⚠ 服务端会**强制补上** `id` / `asin` / `screenshot_path` / `updated_at`，
+即使你没点名（翻页游标与截图路径归一化要用）。所以**返回的键可能比你要的多**，
+别按"键集恰好等于我要的"写解析。
+
+⚠ 非法列名 → **422**，不静默丢弃。拼错的列名被悄悄丢掉的话，
+你会把「这个字段没返回」读成「这个字段是空的」。与 `limit` 超限同一个纪律。
+
+`with_total=false` —— `total` 返回 `null`。它是**全表 COUNT**，随行数线性增长，
+而翻页途中值恒定不变：**首屏要一次就够**，之后一路 `false`。
+翻页的终止条件始终是 `has_more`，**不是** `total`（§5.6 已经说过这一点）。
 
 #### 带 `batch_id` 时**多四个字段**：这一行是不是本批采的
 
@@ -1216,6 +1246,10 @@ if r["status"] == "completed":      # ✅ 权威判据
 | 入队失败绝不影响采集主路径 | `…::test_enqueue_failure_never_breaks_the_write_path` |
 | 非终态失败不发事件；终态失败发 `parse_failed`；stale 提交发 `stale` | `tests/test_batch_records_export.py::RetryTimelineTests` |
 | 终态失败 → 重试 → 成功：流里两条，后一条 cursor 更大 | `…::test_failed_then_success_leaves_both_records` |
+| `fields=` 窄投影：行集不变、强制列必在、翻页照常 | `tests/test_results_projection.py::ProjectionTests` |
+| 非法列名 422 拒绝而不是静默丢弃（含注入形状） | `…::test_unknown_field_is_rejected_not_silently_dropped` / `…::test_injection_attempt_is_rejected` |
+| `with_total=false` 时 `total` 为 null 且 `has_more` 照常 | `…::WithTotalTests` |
+| **不传这两个参数时响应与改动前逐字段相同**（契约 §3.2 不许删字段） | `…::DefaultUnchangedTests::test_default_response_is_unchanged` |
 | 两个后端行为逐字节一致 | `python -m tests.golden.run verify` / `DB_BACKEND=postgres … verify` |
 
 **门禁**（改了本文覆盖的任何行为都要全绿）：

@@ -268,6 +268,16 @@ def run(rec: Recorder) -> None:
     # 而黄金场景是单向递进的、不适合塞这种交叉状态）。
     rec.call("results_by_batch", "GET", "/api/results", expect=200,
              params={"batch_id": ok_tasks[0]["batch_id"]})
+    # 两个减负开关。**默认那几步必须与它们逐字节不同** —— 上面
+    # results_page1 / results_by_batch 是全 56 列 + 有 total，
+    # 下面这两步是窄投影 / total=null。两种形状同时钉在基线里，
+    # 「默认行为没变」这件事才有守卫（契约 §3.2 只许加字段、不许删）。
+    rec.call("results_narrow_fields", "GET", "/api/results", expect=200,
+             params={"fields": "asin,title,current_price", "limit": 2})
+    rec.call("results_without_total", "GET", "/api/results", expect=200,
+             params={"with_total": "false", "limit": 2})
+    rec.call("results_bad_field", "GET", "/api/results", expect=422,
+             params={"fields": "title,no_such_column"})
     rec.call("result_detail", "GET", f"/api/results/{ok_tasks[0]['asin']}", expect=200)
     rec.call("result_detail_missing", "GET", "/api/results/B0NOTEXIST", expect=404)
     rec.call("change_stats", "GET", "/api/changes/stats", expect=200)
