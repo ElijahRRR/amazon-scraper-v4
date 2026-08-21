@@ -1250,6 +1250,12 @@ if r["status"] == "completed":      # ✅ 权威判据
 | 非法列名 422 拒绝而不是静默丢弃（含注入形状） | `…::test_unknown_field_is_rejected_not_silently_dropped` / `…::test_injection_attempt_is_rejected` |
 | `with_total=false` 时 `total` 为 null 且 `has_more` 照常 | `…::WithTotalTests` |
 | **不传这两个参数时响应与改动前逐字段相同**（契约 §3.2 不许删字段） | `…::DefaultUnchangedTests::test_default_response_is_unchanged` |
+| 增量导出 `fields=` 裁块/点号路径，行集与游标不变 | `tests/test_incremental_fields_and_gzip.py::ProjectionTests` |
+| 身份六键（含 `cursor`/`outcome`）任何投影下恒返回 | `…::test_identity_fields_survive_any_projection` |
+| 非法字段 422 拒绝；点号只允许一层 | `…::test_unknown_field_is_rejected_not_silently_dropped` |
+| **不传 `fields=` 时响应与改动前逐字段相同**（契约 v1） | `…::DefaultUnchangedTests` |
+| 两个导出端点共用同一套投影语义 | `…::test_batch_endpoint_shares_the_same_projection` |
+| 大 JSON 走 gzip 且解压后内容不变；小响应与 PNG 不压 | `…::GzipTests` |
 | 两个后端行为逐字节一致 | `python -m tests.golden.run verify` / `DB_BACKEND=postgres … verify` |
 
 **门禁**（改了本文覆盖的任何行为都要全绿）：

@@ -451,6 +451,91 @@ def _to_record(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# ============================================================ fields= 投影
+
+#: **永远返回、不可裁掉**的顶层键。它们是这条记录的身份、顺序与有效性：
+#:   source_id      幂等键（契约 §4.1，消费侧去重靠它）
+#:   cursor         推进游标；少了它调用方连"下一页从哪开始"都不知道
+#:   asin           分组键的一半
+#:   marketplace    分组键的另一半（与 scrape_params.zipcode 一起构成三元组）
+#:   scraped_at     这条事实发生的时刻
+#:   outcome        `!= 'ok'` 的记录不许 upsert products（契约正文）——
+#:                  裁掉它，消费侧会把一条失败记录当成功数据写进商品库
+#: 合计约 200 字节/条，省不出什么，却是唯一能防住"裁出一份不可用数据"的东西。
+_FIELDS_ALWAYS = ("source_id", "cursor", "asin", "marketplace",
+                  "scraped_at", "outcome")
+
+#: 可裁的顶层键（块 + 标量）。点号路径只在前四个块里有意义。
+_FIELDS_BLOCKS = ("scrape_params", "slow", "fast", "raw")
+_FIELDS_SCALARS = ("slow_hash", "review_hash", "completeness_ok", "recorded_at")
+
+#: `fields=` 一次最多几个。asin_data 一共 56 列，块加起来也就几十项 ——
+#: 这个上限防的是"拼个超长 query string 让服务端做无意义的集合运算"。
+MAX_FIELDS = 64
+
+
+def _fields_spec(raw_fields: str):
+    """`"fast,slow.title"` -> ({顶层键}, {块: {子键}})；非法名字抛 ValueError。
+
+    **拒绝而不是静默丢弃**（与 limit 超限、与 /api/results 的 fields= 同一条
+    纪律）：拼错的字段被悄悄丢掉的话，调用方会把「这个字段没返回」读成
+    「这个字段是空的」—— 而对增量流来说那等于把一条有价的记录当成空值写进库。
+    """
+    names = [f.strip() for f in raw_fields.split(",") if f.strip()]
+    if not names:
+        raise ValueError("fields 给了但一个名字都没有。不想筛就别传这个参数。")
+    if len(names) > MAX_FIELDS:
+        raise ValueError(f"fields 最多 {MAX_FIELDS} 项，收到 {len(names)} 项。")
+
+    top, sub, unknown = set(), {}, []
+    for n in names:
+        if "." in n:
+            block, _, leaf = n.partition(".")
+            # ⚠ `not leaf` 与 `"." in leaf` 都要挡：`partition` 只切第一个点，
+            # 所以 `slow.weight.package` 会得到 leaf="weight.package"。放过它
+            # 的话裁出来是 `slow: {}` —— 一个**静默的空块**，调用方会把它读成
+            # "这条记录没有 slow 数据"。点号只支持一层，两层直接拒。
+            if block not in _FIELDS_BLOCKS or not leaf or "." in leaf:
+                unknown.append(n)
+                continue
+            top.add(block)
+            sub.setdefault(block, set()).add(leaf)
+        elif n in _FIELDS_BLOCKS or n in _FIELDS_SCALARS:
+            top.add(n)
+        else:
+            unknown.append(n)
+    if unknown:
+        raise ValueError(
+            "未知字段: " + ", ".join(sorted(unknown)) +
+            "。可选顶层键: " + ", ".join(sorted(_FIELDS_BLOCKS + _FIELDS_SCALARS)) +
+            "；块内可用点号，如 slow.title。"
+            f"（{', '.join(_FIELDS_ALWAYS)} 恒返回，不必也不能筛掉）")
+    return top, sub
+
+
+def _prune(rec: Dict[str, Any], top, sub) -> Dict[str, Any]:
+    """按 `fields=` 裁一条 record。
+
+    ⚠ 先**完整构造**再裁，不是"按需构造" —— 刻意的：`_to_record` 是本仓库
+    两个导出端点共用的唯一映射（tests/test_batch_records_export.py 逐字段
+    比对过），改成按需构造就会分裂成"全量一条路径、投影另一条路径"，
+    而那两条路径迟早对同一行给出不同答案。
+
+    代价是省不掉 `_to_record` 那 409ms/500 条；但实测账目里真正的大头是
+    **传输**（3.4 MB 过公网 7~10s），裁完 3.4MB -> ~1MB 那部分照样省到。
+    """
+    out = {k: rec[k] for k in _FIELDS_ALWAYS if k in rec}
+    for k in top:
+        if k not in rec:
+            continue
+        leaves = sub.get(k)
+        if leaves and isinstance(rec[k], dict):
+            out[k] = {kk: vv for kk, vv in rec[k].items() if kk in leaves}
+        else:
+            out[k] = rec[k]
+    return out
+
+
 # ============================================================ 鉴权
 
 _warned_anonymous = False
@@ -496,11 +581,17 @@ def _check_token(token: Optional[str]) -> Optional[JSONResponse]:
 async def export_incremental(
     cursor: int = Query(0, ge=0, description="独占下界，返回 cursor 大于它的记录；从头拉传 0"),
     limit: int = Query(DEFAULT_LIMIT, ge=1, le=MAX_LIMIT),
+    fields: str = Query(None, description="只返回这些字段；不传 = 全给（默认行为不变）"),
     x_export_token: Optional[str] = Header(None, alias="X-Export-Token"),
 ):
     denied = _check_token(x_export_token)
     if denied is not None:
         return denied
+
+    try:
+        spec = _fields_spec(fields) if fields is not None else None
+    except ValueError as exc:
+        return _sync._err(422, "invalid_parameter", str(exc), parameter="fields")
 
     unavailable = _sync._unavailable()
     if unavailable is not None:
@@ -557,8 +648,11 @@ async def export_incremental(
     has_more = len(rows) > limit
     rows = rows[:limit]
     records = [_to_record(dict(r)) for r in rows]
-    # 游标只推进到**真正投递过的那一条**。空页不推进 —— 这是唯一不丢数据的方向。
+    # 游标要在**裁剪之前**取：cursor 是 _FIELDS_ALWAYS 之一、裁不掉，
+    # 但顺序写反了就会依赖那条保证，而那是个隐式耦合。
     next_cursor = records[-1]["cursor"] if records else cursor
+    if spec is not None:
+        records = [_prune(r, *spec) for r in records]
 
     return JSONResponse(content={
         "contract_version": CONTRACT_VERSION,
@@ -580,6 +674,7 @@ async def export_batch_records(
     batch_name: str,
     cursor: int = Query(0, ge=0, description="独占下界，返回 cursor 大于它的记录；从头拉传 0"),
     limit: int = Query(BATCH_DEFAULT_LIMIT, ge=1, le=MAX_LIMIT),
+    fields: str = Query(None, description="只返回这些字段；不传 = 全给（默认行为不变）"),
     x_export_token: Optional[str] = Header(None, alias="X-Export-Token"),
 ):
     """**这一批次真正采到了什么** —— 逐次采集事件，不是"最新态"。
@@ -654,6 +749,13 @@ async def export_batch_records(
     if denied is not None:
         return denied
 
+    # 与全量流**同一个** _fields_spec：两个端点共用 _to_record，投影语义
+    # 也必须共用，否则同一条记录在两条路上会裁出两种形状。
+    try:
+        spec = _fields_spec(fields) if fields is not None else None
+    except ValueError as exc:
+        return _sync._err(422, "invalid_parameter", str(exc), parameter="fields")
+
     unavailable = _sync._unavailable()
     if unavailable is not None:
         return unavailable
@@ -709,6 +811,8 @@ async def export_batch_records(
     records = [_to_record(dict(r)) for r in rows]
     # 与全量流同一条纪律：游标只推进到**真正投递过的那一条**，空页不推进。
     next_cursor = records[-1]["cursor"] if records else cursor
+    if spec is not None:
+        records = [_prune(r, *spec) for r in records]
 
     return JSONResponse(content={
         "contract_version": CONTRACT_VERSION,
