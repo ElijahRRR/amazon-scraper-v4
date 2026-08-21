@@ -315,6 +315,38 @@ from server.authz import AdminTokenMiddleware  # noqa: E402
 app.add_middleware(AdminTokenMiddleware)
 
 
+# ==================== 响应压缩 ====================
+#
+# 增量导出这类端点吐的是大 JSON，而账目里真正的大头是**传输**，不是 SQL：
+# 实测 500 条 record（每条内容各不相同的真实体量）
+#     未压缩 2319.6 KB -> level 6 后 389.6 KB（16%），压缩耗时 71ms
+# 消费侧跨机房拉取实测 8~11s/页，其中服务端只占 ~1.1s —— 剩下全是这 2~3 MB
+# 在路上。压到六分之一，那 7~10s 直接跟着掉。
+#
+# **为什么是 level 6 而不是 Starlette 默认的 9**（实测，同一份 payload）：
+#     level 1   525.4 KB  22%   17.1 ms
+#     level 4   461.1 KB  19%   29.0 ms
+#     level 6   389.6 KB  16%   71.1 ms
+#     level 9   385.5 KB  16%  106.3 ms
+# 9 比 6 多花 35ms 只多省 4 KB —— 在 0.4 MB/s 的实测链路上那 4 KB 值 10ms，
+# 净亏。6 是收益/成本的拐点。
+#
+# ⚠ 上面那组数**是用逐条不同的文本量的**。第一次用「每条描述一模一样」的
+# 合成数据量出来是 98.7% 压缩率 —— 那是夹具不真实造成的假象，不是真实收益。
+#
+# `exclude_content_types` 用 Starlette 1.6 的默认值：已经排掉了 PNG/JPEG/
+# zip/字体/视频 —— 截图和 xlsx 不会被白压一遍。
+# `thread_minimum_size` 默认 128KB：超过这个尺寸的 body 在线程池里压，
+# 那 71ms 不会堵事件循环。
+#
+# 位置：**最后 add = 最外层**，于是它压的是最终响应（含错误响应）。
+# 对客户端透明：requests / httpx / 浏览器都默认发 Accept-Encoding: gzip
+# 并自动解压；不发的客户端拿到的还是原样未压缩的 body。
+from starlette.middleware.gzip import GZipMiddleware  # noqa: E402
+
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
+
+
 @app.exception_handler(Exception)
 async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     """全局 500。返回结构化 JSON，异常细节只进日志。

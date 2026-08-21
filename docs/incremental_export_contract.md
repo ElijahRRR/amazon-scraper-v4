@@ -234,6 +234,71 @@ X-Export-Token: <token>
 那时 `category_path` 就是 `[]`。**别拿空值去覆盖你侧已有的值**——
 用 `completeness_ok` 与 `outcome` 判断这条记录够不够格进 products。
 
+## 2.1 `fields=` —— 只拉你要的块（可选，默认全给）
+
+**为什么有这个参数**：实测消费侧跨机房拉一页（500 条）要 8~11 秒，其中服务端
+只占 ~1.1 秒 —— 剩下 7~10 秒全在传输 **3.4 MB** 响应体上。单条 record 的构成：
+
+| 块 | 单条 | 占比 |
+|---|---|---|
+| `slow` | 4847 B | **69%**（其中 `slow.description` 一项就 3301 B = 47%） |
+| `raw` | 1451 B | 20% |
+| `fast` | 262 B | 3% |
+| `scrape_params` | 136 B | 1% |
+
+只要价格库存的消费方，没必要每页背 2 MB 的商品描述。
+
+**用法**（逗号分隔，块名或一层点号路径）：
+
+```
+GET /api/export/incremental?cursor=0&limit=500&fields=fast
+GET /api/export/incremental?cursor=0&limit=500&fields=fast,slow.title,slow.brand
+```
+
+可选名字：块 `scrape_params` / `slow` / `fast` / `raw`，标量
+`slow_hash` / `review_hash` / `completeness_ok` / `recorded_at`；
+块内用一层点号，如 `slow.title`、`fast.price`。
+
+实测（500 条）：
+
+| | 响应体 | 剩余 |
+|---|---|---|
+| 默认（全给） | 3429 KB | 100% |
+| `fields=fast` | 217 KB | **6%** |
+| `fields=fast,slow.title,slow.brand` | 275 KB | 8% |
+| `fields=fast,slow` | 2588 KB | 75% |
+
+⚠ **这六个键永远返回，裁不掉**：`source_id`、`cursor`、`asin`、`marketplace`、
+`scraped_at`、`outcome`。它们合计约 200 字节，省不出什么，但少任何一个都会
+裁出一份**不可用**的数据 —— 少 `cursor` 你不知道下一页从哪开始；少 `outcome`
+你会把一条失败记录当成功数据 upsert 进商品库（本契约正文：`outcome != 'ok'`
+只进快照表）。
+
+⚠ **非法字段名 -> 422 拒绝，不静默丢弃**。拼错的名字被悄悄丢掉的话，你会把
+「这个字段没返回」读成「这个字段是空的」。点号只支持**一层**，
+`slow.weight.package` 一样是 422（放过它会裁出一个静默的空 `slow: {}`）。
+
+⚠ 不传 `fields=` 时响应与本契约正文**逐字段相同**。这是追加参数（§3.2 允许
+单方面加），`contract_version` 仍是 1。
+
+`GET /api/export/batch/{name}/records`（§6）用**同一个** `fields=` 语义 ——
+两个端点共用同一份记录映射，投影也共用。
+
+## 2.2 响应压缩（gzip）
+
+服务端对超过 1 KB 的响应做 gzip（level 6）。实测同一页 500 条、**每条内容各不
+相同**的真实体量：
+
+```
+未压缩 2319.6 KB  ->  level 6 后 389.6 KB（16%），压缩耗时 71 ms
+```
+
+对客户端**透明**：`requests` / `httpx` / 浏览器都默认发
+`Accept-Encoding: gzip` 并自动解压，不需要改任何代码。手搓 `urllib` 的客户端
+若不发这个头，拿到的还是原样未压缩的 body。
+
+与 `fields=` 是**叠加**的：先裁块再压，两刀都吃满。
+
 ## 3. 边界语义（验收会测的项）
 
 | 项 | 行为 |

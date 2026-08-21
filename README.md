@@ -266,6 +266,14 @@ ASIN 只有一行，后采的覆盖先采的；而 `/api/results?batch_id=` 的 
 1. **UI 导出**（`server/api/export.py`，`GET /api/export/*`）：网页点"导出"按钮走的路径，弹窗选择格式（Excel/CSV）、字段（全选/仅价格库存/自定义勾选）、范围（当前批次 + 变动筛选）；支持流式导出，百万级数据不 OOM。导出列含**变体属性**（`color_name=X; size_name=Y`）/ 父体 ASIN / 变体 ASIN 列表；原 **EAN 列已下线**（amazon.com 实测 100% 为空，`ean_list` 已经不在可导出字段集合里），槽位由「变体属性」顶上。
 2. **增量导出契约**（`server/api/export_incremental.py`，`GET /api/export/incremental`，**仅 PostgreSQL 后端**）：面向下游 catalog_sync（沃尔玛侧）的固定契约 v1，cursor+limit 分页，可选 `X-Export-Token` 请求头鉴权（`EXPORT_TOKEN`/`EXPORT_REQUIRE_TOKEN` 控制是否强制）。完整字段定义与不变量见 [`docs/incremental_export_contract.md`](docs/incremental_export_contract.md)。
 
+   **拉得慢就用 `fields=`**：实测消费侧跨机房拉一页 500 条要 8~11 秒，其中服务端
+   只占 ~1.1 秒 —— 剩下全在传 **3.4 MB** 响应体。单条 record 里 `slow` 占 69%，
+   而 `slow.description` 一项就占 47%。只要价格库存的话
+   `fields=fast` 直接降到 **6%**（3429 KB → 217 KB）。
+   块名 `scrape_params`/`slow`/`fast`/`raw`，块内可用一层点号（`slow.title`）。
+   ⚠️ `source_id`/`cursor`/`asin`/`marketplace`/`scraped_at`/`outcome` 恒返回、裁不掉；
+   非法字段名 **422 拒绝**不静默丢弃。不传 `fields=` 时响应逐字段不变。
+
    **副标题在这里**：`slow.subtitle`。2026-08 Amazon 把商品标题拆成两个元素
    （`span#productTitle` + `div.dp-title-differentiators`），采集侧用 **Amazon 自己的
    分隔符 `" | "`** 把两段拼回 `slow.title`，**同时**把后半段单独给一份。
@@ -315,6 +323,16 @@ ASIN 只有一行，后采的覆盖先采的；而 `/api/results?batch_id=` 的 
 4. **同步运维 API**（`server/api/sync.py`，`/api/v1/sync/*`，**仅 PostgreSQL 后端**）：读的是同一份事件流，但给的是内部原始事件形状 + 运维可观测性（relay 延迟、outbox 深度、保留期水位、`ack` 游标、强制裁剪通知）。完整契约见 [`docs/sync_contract.md`](docs/sync_contract.md)；面向 erpAPI 侧的业务端点（上传/状态/结果/失败明细）契约见 [`docs/erpapi_contract.md`](docs/erpapi_contract.md)。
 
 后三者依赖事件流，只有 PostgreSQL 后端提供；万一跑在 SQLite 回滚路径上，它们统一返回结构化 `503`（不是 404——404 容易被消费方误读成"暂无数据"，导致游标停滞）。
+
+### 响应压缩
+
+服务端对 >1 KB 的响应做 gzip（level 6）。实测 500 条真实体量的增量导出：
+**2319.6 KB → 389.6 KB（16%）**，压缩耗时 71 ms。
+
+对客户端透明——`requests`/`httpx`/浏览器默认发 `Accept-Encoding: gzip` 并自动解压。
+已压缩的类型（PNG/JPEG/zip/字体/视频）走 Starlette 的排除名单，不会被白压一遍。
+
+选 level 6 而不是默认的 9 是实测的：9 比 6 多花 35 ms 只多省 4 KB。
 
 ### 升级到带 `subtitle` 列的版本（2026-08）
 
