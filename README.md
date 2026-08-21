@@ -334,6 +334,87 @@ ASIN 只有一行，后采的覆盖先采的；而 `/api/results?batch_id=` 的 
 
 选 level 6 而不是默认的 9 是实测的：9 比 6 多花 35 ms 只多省 4 KB。
 
+⚠ 上面是沙箱夹具的数字，真实数据更难压（线上全字段量到 24%）。
+更要紧的是：**放在反代后面时这一节可能整节静默失效** —— 见下一节。
+
+### 反向代理（nginx）：别让 `Accept-Encoding` 被抹掉
+
+压缩在 **FastAPI 侧**做（见上一节）。放在应用里而不是 nginx 里是有意的：换掉前面
+任何一层反代它都还在，而且有测试盖着。但它有一个**静默失效**的前提 ——
+上游必须真的收到 `Accept-Encoding: gzip`。
+
+反代配置里这一行会让整节改动完全作废：
+
+```nginx
+proxy_set_header Accept-Encoding "";
+```
+
+这行在 nginx 配方里极常见（`sub_filter` 需要它，「让 nginx 自己压」的教程也教它）。
+一旦有，`GZipMiddleware` 收到的请求就没有 `Accept-Encoding`，直接放行不压 ——
+**没有任何报错、没有任何日志**，只是响应体大了四倍。2026-08 线上就踩过：
+FastAPI 直连 710,184 字节，同一请求走公网 2,938,176 字节且响应头里没有
+`Content-Encoding`。
+
+三个不必配的（这几点容易被误传）：
+
+* **不需要 `gzip_proxied any;`**。它只在**你想让 nginx 来压上游响应**时才有意义。
+  上游已经压好了，nginx 不用参与。
+* **不需要为 `Content-Encoding` 配透传**。`proxy_pass` 不改上游响应头，
+  `proxy_hide_header` 的默认名单只有 `Date / Server / X-Pad / X-Accel-*`，不含它。
+* **也不会双压**。`ngx_http_gzip_module` 遇到已带 `Content-Encoding` 的响应直接跳过，
+  所以上游压过之后 nginx 那边 `gzip on` 只是空转，客户端永远只需解一层。
+
+若通用 location 因为 `sub_filter` 改写 UI 路径而必须保留那一行，就给 API 单开一个
+更具体的 location（`^~` 保证它优先于通用前缀匹配）：
+
+```nginx
+location ^~ /amazon-v4/api/ {
+    proxy_pass http://127.0.0.1:8899/api/;
+
+    # 关键：不要在这里 set Accept-Encoding —— 让客户端的原样透传到 FastAPI
+    proxy_http_version 1.1;          # 默认 1.0，会让到上游的 keepalive 失效
+    proxy_set_header Connection "";  # 配合上一行启用上游连接复用
+
+    proxy_buffering on;              # 默认即 on，确认没被别处关掉
+    proxy_read_timeout 300s;         # 大 limit 的导出服务端就要 1s+，跨机房再加传输
+}
+```
+
+把 API 整族（而不只是 `/api/export/`）放进来是有理由的：`/api/results` 的
+`fields=` / `with_total=` 同样靠压缩才能吃满，而 `sub_filter` 对 JSON 本来就是空转
+（`sub_filter_types` 不设时只作用于 `text/html`），导出里唯一像路径的字段
+`screenshot_path` 是库里存的相对路径、由客户端自己拼，不经反代改写。所以让 API
+绕开 `sub_filter` 是**无损**的。
+
+截图取图那类二进制端点不用特殊处理：`image/png` / `image/jpeg` 在 Starlette 的
+默认排除名单里（见上一节），不会被白压一遍。
+
+**改完必须实测**，因为这个失败模式不报错：
+
+```bash
+# 1. 响应头里应出现 content-encoding: gzip
+curl -sI -H 'Accept-Encoding: gzip' -H "X-Export-Token: $EXPORT_TOKEN" \
+  'http://<host>/amazon-v4/api/export/incremental?limit=500'
+
+# 2. 压缩前后字节数对比；两行一样大就是压根没压上
+for ae in gzip identity; do
+  echo -n "$ae: "
+  curl -s -o /dev/null -w '%{size_download} bytes  %{time_total}s\n' \
+    -H "Accept-Encoding: $ae" -H "X-Export-Token: $EXPORT_TOKEN" \
+    'http://<host>/amazon-v4/api/export/incremental?limit=500'
+done
+```
+
+2026-08 线上实测（500 条/页，跨机房）：
+
+| 请求 | 修复前 | 修复后 |
+|---|---|---|
+| 全字段 | 2,938,176 | 710,184（24%） |
+| `fields=fast` | 211,356 | 34,284（16%） |
+
+两刀叠起来 2,938 KB → 34 KB。注意真实数据比合成夹具**更难压**（上一节沙箱量到
+16%，线上全字段是 24%）—— 报数时别把夹具数字当线上预期。
+
 ### 升级到带 `subtitle` 列的版本（2026-08）
 
 `asin_data` 新增一列 `subtitle`。**不需要手工执行任何 SQL**，两个后端都在启动时
