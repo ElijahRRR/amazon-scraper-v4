@@ -329,7 +329,41 @@ Server 采集，自动识别当前是商品列表页 / 卖家店铺页 / 商品�
 - **搜索**：支持 ASIN、标题、品牌模糊搜索，多个关键词用换行或逗号分隔
   - 走 `pg_trgm` GIN 表达式索引，百万级数据下 5-50ms 量级（比 LIKE 全表扫快 ~1000 倍）
   - 短查询（<3 字符）自动 fallback 到 LIKE 路径保证正确性
-- **分页**：keyset cursor 分页，单页上限 1000（近期从 200 上调）
+  - PG 侧的 SQL 形状是「每个 (词 × 列) 一个分支，各自 `ORDER BY id LIMIT n`，
+    再 UNION 进 `MATERIALIZED` CTE」。**不要**改回扁平 OR：OR 分支一多，
+    规划器估计的命中行数就被推高，进而丢掉 trgm 索引改走主键倒序扫，
+    命中少时要扫穿整张表。2026-08 线上就是这么坏的 —— 粘 4 个以上 ASIN
+    进搜索框 100% 卡满 60s 返回 500，而 4 个高频词只要 245ms。
+    200k 行实测：零命中 10 词 `5273ms → 45ms`。
+  - **带 `batch_id` 时走另一条路**：先把该批次的 ASIN 集合物化一次（`WITH bset
+    AS MATERIALIZED`），再在这约 2000 行的小集合上跑扁平 OR，**不拆分支**。
+    分支里那个 `JOIN batch_asins` 会被原样复制 3N 份，而且开销取决于批次 id
+    落在哪一段（老批次要主键倒序穿过几乎整张表）。200k 行实测「高命中 10 词 +
+    最老批次」：改动前 607ms、拆分支 4665ms、本形状 **19ms**。
+    代价是低命中时要在 2000 行上算 3N 次 LIKE（最坏约 180ms），换来的是
+    **与批次位置无关、有界的最坏情况**。
+  - ⚠ 这条只对**每个词都 ≥ 3 字符**的搜索生效。1~2 字符的词 pg_trgm 索引
+    服务不了（trigram 最小单位就是 3 字符），只要有一个短词就退回扁平 OR
+    ——**一次**全表扫。拆成分支反而会变成 3N 次扫描（实测 6028ms → 12171ms），
+    本轮踩过这个坑。短词的慢是既有行为：10 个零命中短词约 6s（200k 行），
+    百万行量级会更久，这条**没有修**。用户实际粘的是 10 位 ASIN，走的是快路径。
+- **排序**：`sort=id`（默认）/ `sort=recent`。
+  ⚠ **默认那个不是"最近采集"**：`asin_data` 一 ASIN 一行、按 asin UPSERT，
+  `id` 在**首次入库**时分配后永不改变，所以 `ORDER BY d.id DESC` 是"第一次见到
+  这个 ASIN"的倒序 —— 两年前入库、今天刚重采完的 ASIN 仍然沉在最底下。
+  `sort=recent` 才是按 `updated_at` 倒序。**控制台的采集结果页已经默认用它**；
+  API 的默认值保持 `id` 不变，因为游标语义是对外契约（同一个游标在两种排序下
+  含义不同，改默认会让老调用方静默翻错页）。
+  - 排序键是 `COALESCE(updated_at, '')` 而不是裸列，配 `idx_asin_data_updated_id`
+    表达式索引。三条理由（每条都踩过）写在 `common/core/results_sort.py` 的模块头，
+    最要命的一条：行值比较遇 NULL 恒为 NULL，`updated_at` 为空的行会在**第一页
+    之后静默消失**。
+  - `sort=recent` 且游标那一行已被删除 -> **422 `cursor_expired`**，请从第一页
+    重来（控制台会自动重来）。这里不降级成按 id 比较：那会给出一页语义错误的
+    数据，而且没人看得出来。
+- **分页**：keyset cursor 分页，单页上限 1000（近期从 200 上调）。
+  游标始终是一个整数 `id`，`sort=recent` 也一样 —— 服务端按主键把该行的
+  `updated_at` 查出来，调用方不需要理解任何新的游标编码。
 - **两个减负开关**（默认都关，不传就是原行为）：`fields=a,b,c` 只返回指定列、
   `with_total=false` 不算全表 COUNT。本端点没有 `response_model`，**82% 的耗时在
   Python 序列化上**，所以这两个开关冲的是响应体而不是 SQL。
@@ -345,6 +379,19 @@ Server 采集，自动识别当前是商品列表页 / 卖家店铺页 / 商品�
   **不出现**。⚠️ 从没采过的 ASIN 在这个端点**整行不返回**（INNER JOIN），
   要查覆盖率用 `GET /api/export/batch/{name}/records` 的 `coverage`。
 - **选中删除**：勾选行 checkbox，点击"删除选中"（同时删除关联截图文件）
+  - 删除类操作失败时，前端弹的是**服务端给的原因**（`window.apiErrText`，定义在
+    `base.html`，四个删除入口共用）。最常见的一条是配了 `ADMIN_TOKEN` 却没在
+    「设置」页填 —— 那会 401，以前只显示一个光秃秃的 `401`。
+  - 删批次按 **`BATCH_DELETE_CHUNK`（50）个批次一组**发 DELETE，既不是一条
+    `IN (全部 id)`，也不是每批次一条：
+    - 一条 `IN (全部)` 的工作量无上界，选 500 个批次迟早跨过 `PG_COMMAND_TIMEOUT`
+      （60s），整事务回滚、前端只看到 500；
+    - 每批次一条能钉死单条语句，但语句数变成 4N，而 `statement_cache_size=0`
+      让每条都要重新 Parse/Bind/Execute，**这些往返全发生在写锁内**，
+      worker 的 pull/result 会被一起挡住。实测 500 批 × 每表 20 行：
+      一条 28ms、每批次一条 264ms（9.4 倍，全是往返固定成本）、50 个一组 29ms。
+    仍在同一个事务里，原子性不变（`test_delete_is_still_atomic` 守着，
+    四张子表都预先插了行——它原来只造空批次，是一条空转的断言）。
 - **清空数据**：根据当前筛选条件智能删除
   - 选了批次 → 只删该批次数据
   - 输了搜索词 → 只删匹配数据
@@ -1015,7 +1062,49 @@ curl http://<SERVER>:8899/api/_debug/lock-stats | python3 -m json.tool
 # - pull_tasks.waits.p99 高 → 锁竞争严重
 # - accept_results_batch.holds.max 大 → commit 抖动
 # - stage_timings.commit 大 → SSD/fsync 问题
+# - waits.read_pool.p99 高 → 读池被占满，页面查询在排队等连接
+#   （不是锁竞争。两者并排在同一张表里，就是为了先分清卡在哪一侧）
 ```
+
+`waits.read_pool` 记的是 `db.read()` 里 `acquire()` 的排队时长，两个后端都记
+（SQLite 记 `asyncio.Queue.get()`，PG 记 `asyncpg` 池）。它接近 0 就说明池
+够用，"页面慢"要往别处查——通常是磁盘 I/O（见下一节）。
+
+### 页面慢：先分清是排队、是锁、还是磁盘
+
+一次「采集结果」页首屏会并发发三个请求：`/api/batches`、`/api/results`、
+`/api/changes/stats`。三者同时变慢、而纯内存端点（`/api/coordinator`）仍然
+毫秒级返回，说明**不是** event loop 被堵住，而是都在等同一份资源：
+
+| 现象 | 指向 | 怎么确认 |
+|---|---|---|
+| `waits.read_pool.p99` 高 | 读池不够用 | 调 `PG_POOL_MAX` |
+| `waits.*.p99` 高（pull_tasks / accept_results_batch） | 写锁竞争 | worker 太猛 |
+| 三者都低，但**第一次**慢、紧接着重试快十几倍 | 磁盘冷读 | 见下 |
+
+最后一种最常见，也最容易误判成"SQL 写得差"。判据是 PG 的 `DataFileRead` /
+`BufferIo` / `BtreePage` 等待占多数，且 `pg_stat_database` 的 cache hit 明显
+低于 99%。根因通常是**数据集大于可用内存**——此时任何"要扫一遍"的查询都会
+退化成磁盘读，而同一条查询在热缓存下只要几十毫秒。
+
+两个便宜且见效大的动作：
+
+```sql
+-- 1. 可见性图（VM）被死行打穿时，COUNT(*) 会从「只读主键索引」退化成
+--    「索引 + 全堆随机读」。20 万行实测：552 个 buffer -> 27,440 个，差 50 倍。
+--    在线执行，不锁 DML；VACUUM FULL 才锁表，别用。
+VACUUM (ANALYZE) asin_data;
+VACUUM (ANALYZE) tasks;
+
+-- 2. tasks 写得太频繁，默认 20% 的 autovacuum 阈值对它太松，会反复退化
+ALTER TABLE tasks     SET (autovacuum_vacuum_scale_factor = 0.02,
+                           autovacuum_analyze_scale_factor = 0.01);
+ALTER TABLE asin_data SET (autovacuum_vacuum_scale_factor = 0.05);
+```
+
+再往下才轮到 `shared_buffers` / `work_mem`（默认的 128MB / 4MB 对百万行量级
+偏小）。⚠ PG 跑在容器里时，调大 `shared_buffers` 要连容器的 `--shm-size`
+一起调大，否则并行查询会**偶发**报 `could not resize shared memory segment`。
 
 ### PostgreSQL 事件流诊断（仅 PostgreSQL 后端）
 

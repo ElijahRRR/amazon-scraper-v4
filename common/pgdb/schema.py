@@ -54,6 +54,9 @@ import logging
 import os
 from typing import Dict, List
 
+# 排序键表达式的唯一真源（core 零依赖，不会把驱动拖进来）
+from common.core.results_sort import sort_key as _sort_key
+
 logger = logging.getLogger(__name__)
 
 # 时间戳列的默认值：与 SQLite 的 CURRENT_TIMESTAMP 逐字节同格式（UTC，无小数秒）
@@ -295,6 +298,9 @@ DDL_TABLES: List[str] = [
 # 索引：与 common/database.py:440-607 + 711-717 一一对应
 # ------------------------------------------------------------------
 
+#: 排序键表达式（唯一真源在 common/core/results_sort.py）
+_SORT_KEY_EXPR = _sort_key('')
+
 DDL_INDEXES: List[str] = [
     "CREATE INDEX IF NOT EXISTS idx_batch_asins_asin ON batch_asins(asin)",
 
@@ -344,6 +350,16 @@ DDL_INDEXES: List[str] = [
 
     "CREATE INDEX IF NOT EXISTS idx_batches_callback_pending "
     "ON batches(callback_status, callback_next_retry_at)",
+
+    # /api/results?sort=recent 的排序键（updated_at DESC, id DESC）。
+    #
+    # ⚠ 排序键是 **COALESCE(updated_at, '')** 而不是裸列，理由（三条，都踩过）
+    #   写在 common/core/results_sort.py 的模块头：两个引擎的 NULL 默认位置相反、
+    #   SQLite 的 CREATE INDEX 不接受 NULLS LAST、以及行值比较遇 NULL 会**静默丢行**。
+    # ⚠ 表达式索引要被用上，索引里的表达式必须和查询里的**逐字一致** ——
+    #   所以这里从 results_sort.sort_key('') 取，不手写。
+    f"CREATE INDEX IF NOT EXISTS idx_asin_data_updated_id "
+    f"ON asin_data ({_SORT_KEY_EXPR} DESC, id DESC)",
 ]
 
 # pg_trgm：替代 FTS5 虚表。表达式索引必须与查询里的表达式**逐字一致**，

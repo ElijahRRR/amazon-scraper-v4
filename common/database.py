@@ -50,7 +50,15 @@ from common.core import (  # noqa: F401  —— 全部是有意的再导出
     _NamedLockCtx,
     _record_wait,
     _record_hold,
+    record_pool_wait,
     record_stage,
+    # ---- /api/results 排序规则（两个后端逐字共用）----
+    CursorExpired,
+    DEFAULT_SORT,
+    is_next,
+    keyset_predicate,
+    normalize_sort,
+    order_by,
     # ---- 解析失败 / 截图路径归一 ----
     _NA_VALUES,
     _normalize_screenshot_path,
@@ -72,6 +80,7 @@ from common.core import (  # noqa: F401  —— 全部是有意的再导出
     CLEAR_TABLES,
     # ---- 按 ASIN 删除 / 模糊搜索（DELETE /api/results）----
     ASIN_DELETE_CHUNK,
+    BATCH_DELETE_CHUNK,
     ASIN_DELETE_TABLES,
     search_like_pattern,
 )
@@ -152,10 +161,15 @@ class Database:
     async def read(self):
         """从只读连接池借一条连接（池空时排队等待，形成读侧背压，绝不触碰写连接）。
         回退：池未初始化时退化到写连接，保证调用方始终可用。"""
+        _t0 = time.perf_counter()
         if self._read_pool is None:
+            record_pool_wait((time.perf_counter() - _t0) * 1000)
             yield self._db
             return
         conn = await self._read_pool.get()
+        # 池空时在这里排队。与 PG 侧记在同一个 caller（read_pool）下——
+        # 两个后端共用一份黄金基线，key 集必须一致。
+        record_pool_wait((time.perf_counter() - _t0) * 1000)
         try:
             yield conn
         finally:
@@ -401,6 +415,15 @@ class Database:
             -- 加了这条就不再依赖统计信息。与 PG 侧
             -- common/pgdb/schema.py 的 idx_screenshots_asin_done 一一对应（C4）。
             CREATE INDEX IF NOT EXISTS idx_screenshots_asin_done ON screenshots(asin) WHERE status = 'done';
+
+            -- /api/results?sort=recent 的排序键。与 PG 侧
+            -- common/pgdb/schema.py 的 idx_asin_data_updated_id 一一对应。
+            -- ⚠ 排序键是 COALESCE(updated_at, '') 而不是裸列，三条理由写在
+            --   common/core/results_sort.py 的模块头（NULL 默认位置两个引擎相反、
+            --   SQLite 索引不接受 NULLS LAST、行值比较遇 NULL 静默丢行）。
+            --   表达式必须与查询里的逐字一致，否则索引静默失效。
+            CREATE INDEX IF NOT EXISTS idx_asin_data_updated_id
+                ON asin_data(COALESCE(updated_at, '') DESC, id DESC);
 
             -- 卖家店铺发现结果表（F-009：seller storefront 模式）
             -- 每行 = 某 batch 在某 seller 店内发现的一个 ASIN
@@ -738,16 +761,47 @@ class Database:
 
     async def get_batches(self) -> List[Dict]:
         """获取所有批次及其统计"""
+        # 先按 batch_id 把 tasks 聚合成"每批次一行"，再去 LEFT JOIN batches。
+        #
+        # ⚠ 原来的写法是 `batches LEFT JOIN tasks ... GROUP BY b.id`：先把
+        # **每一条任务**连出来（170 万行）再分组。这条查询在每次打开采集结果页
+        # 和任务页时都要跑一遍，实测线上约 650ms、且随任务总量线性增长。
+        # 改成先聚合之后，tasks 只被扫一遍且能走 idx_tasks_batch_status 的
+        # index-only scan，连出来的行数从"任务数"降到"批次数"。
+        #
+        # 语义**逐字保持**，两处容易改坏的地方：
+        #   * 零任务批次必须是 (total_tasks, completed, failed, pending,
+        #     processing) = (0, 0, 0, 0, 0)，**五个都是 0，不是 NULL**。
+        #     老写法是这么来的：LEFT JOIN 给出一行 t.* 全 NULL 的行，
+        #     COUNT(t.id) 数非空 -> 0，而 `SUM(CASE WHEN NULL='done' THEN 1
+        #     ELSE 0 END)` 走的是 ELSE 分支 -> SUM(0) -> 0。
+        #     换成子查询之后这一行**根本不存在**，五个全是 NULL，所以必须
+        #     逐个 COALESCE 回 0。
+        #     ⚠ 本文件模块头注释里"零任务批次 completed/... = NULL，别 COALESCE
+        #     掉"那句是**错的**，已一并改正；真源是
+        #     tests/pgdb/test_batches.py::test_get_batches_zero_task_batch。
+        #   * COUNT(*) 与 SUM(CASE ... THEN 1 ELSE 0 END) 的分支都是整数字面量
+        #     -> bigint -> asyncpg 给 int。**绝不能**加 ::bigint 之类的转换，
+        #     那会让 SUM 变 numeric -> Decimal -> FastAPI 序列化成 JSON 字符串。
+        #     COALESCE(x, 0) 的 0 是整数字面量，不影响这一点。
         sql = """
             SELECT b.id, b.name, b.needs_screenshot, b.created_at,
-                   COUNT(t.id) as total_tasks,
-                   SUM(CASE WHEN t.status = 'done' THEN 1 ELSE 0 END) as completed,
-                   SUM(CASE WHEN t.status = 'failed' THEN 1 ELSE 0 END) as failed,
-                   SUM(CASE WHEN t.status = 'pending' THEN 1 ELSE 0 END) as pending,
-                   SUM(CASE WHEN t.status = 'processing' THEN 1 ELSE 0 END) as processing
+                   COALESCE(t.total_tasks, 0) as total_tasks,
+                   COALESCE(t.completed, 0) as completed,
+                   COALESCE(t.failed, 0) as failed,
+                   COALESCE(t.pending, 0) as pending,
+                   COALESCE(t.processing, 0) as processing
             FROM batches b
-            LEFT JOIN tasks t ON t.batch_id = b.id
-            GROUP BY b.id
+            LEFT JOIN (
+                SELECT batch_id,
+                       COUNT(*) as total_tasks,
+                       SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) as completed,
+                       SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
+                       SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
+                       SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END) as processing
+                FROM tasks
+                GROUP BY batch_id
+            ) t ON t.batch_id = b.id
             ORDER BY b.id DESC
         """
         async with self.read() as rc, rc.execute(sql) as c:
@@ -1446,18 +1500,44 @@ class Database:
         ph = ",".join("?" * len(ids))
 
         # 先收集截图物理文件路径（只读连接，不占写锁）
-        async with self.read() as rc, rc.execute(
-            f"SELECT file_path FROM screenshots WHERE batch_id IN ({ph})"
-            f" AND file_path IS NOT NULL", ids
-        ) as c:
-            screenshot_files = [row["file_path"] for row in await c.fetchall()]
+        # 同样逐批次取（理由见下面事务里那段注释），但**只借一次读连接** ——
+        # 每个 id 各借一次会让 500 个批次变成 500 次 pool.acquire()。
+        screenshot_files: List[str] = []
+        async with self.read() as rc:
+            for bid in ids:
+                async with rc.execute(
+                    "SELECT file_path FROM screenshots WHERE batch_id = ?"
+                    " AND file_path IS NOT NULL", (bid,)
+                ) as c:
+                    screenshot_files.extend(row["file_path"] for row in await c.fetchall())
 
         async with self._write_lock:
             await self._db.execute("BEGIN")
             try:
+                # ⚠ **按 BATCH_DELETE_CHUNK 个批次一组**删，既不是一条
+                # `IN (全部 id)`，也不是"每个批次一条"。
+                #
+                # 超时是**按语句**计的（asyncpg 的 command_timeout，默认 60s，
+                # 见 config.PG_COMMAND_TIMEOUT）。一条 `DELETE ... WHERE
+                # batch_id IN (...500 个 id...)` 的工作量无上界，某天会跨过 60s，
+                # 然后整个事务回滚、前端只看到一个 500。
+                #
+                # 但"每个批次一条"矫枉过正：语句数变成 4N，而 pool.py 是
+                # statement_cache_size=0（决策 D-7），每条都要重新 Parse/Bind/
+                # Execute，这些往返**全发生在写锁内** —— worker 的 pull/result
+                # 会被一起挡住。实测 500 批 × 每表 20 行：一条 28ms、每批次一条
+                # 264ms（9.4 倍，全是 2000 次往返的固定成本）、50 个一组 29ms。
+                # 分组大小与实测表见 common/core/dbtables.py:BATCH_DELETE_CHUNK。
+                #
+                # 仍在**同一个事务**里：原子性是这个方法的既有语义（要么全删、
+                # 要么全不删），分组只改语句粒度，不改事务边界。
                 for tbl in ("tasks", "batch_asins", "screenshots", "asin_changes"):
-                    await self._db.execute(
-                        f"DELETE FROM {tbl} WHERE batch_id IN ({ph})", ids)
+                    for grp in (ids[i:i + BATCH_DELETE_CHUNK]
+                                for i in range(0, len(ids), BATCH_DELETE_CHUNK)):
+                        gph = ",".join("?" * len(grp))
+                        await self._db.execute(
+                            f"DELETE FROM {tbl} WHERE batch_id IN ({gph})", grp)
+                # batches 本身一行一个批次，一条语句就够，不需要拆
                 await self._db.execute(
                     f"DELETE FROM batches WHERE id IN ({ph})", ids)
                 await self._db.execute("COMMIT")
@@ -2473,13 +2553,17 @@ class Database:
                           change_filter: str = "all",
                           direction: str = "next",
                           columns: List[str] = None,
-                          with_total: bool = True) -> Dict:
+                          with_total: bool = True,
+                          sort: str = DEFAULT_SORT) -> Dict:
         """
         获取结果列表（keyset 分页）
         change_filter: all / price_stock / title_bullets / new
         direction: next (向后翻页) / prev (向前翻页)
         columns: 只取这些列（None = 全部 56 列，**默认行为不变**）
         with_total: 算不算 total（False -> total 为 None，**默认行为不变**）
+        sort: "id"（默认，按首次入库倒序）/ "recent"（按 updated_at 倒序）。
+              规则的唯一真源在 common/core/results_sort.py，与 PG 侧共用同一份
+              ORDER BY 与 keyset 谓词文本；游标行已删除时抛 CursorExpired。
         返回: {"items": [...], "has_more": bool, "next_cursor": int, "prev_cursor": int, "total": int|None}
 
         ------------------------------------------------------------------
@@ -2528,6 +2612,23 @@ class Database:
                         wanted.append(forced)
                 proj = ", ".join(f"d.{c}" for c in wanted)
 
+        sort = normalize_sort(sort)
+
+        # recent 模式：游标是 int id，但谓词要 (updated_at, id)。先按主键把那一行的
+        # updated_at 查出来。查不到 = 该行已被删除 -> 抛 CursorExpired 让调用方从
+        # 第一页重来。**不要**退回按 id 比较：那会在 ORDER BY updated_at 下给出
+        # 一页语义错误的数据，而且看不出来。与 PG 侧同构。
+        cursor_ts = None
+        if cursor_id is not None and sort == "recent":
+            async with self.read() as rc, rc.execute(
+                    "SELECT updated_at FROM asin_data WHERE id = ?", (cursor_id,)) as c:
+                row = await c.fetchone()
+            if row is None:
+                raise CursorExpired(cursor_id)
+            # ⚠ 也要过 COALESCE 的等价物：谓词左边是 COALESCE(...,'')，
+            #    右边若绑 None，行值比较又退化成 NULL -> 那一页恒空。
+            cursor_ts = row["updated_at"] or ""
+
         join_parts = []
         count_join_parts = []
         join_params: list = []
@@ -2543,7 +2644,8 @@ class Database:
         # 变动筛选 —— 由 `JOIN (SELECT DISTINCT asin FROM asin_changes ...)`
         # 改写成 EXISTS 半连接。等价性与两条注意事项见 common/pgdb/results_read.py
         # 的同名注释（DISTINCT 本就不放大行数；参数随谓词从 join_params 挪进
-        # where_params；谓词文本不含 "d.id" 所以不会被 D-8 的 count 过滤误剔）。
+        # where_params。原注释里"谓词文本不含 d.id 所以不会被 D-8 的 count 过滤
+        # 误剔"那半句已作废：D-8 已修，count 不再按文本剔谓词）。
         if change_filter in ("price_stock", "title_bullets"):
             # change_filter 的取值被上面这个成员判断限死在两个字面量上，不是外部拼接
             pred = ("EXISTS (SELECT 1 FROM asin_changes ac "
@@ -2604,16 +2706,20 @@ class Database:
                         where_params.append(like_pattern)
                     where_parts.append(f"d.id IN ({' UNION '.join(fts_subs)})")
 
-        # 构建 count 查询参数（join_params + where_params，不含 cursor）
+        # 构建 count 查询的参数**与谓词**——两者必须在同一时刻快照，
+        # 也就是 keyset 谓词追加**之前**。见下面 count_where 处的注释。
         count_params = join_params + where_params
+        count_where_parts = list(where_parts)
 
-        # keyset 分页
+        # keyset 分页。谓词文本与排序键都来自 common/core/results_sort.py，
+        # 与 PG 侧逐字共用 —— 分叉的症状是"同一个游标在两个后端翻出不同的页"，
+        # 而它不会报错。
         if cursor_id is not None:
-            if direction == "next":
-                where_parts.append("d.id < ?")
+            where_parts.append(keyset_predicate(sort, direction))
+            if sort == "recent":
+                where_params.extend([cursor_ts, cursor_id])
             else:
-                where_parts.append("d.id > ?")
-            where_params.append(cursor_id)
+                where_params.append(cursor_id)
 
         params = join_params + where_params
 
@@ -2621,14 +2727,14 @@ class Database:
         join_clause = " ".join(join_parts) if join_parts else ""
         count_join_clause = " ".join(count_join_parts) if count_join_parts else ""
 
-        order = "DESC" if direction == "next" else "ASC"
+        order_by_clause = order_by(sort, direction)
 
         # 查询数据
         sql = f"""
             SELECT {proj or 'd.*'} FROM asin_data d
             {join_clause}
             WHERE {where_clause}
-            ORDER BY d.id {order}
+            ORDER BY {order_by_clause}
             LIMIT ?
         """
         params.append(limit + 1)  # 多取一条判断 has_more
@@ -2641,21 +2747,27 @@ class Database:
         if has_more:
             items = items[:limit]
 
-        if direction == "prev":
+        if not is_next(direction):
             items.reverse()
 
         await self._hydrate_screenshot_paths(items, batch_id)
         if batch_id:
             await self._hydrate_batch_task_status(items, batch_id)
 
-        # 查询总数
-        count_where = " AND ".join(
-            [p for p in (where_parts[:-1] if cursor_id is not None else where_parts)]
-        ) if where_parts else "1=1"
-        # 移除 cursor 条件
-        if cursor_id is not None and where_parts:
-            count_where_parts = [p for p in where_parts if "d.id" not in p]
-            count_where = " AND ".join(count_where_parts) if count_where_parts else "1=1"
+        # 查询总数。
+        #
+        # count_where_parts 与 count_params 在**同一时刻**快照（keyset 谓词追加
+        # 之前），所以它天然不含 cursor 条件，谓词与参数不可能对不齐。
+        #
+        # ⚠ 这里以前是靠 `[p for p in where_parts if "d.id" not in p]` 猜的 ——
+        #   本意只想剔掉 keyset 谓词 `d.id < ?`，但搜索快路径的谓词文本里也带
+        #   "d.id"，于是被一并剔掉，而 count_params 里仍留着它那 3N 个参数
+        #   -> 参数个数对不上 -> asyncpg/sqlite3 抛错 -> 500。
+        #   也就是说 `?search=GoldenBrand&cursor=3` 一直是必崩的（决策 D-8 把它
+        #   当既有行为**刻意复现**过；本轮按 D-8 自己写的"留给 Phase 1.5 修"修掉）。
+        #   靠文本匹配识别"哪个谓词是 cursor"本身就是错的方案：任何一个新谓词
+        #   只要碰巧提到 d.id 就会重蹈覆辙。快照法从结构上消灭这一整类。
+        count_where = " AND ".join(count_where_parts) if count_where_parts else "1=1"
 
         # with_total=False -> 整条 count 都不发。它随行数线性增长、且翻页途中
         # 值恒定不变，前端只在首屏要它。

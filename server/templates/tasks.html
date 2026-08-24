@@ -499,7 +499,9 @@ document.getElementById('keywordForm').addEventListener('submit', async (e) => {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload),
         });
-        const data = await resp.json();
+        // ⚠ 只在成功分支读 json：resp.body 只能读一次，失败分支要留给
+        // apiErrText 自己去读（它对非 JSON 响应也有兜底）。
+        const data = resp.ok ? await resp.json() : null;
         resultDiv.style.display = 'block';
         resultDiv.innerHTML = '';
         const alertDiv = document.createElement('div');
@@ -517,7 +519,11 @@ document.getElementById('keywordForm').addEventListener('submit', async (e) => {
             setTimeout(() => location.reload(), 1500);
         } else {
             alertDiv.className = 'alert alert-danger';
-            alertDiv.textContent = '❌ ' + (data.detail || '提交失败');
+            // 走 base.html 的 window.apiErrText（PR #18 引入的统一写法）：
+            // 它认 message/detail/error 三种键并带上状态码。自己读 data.detail
+            // 的话，401（ADMIN_TOKEN 拦下）这类**没有 detail 键**的响应会显示
+            // "undefined"，用户完全看不出是鉴权问题。
+            alertDiv.textContent = '❌ ' + await window.apiErrText(resp);
             resultDiv.appendChild(alertDiv);
         }
     } catch(err) {
@@ -560,8 +566,18 @@ async function prioritizeBatch(batchId, name) {
 
 async function deleteBatch(name) {
     if (!confirm(`确定删除批次 "${name}"？此操作不可恢复！`)) return;
-    await fetch(`/api/batches/${encodeURIComponent(name)}`, { method: 'DELETE' });
-    location.reload();
+    try {
+        // ⚠ 这里以前是 `await fetch(...); location.reload();` —— **完全不看响应**。
+        // 删除被 401 挡下时页面照样刷新，批次还在原地，一句提示都没有。
+        const resp = await fetch(`/api/batches/${encodeURIComponent(name)}`, { method: 'DELETE' });
+        if (!resp.ok) {
+            alert('删除失败：' + await window.apiErrText(resp));
+            return;
+        }
+        location.reload();
+    } catch (e) {
+        alert('删除异常：' + e);
+    }
 }
 
 // ===== 历史批次：勾选批量删除 =====
@@ -602,11 +618,10 @@ async function bulkDeleteBatches() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ batch_ids: ids }),
         });
-        const data = await resp.json().catch(() => ({}));
         if (resp.ok) {
             location.reload();
         } else {
-            alert('批量删除失败：' + (data.detail || resp.status));
+            alert('批量删除失败：' + await window.apiErrText(resp));
             btn.disabled = false;
             updateBulkDeleteBtn();
         }
