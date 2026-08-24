@@ -98,6 +98,25 @@
       };
     })();
     </script>
+    <!-- 统一的「失败响应 → 给人看的一句话」。**唯一真源**：删除类操作分散在
+         tasks.html / results.html 两个页面共 4 处，以前各自 `data.detail || ...`，
+         而服务端有三种不同形状的错误体，于是最要紧的那种（401）永远显示不出来。 -->
+    <script>
+    (function () {
+      // 服务端的三种错误体，历史原因并存，一个都不能漏：
+      //   FastAPI HTTPException      -> {"detail": "..."}
+      //   authz 中间件的 401         -> {"error": "...", "message": "..."}
+      //   网关 5xx / 非 JSON         -> 没有可读字段，只能退回状态码
+      // ⚠ 顺序是 message -> detail -> error：401 的 message 是给人看的整句，
+      //   而 error 是 "invalid_admin_token" 这种机器码，读反了等于没修。
+      window.apiErrText = async function (resp) {
+        var data = null;
+        try { data = await resp.json(); } catch (e) { /* 非 JSON，往下走 */ }
+        var msg = data && (data.message || data.detail || data.error);
+        return msg ? msg + '（HTTP ' + resp.status + '）' : 'HTTP ' + resp.status;
+      };
+    })();
+    </script>
     {% block extra_js %}{% endblock %}
 </body>
 </html>

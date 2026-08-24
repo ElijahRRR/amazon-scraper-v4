@@ -85,6 +85,7 @@
 </div>
 
 <!-- 结果列表 -->
+<div class="alert alert-warning py-2 mb-3" id="filterNotice" style="display:none;"></div>
 <div class="card">
     <div class="card-header d-flex justify-content-between">
         <span><i class="bi bi-table"></i> 共 <span id="resultTotal">-</span> 条结果</span>
@@ -205,39 +206,132 @@ let state = {
     total: null,
 };
 
+const CHANGE_FILTERS = ['all', 'price_stock', 'title_bullets', 'new'];
+
+// URL <-> 筛选状态。
+//
+// ⚠ 这一段以前**整个不存在**：state.batchId 初始化成 null 之后就只被下拉框改过，
+// 谁也不读 location.search。于是任务页和仪表盘上那三处
+// `<a href="/results?batch_id=...">` 点进来，打开的是一个**没有筛选**的
+// 结果页 —— 链接看起来好好的，行为上等于死链。
+function readFiltersFromUrl() {
+    const q = new URLSearchParams(location.search);
+    const bid = q.get('batch_id');
+    // 只认纯数字：后面要用它和 <option value> 做 == 比较，也要拼进 API 查询串
+    if (bid && /^\d+$/.test(bid)) state.batchId = bid;
+    const cf = q.get('change_filter');
+    if (cf && CHANGE_FILTERS.includes(cf)) state.changeFilter = cf;
+    const sq = q.get('search');
+    if (sq) state.search = normalizeSearch(sq);
+}
+
+// 把当前筛选写回地址栏（replaceState：不往历史里塞条目，刷新/收藏/分享都能复现）
+function syncUrl() {
+    const q = new URLSearchParams();
+    if (state.batchId) q.set('batch_id', state.batchId);
+    if (state.changeFilter && state.changeFilter !== 'all') q.set('change_filter', state.changeFilter);
+    if (state.search) q.set('search', state.search);
+    const qs = q.toString();
+    history.replaceState(null, '', qs ? `${location.pathname}?${qs}` : location.pathname);
+}
+
+// 搜索框的归一化：换行或逗号分隔 -> 逗号分隔的单行。
+// **唯一真源** —— URL 快照、state.search、发给 API 的值必须是同一个字符串，
+// 否则地址栏里的和实际搜的对不上（历史上就是这么不一致的）。
+function normalizeSearch(raw) {
+    return String(raw || '').split(/[\n,]+/).map(t => t.trim()).filter(Boolean).join(',');
+}
+
+function resetPaging() {
+    state.nextCursor = null;
+    state.prevCursor = null;
+    state.cursorStack = [];
+    state.currentStartCursor = null;
+}
+
 // 初始化
-document.addEventListener('DOMContentLoaded', () => {
-    loadBatches();
+document.addEventListener('DOMContentLoaded', async () => {
+    readFiltersFromUrl();
+    document.getElementById('changeFilter').value = state.changeFilter;
+    document.getElementById('searchInput').value = state.search;
+
+    // ⚠ 必须**先 await** loadBatches()：它会重建整个 <select> 的 <option>，
+    // 在那之前给 sel.value 赋值会被静默丢弃（没有匹配的 option -> value 变空串）。
+    await loadBatches();
+    const sel = document.getElementById('batchFilter');
+    if (state.batchId) {
+        sel.value = state.batchId;
+        if (sel.value !== state.batchId) {
+            // 批次已被删除 / id 不存在：退回全部批次，并说明为什么，
+            // 而不是让用户对着一个"看起来没筛选"的页面猜。
+            logInvalidBatch(state.batchId);
+            state.batchId = null;
+            sel.value = '';
+        }
+    }
+    syncUrl();
+
     loadResults();
     loadChangeStats();
 
     document.getElementById('batchFilter').addEventListener('change', () => {
         state.batchId = document.getElementById('batchFilter').value || null;
-        state.nextCursor = null;
-        state.prevCursor = null;
-        state.cursorStack = [];
+        resetPaging();
+        clearFilterNotice();
+        syncUrl();
         loadResults();
         loadChangeStats();
     });
 
     document.getElementById('changeFilter').addEventListener('change', () => {
         state.changeFilter = document.getElementById('changeFilter').value;
-        state.nextCursor = null;
-        state.prevCursor = null;
-        state.cursorStack = [];
+        resetPaging();
+        clearFilterNotice();
+        syncUrl();
         loadResults();
     });
 
-    document.getElementById('searchInput').addEventListener('keyup', e => {
-        if (e.key === 'Enter') {
-            state.search = e.target.value;
-            state.nextCursor = null;
-            state.prevCursor = null;
-            state.cursorStack = [];
+    // ⚠ #searchInput 是 <textarea>（要支持"换行或逗号分隔"的批量粘贴），
+    // 所以回车会先把 '\n' 插进 value，keyup 才触发。原来直接把 e.target.value
+    // 快照进 URL，于是地址栏变成 ?search=GoldenBrand%0A，而且**每按一次回车
+    // 累积一个** —— 分享出去的链接里搜索框带着一串空行，看着像坏了。
+    // 而发给 API 的值又是在 loadResults 里重新 trim/split 归一化过的，
+    // 两者不一致。这里在 keydown 阶段就拦掉回车（不让它插换行），并统一走
+    // 同一份归一化。Shift+Enter 保留换行，批量粘贴照常能用。
+    const searchEl = document.getElementById('searchInput');
+    searchEl.addEventListener('keydown', e => {
+        if (e.key === 'Enter' && !e.shiftKey) e.preventDefault();
+    });
+    searchEl.addEventListener('keyup', e => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            state.search = normalizeSearch(e.target.value);
+            e.target.value = state.search;
+            resetPaging();
+            clearFilterNotice();
+            syncUrl();
             loadResults();
         }
     });
 });
+
+// ⚠ 提示**不能**写进 #resultBody：紧接着的 loadResults() 一返回，
+// renderResults() 就会 `tbody.innerHTML = html` 把整块覆盖掉 —— 实测这句话
+// 只活了 26ms。用户看到的仍然是「一个看起来没筛选的页面」，正是这段代码
+// 想避免的情况。所以写进表格外面那个独立横幅。
+function logInvalidBatch(id) {
+    const el = document.getElementById('filterNotice');
+    if (el) {
+        el.textContent = `批次 ${String(id)} 不存在（可能已被删除），已显示全部批次`;
+        el.style.display = '';
+    }
+}
+
+// 用户自己改筛选时把横幅收掉 —— 它说的是"你点进来的那个链接失效了"，
+// 一旦用户主动选了别的条件，这句话就不再成立。
+function clearFilterNotice() {
+    const el = document.getElementById('filterNotice');
+    if (el) el.style.display = 'none';
+}
 
 async function loadBatches() {
     try {
@@ -286,8 +380,11 @@ async function loadResults(cursor = null, direction = 'next') {
     // 只在首屏要一次。cursor 非空 = 在翻页，直接省掉。
     const needTotal = !cursor;
 
+    // sort=recent = 「最近采的排前面」。服务端默认是 sort=id（首次入库倒序），
+    // 那个默认不能动 —— 游标语义是对外契约，改默认会让老调用方拿着同一个游标
+    // 翻出语义完全不同的一页。所以由前端显式要。
     let url = `/api/results?limit=50&change_filter=${state.changeFilter}&direction=${direction}`
-            + `&fields=${UI_FIELDS}`;
+            + `&fields=${UI_FIELDS}&sort=recent`;
     if (!needTotal) url += '&with_total=false';
     if (state.batchId) url += `&batch_id=${state.batchId}`;
     if (state.search) url += `&search=${encodeURIComponent(state.search)}`;
@@ -295,6 +392,18 @@ async function loadResults(cursor = null, direction = 'next') {
 
     try {
         const resp = await fetch(url);
+        if (!resp.ok) {
+            const err = await resp.clone().json().catch(() => ({}));
+            // 游标那一行被删了（多半就是刚在这个页面上删的）。静默退回第一页，
+            // 别把一个 422 甩给用户 —— 他要的只是"接着看"。
+            if (err?.detail?.error === 'cursor_expired' && cursor) {
+                resetPaging();
+                return loadResults();
+            }
+            document.getElementById('resultBody').innerHTML =
+                `<tr><td colspan="14" class="text-center text-danger p-4">加载失败: ${esc(await window.apiErrText(resp))}</td></tr>`;
+            return;
+        }
         const data = await resp.json();
 
         // 翻页时服务端不再回 total（null）——沿用首屏那次的值，别把计数刷成空
@@ -432,13 +541,12 @@ async function deleteSelected() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body),
         });
-        const data = await resp.json();
-        if (resp.ok) {
-            loadResults();
-            loadChangeStats();
-        } else {
-            alert('删除失败: ' + (data.detail || '未知错误'));
+        if (!resp.ok) {
+            alert('删除失败: ' + await window.apiErrText(resp));
+            return;
         }
+        loadResults();
+        loadChangeStats();
     } catch(e) {
         alert('网络错误: ' + e.message);
     }
@@ -565,15 +673,17 @@ async function clearData() {
         } else {
             resp = await fetch('/api/database', { method: 'DELETE' });
         }
+        if (!resp.ok) {
+            alert('删除失败: ' + await window.apiErrText(resp));
+            return;
+        }
         const data = await resp.json();
-        if (resp.ok) {
+        {
             const deleted = data.deleted != null ? `已删除 ${data.deleted} 条` : '数据已清空';
             alert(deleted);
             loadResults();
             loadChangeStats();
             loadBatches();
-        } else {
-            alert('删除失败: ' + (data.detail || '未知错误'));
         }
     } catch(e) {
         alert('网络错误: ' + e.message);
@@ -587,15 +697,15 @@ async function deleteByFile(input) {
     input.value = '';  // 重置，允许重复上传同一文件
     try {
         const resp = await fetch('/api/results/delete-by-file', { method: 'POST', body: fd });
-        const data = await resp.json();
-        if (resp.ok) {
-            alert(`已删除 ${data.deleted} 条数据（文件中识别到 ${data.asin_count} 个 ASIN）`);
-            loadResults();
-            loadChangeStats();
-            loadBatches();
-        } else {
-            alert('删除失败: ' + (data.detail || '未知错误'));
+        if (!resp.ok) {
+            alert('删除失败: ' + await window.apiErrText(resp));
+            return;
         }
+        const data = await resp.json();
+        alert(`已删除 ${data.deleted} 条数据（文件中识别到 ${data.asin_count} 个 ASIN）`);
+        loadResults();
+        loadChangeStats();
+        loadBatches();
     } catch(e) {
         alert('网络错误: ' + e.message);
     }

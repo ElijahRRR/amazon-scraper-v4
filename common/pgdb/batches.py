@@ -39,8 +39,10 @@ OWNS（9 个方法，对应 common/database.py 的同名实现）:
 * get_batches：``GROUP BY b.id`` 带裸列（b.name / b.needs_screenshot /
   b.created_at）在 PG 里合法，**仅因为** batches.id 是声明过的 PRIMARY KEY。
   schema.py 已经保证了这点。查询逐字移植即可，不要往 GROUP BY 里加列。
-  零任务的批次：LEFT JOIN + SUM(CASE...) 会给出 completed/failed/pending/
-  processing = NULL（JSON null）而 total_tasks = 0，两边一致，别 COALESCE 掉。
+  零任务的批次：五个统计列**全是 0**（不是 NULL）。旧写法靠 LEFT JOIN 出来的
+  那一行"t.* 全 NULL"凑出 0（COUNT 数非空 -> 0；SUM(CASE) 走 ELSE -> 0）；
+  现在换成子查询聚合，那一行不存在了，靠逐列 COALESCE(…, 0) 保持同一结果。
+  真源是 tests/pgdb/test_batches.py::test_get_batches_zero_task_batch。
   ``SUM(CASE WHEN ... THEN 1 ELSE 0 END)`` 的 CASE 分支是整数字面量 →
   结果 bigint → asyncpg 给 int。**绝不能**给 CASE 分支加 ::bigint 之类的转换，
   那会让 SUM 变 numeric → Decimal → FastAPI 序列化成 JSON 字符串。
@@ -100,7 +102,9 @@ from typing import Any, Dict, List, Optional, Tuple
 # 只借异常类型，不建连接（硬规矩 3 禁的是自己建连接）。
 from asyncpg.exceptions import IntegrityConstraintViolationError
 
-from common.pgdb._shared import LOCK_STATS, TimedLock, record_stage  # noqa: F401
+from common.pgdb._shared import (  # noqa: F401
+    BATCH_DELETE_CHUNK, LOCK_STATS, TimedLock, record_stage,
+)
 from common.pgdb.pool import as_int, text_affinity
 
 
@@ -192,16 +196,47 @@ class BatchesMixin:
 
     async def get_batches(self) -> List[Dict]:
         """获取所有批次及其统计"""
+        # 先按 batch_id 把 tasks 聚合成"每批次一行"，再去 LEFT JOIN batches。
+        #
+        # ⚠ 原来的写法是 `batches LEFT JOIN tasks ... GROUP BY b.id`：先把
+        # **每一条任务**连出来（170 万行）再分组。这条查询在每次打开采集结果页
+        # 和任务页时都要跑一遍，实测线上约 650ms、且随任务总量线性增长。
+        # 改成先聚合之后，tasks 只被扫一遍且能走 idx_tasks_batch_status 的
+        # index-only scan，连出来的行数从"任务数"降到"批次数"。
+        #
+        # 语义**逐字保持**，两处容易改坏的地方：
+        #   * 零任务批次必须是 (total_tasks, completed, failed, pending,
+        #     processing) = (0, 0, 0, 0, 0)，**五个都是 0，不是 NULL**。
+        #     老写法是这么来的：LEFT JOIN 给出一行 t.* 全 NULL 的行，
+        #     COUNT(t.id) 数非空 -> 0，而 `SUM(CASE WHEN NULL='done' THEN 1
+        #     ELSE 0 END)` 走的是 ELSE 分支 -> SUM(0) -> 0。
+        #     换成子查询之后这一行**根本不存在**，五个全是 NULL，所以必须
+        #     逐个 COALESCE 回 0。
+        #     ⚠ 本文件模块头注释里"零任务批次 completed/... = NULL，别 COALESCE
+        #     掉"那句是**错的**，已一并改正；真源是
+        #     tests/pgdb/test_batches.py::test_get_batches_zero_task_batch。
+        #   * COUNT(*) 与 SUM(CASE ... THEN 1 ELSE 0 END) 的分支都是整数字面量
+        #     -> bigint -> asyncpg 给 int。**绝不能**加 ::bigint 之类的转换，
+        #     那会让 SUM 变 numeric -> Decimal -> FastAPI 序列化成 JSON 字符串。
+        #     COALESCE(x, 0) 的 0 是整数字面量，不影响这一点。
         sql = """
             SELECT b.id, b.name, b.needs_screenshot, b.created_at,
-                   COUNT(t.id) as total_tasks,
-                   SUM(CASE WHEN t.status = 'done' THEN 1 ELSE 0 END) as completed,
-                   SUM(CASE WHEN t.status = 'failed' THEN 1 ELSE 0 END) as failed,
-                   SUM(CASE WHEN t.status = 'pending' THEN 1 ELSE 0 END) as pending,
-                   SUM(CASE WHEN t.status = 'processing' THEN 1 ELSE 0 END) as processing
+                   COALESCE(t.total_tasks, 0) as total_tasks,
+                   COALESCE(t.completed, 0) as completed,
+                   COALESCE(t.failed, 0) as failed,
+                   COALESCE(t.pending, 0) as pending,
+                   COALESCE(t.processing, 0) as processing
             FROM batches b
-            LEFT JOIN tasks t ON t.batch_id = b.id
-            GROUP BY b.id
+            LEFT JOIN (
+                SELECT batch_id,
+                       COUNT(*) as total_tasks,
+                       SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) as completed,
+                       SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
+                       SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
+                       SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END) as processing
+                FROM tasks
+                GROUP BY batch_id
+            ) t ON t.batch_id = b.id
             ORDER BY b.id DESC
         """
         async with self.read() as rc, rc.execute(sql) as c:
@@ -392,18 +427,44 @@ class BatchesMixin:
         ph = ",".join("?" * len(ids))
 
         # 先收集截图物理文件路径（只读连接，不占写锁）
-        async with self.read() as rc, rc.execute(
-            f"SELECT file_path FROM screenshots WHERE batch_id IN ({ph})"
-            f" AND file_path IS NOT NULL", ids
-        ) as c:
-            screenshot_files = [row["file_path"] for row in await c.fetchall()]
+        # 同样逐批次取（理由见下面事务里那段注释），但**只借一次读连接** ——
+        # 每个 id 各借一次会让 500 个批次变成 500 次 pool.acquire()。
+        screenshot_files: List[str] = []
+        async with self.read() as rc:
+            for bid in ids:
+                async with rc.execute(
+                    "SELECT file_path FROM screenshots WHERE batch_id = ?"
+                    " AND file_path IS NOT NULL", (bid,)
+                ) as c:
+                    screenshot_files.extend(row["file_path"] for row in await c.fetchall())
 
         async with self._write_lock:
             await self._db.execute("BEGIN")
             try:
+                # ⚠ **按 BATCH_DELETE_CHUNK 个批次一组**删，既不是一条
+                # `IN (全部 id)`，也不是"每个批次一条"。
+                #
+                # 超时是**按语句**计的（asyncpg 的 command_timeout，默认 60s，
+                # 见 config.PG_COMMAND_TIMEOUT）。一条 `DELETE ... WHERE
+                # batch_id IN (...500 个 id...)` 的工作量无上界，某天会跨过 60s，
+                # 然后整个事务回滚、前端只看到一个 500。
+                #
+                # 但"每个批次一条"矫枉过正：语句数变成 4N，而 pool.py 是
+                # statement_cache_size=0（决策 D-7），每条都要重新 Parse/Bind/
+                # Execute，这些往返**全发生在写锁内** —— worker 的 pull/result
+                # 会被一起挡住。实测 500 批 × 每表 20 行：一条 28ms、每批次一条
+                # 264ms（9.4 倍，全是 2000 次往返的固定成本）、50 个一组 29ms。
+                # 分组大小与实测表见 common/core/dbtables.py:BATCH_DELETE_CHUNK。
+                #
+                # 仍在**同一个事务**里：原子性是这个方法的既有语义（要么全删、
+                # 要么全不删），分组只改语句粒度，不改事务边界。
                 for tbl in ("tasks", "batch_asins", "screenshots", "asin_changes"):
-                    await self._db.execute(
-                        f"DELETE FROM {tbl} WHERE batch_id IN ({ph})", ids)
+                    for grp in (ids[i:i + BATCH_DELETE_CHUNK]
+                                for i in range(0, len(ids), BATCH_DELETE_CHUNK)):
+                        gph = ",".join("?" * len(grp))
+                        await self._db.execute(
+                            f"DELETE FROM {tbl} WHERE batch_id IN ({gph})", grp)
+                # batches 本身一行一个批次，一条语句就够，不需要拆
                 await self._db.execute(
                     f"DELETE FROM batches WHERE id IN ({ph})", ids)
                 await self._db.execute("COMMIT")

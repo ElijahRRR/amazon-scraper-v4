@@ -91,10 +91,11 @@ _FIXTURE_HEADER = [
     "      守它的 case：search=Gol%rand / search=Gol_en / search=% /",
     "      search=___ / search=%%%。",
     "",
-    "  * 值为 [\"raise\"] 的条目不是「录制失败」，是 D-8：>=3 字符的 search 配 cursor_id",
-    "      今天就是 500（count 查询把搜索谓词连同参数一起剔了）。崩溃行为本身是契约，",
-    "      PG 侧必须照样崩。修它是 Phase 1.5 的事，修的时候这几条会红 —— 那是对的，",
-    "      届时按上面的规矩重录。",
+    "  * 值为 [\"raise\"] 的条目：这里**曾经**有 5 条 D-8（>=3 字符的 search 配 cursor_id",
+    "      必 500，count 查询把搜索谓词连同参数一起剔了）。D-8 已修 —— count 的谓词",
+    "      与参数改成同一时刻快照，不再靠 \"d.id\" 文本匹配猜哪个是游标谓词。",
+    "      那 5 条已按本文件的规矩重录成正常返回值。若将来又冒出 [\"raise\"]，",
+    "      那是**新**的崩溃，不是历史包袱，先查清楚再决定录不录。",
 ]
 
 RESULTS_READ_HEADER = _COMMON_HEADER + [
@@ -151,7 +152,7 @@ def build_cases() -> List[Tuple[str, str, str, str, tuple, dict]]:
 
     for group, func, kind in (
         ("get_results", T.test_get_results_matches_sqlite, "call"),
-        ("count_bug", T.test_count_bug_is_reproduced, "call"),
+        ("count_bug", T.test_search_with_cursor_no_longer_500s, "call"),
         ("short_term_search", T.test_short_term_search_with_cursor_still_works, "call"),
         ("iter_results", T.test_iter_results_matches_sqlite, "iter"),
     ):
@@ -187,7 +188,8 @@ async def _run_case(db, kind: str, method: str, args: tuple, kwargs: dict):
 
 async def capture_results_read_sqlite() -> Dict[str, Dict[str, Any]]:
     """SQLite 侧：**每条 case 一个全新的库**，和 seeded_sqlite 夹具（function 作用域）
-    的隔离度一致。count_bug 那三条会在库里抛异常，共用连接等于给自己埋雷。"""
+    的隔离度一致（count_bug 那三条历史上会在库里抛异常，共用连接等于给自己埋雷；
+    D-8 修好之后它们不再抛，但每条一个新库这条纪律照旧——它保的是隔离，不是崩溃）。"""
     from common.database import Database as SqliteDatabase
     from tests.pgdb.test_results_read import _seed
 

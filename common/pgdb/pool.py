@@ -68,6 +68,7 @@ import logging
 import os
 import re
 import sqlite3
+import time
 from contextlib import asynccontextmanager
 from typing import Any, List, Optional, Sequence
 
@@ -75,6 +76,7 @@ import asyncpg
 
 from common import config
 from common.core.coerce import as_int  # noqa: F401  —— 再导出，见下方 1) 节的说明
+from common.core.lockmeter import record_pool_wait
 from common.pgdb._shared import TimedLock
 
 logger = logging.getLogger(__name__)
@@ -235,6 +237,66 @@ _TX_ROLLBACK = frozenset({"rollback", "rollback transaction"})
 # 返回行的语句：走 fetch()；其余走 execute() 拿命令标签。
 _ROW_RETURNING_HEAD = ("select", "values", "table", "show", "explain")
 _RETURNING_RE = re.compile(r"\breturning\b", re.IGNORECASE)
+
+#: CTE 外层语句可能的开头。用来判断 ``WITH ...`` 到底返不返回行。
+_CTE_OUTER_HEADS = frozenset({"select", "values", "table",
+                              "insert", "update", "delete", "merge"})
+
+
+def cte_outer_head(norm: str) -> str:
+    """``WITH ...`` 的**外层**语句关键字（取不到时返回空串）。
+
+    ⚠ 为什么需要它：这里以前的判断是「``with`` 开头的语句，只有文本里出现
+    ``returning`` 才算返回行」。那等于假设每个 CTE 都是数据修改型
+    （``WITH x AS (UPDATE ... RETURNING ...)``）。一条**只读**的
+    ``WITH x AS (SELECT ...) SELECT ...`` 会落到 execute() 分支，
+    于是 ``fetchone()`` 返回 None、``fetchall()`` 返回 []
+    —— **不报错、没有日志，就是查不到数据**。
+    results_read 的搜索 CTE 第一次跑就踩中了：COUNT 说有 3 行，
+    列表却是空的，两条查询谓词一模一样。
+
+    做法：按括号深度扫描，取 CTE 定义列表**之外**（深度 0）的第一个语句关键字。
+        with a as ( ... ), b as ( ... ) select ...   -> "select"
+        with a as ( ... ) insert into t ... returning -> "insert"
+    单引号 / 双引号里的内容整段跳过，免得字面量里的括号把深度算歪。
+    """
+    depth = 0
+    i, n = 0, len(norm)
+    word_start = -1
+    while i < n:
+        ch = norm[i]
+        if ch == "'" or ch == '"':
+            q = ch
+            i += 1
+            while i < n:
+                if norm[i] == q:
+                    # '' 是转义的单引号，不算收尾
+                    if q == "'" and i + 1 < n and norm[i + 1] == "'":
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            word_start = -1
+            continue
+        if ch == "(":
+            depth += 1
+            word_start = -1
+        elif ch == ")":
+            depth -= 1
+            word_start = -1
+        elif depth == 0 and (ch.isalpha() or ch == "_"):
+            if word_start < 0:
+                word_start = i
+            if i + 1 >= n or not (norm[i + 1].isalpha() or norm[i + 1] == "_"):
+                word = norm[word_start:i + 1]
+                if word in _CTE_OUTER_HEADS:
+                    return word
+                word_start = -1
+        else:
+            word_start = -1
+        i += 1
+    return ""
 
 # `col LIKE ?` -> `ascii_lower(col) LIKE ascii_lower(?) ESCAPE ''`
 #
@@ -605,7 +667,12 @@ class ConnProxy:
         head = norm.split(" ", 1)[0] if norm else ""
         returns_rows = (
             head in _ROW_RETURNING_HEAD
-            or (head == "with" and bool(_RETURNING_RE.search(norm)))
+            # WITH：看**外层**语句是什么。只读 CTE（外层是 SELECT/VALUES/TABLE）
+            # 一定返回行；数据修改型 CTE 仍然要靠 RETURNING 判断。
+            # 详见 cte_outer_head 的 docstring —— 判错的代价是静默返回空结果集。
+            or (head == "with"
+                and (cte_outer_head(norm) in ("select", "values", "table")
+                     or bool(_RETURNING_RE.search(norm))))
             or (head in ("insert", "update", "delete")
                 and bool(_RETURNING_RE.search(norm)))
         )
@@ -917,10 +984,16 @@ class PoolMixin:
         与 SQLite 版形状一致：``async with db.read() as rc, rc.execute(sql, p) as c:``
         回退分支也保留（池未就绪时退化到写连接），与 database.py:363-364 一致。
         """
+        _t0 = time.perf_counter()
         if self._pool is None:
+            record_pool_wait((time.perf_counter() - _t0) * 1000)
             yield self._write_proxy
             return
         conn = await self._pool.acquire()
+        # 池满时 acquire() 会在这里排队。这个数以前谁也看不到，诊断"页面慢"
+        # 只能靠外部采 pg_stat_activity 反推池满没满 —— 现在它就在
+        # /api/_debug/lock-stats 的 waits.read_pool 里。
+        record_pool_wait((time.perf_counter() - _t0) * 1000)
         proxy = ConnProxy(conn, allow_tx=False, label="read")
         try:
             yield proxy

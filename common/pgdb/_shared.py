@@ -72,6 +72,7 @@ from common.core import (
     CLEAR_TABLES,
     # ---- 按 ASIN 删除 / 模糊搜索（DELETE /api/results）----
     ASIN_DELETE_CHUNK,
+    BATCH_DELETE_CHUNK,
     ASIN_DELETE_TABLES,
     search_like_pattern,
 )
@@ -102,6 +103,7 @@ __all__ = [
     "_ASIN_DATA_COLUMN_SET",
     "CLEAR_TABLES",
     "ASIN_DELETE_CHUNK",
+    "BATCH_DELETE_CHUNK",
     "ASIN_DELETE_TABLES",
     "search_like_pattern",
 ]

@@ -323,8 +323,18 @@ async function prioritizeBatch(batchId, name) {
 
 async function deleteBatch(name) {
     if (!confirm(`确定删除批次 "${name}"？此操作不可恢复！`)) return;
-    await fetch(`/api/batches/${encodeURIComponent(name)}`, { method: 'DELETE' });
-    location.reload();
+    try {
+        // ⚠ 这里以前是 `await fetch(...); location.reload();` —— **完全不看响应**。
+        // 删除被 401 挡下时页面照样刷新，批次还在原地，一句提示都没有。
+        const resp = await fetch(`/api/batches/${encodeURIComponent(name)}`, { method: 'DELETE' });
+        if (!resp.ok) {
+            alert('删除失败：' + await window.apiErrText(resp));
+            return;
+        }
+        location.reload();
+    } catch (e) {
+        alert('删除异常：' + e);
+    }
 }
 
 // ===== 历史批次：勾选批量删除 =====
@@ -365,11 +375,10 @@ async function bulkDeleteBatches() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ batch_ids: ids }),
         });
-        const data = await resp.json().catch(() => ({}));
         if (resp.ok) {
             location.reload();
         } else {
-            alert('批量删除失败：' + (data.detail || resp.status));
+            alert('批量删除失败：' + await window.apiErrText(resp));
             btn.disabled = false;
             updateBulkDeleteBtn();
         }

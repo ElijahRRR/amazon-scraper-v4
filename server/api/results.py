@@ -75,6 +75,7 @@ from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 # `fields=` 的列名白名单。与 iter_results 的投影白名单**同一个对象** ——
 # 两处对"什么是合法列名"必须给出同一个答案。
 from common.core.asindata import _ASIN_DATA_COLUMN_SET
+from common.core.results_sort import CursorExpired, DEFAULT_SORT, SORT_MODES
 
 
 def _srv():
@@ -165,7 +166,8 @@ async def api_results(batch_id: int = None,
                       change_filter: str = "all",
                       direction: str = "next",
                       fields: str = None,
-                      with_total: bool = True):
+                      with_total: bool = True,
+                      sort: str = DEFAULT_SORT):
     """
     `fields` / `with_total` 是**可选的减负开关**，两个都默认关闭（= 保持原行为）。
 
@@ -192,7 +194,28 @@ async def api_results(batch_id: int = None,
     非法列名 -> **422 拒绝，不静默丢弃**。与 `limit` 超限那条同一个纪律
     （见上面 MAX_PAGE_LIMIT 的注释）：静默丢弃会让调用方把「这个字段没返回」
     读成「这个字段是空的」。
+
+    ------------------------------------------------------------------
+    `sort` —— 排序键，默认 `id`（**默认行为不变**）
+    ------------------------------------------------------------------
+    * `id`（默认）：`ORDER BY d.id DESC`。`asin_data` 一 ASIN 一行、按 asin
+      UPSERT，`id` 在**首次入库**时分配后永不改变 —— 所以这是"第一次见到这个
+      ASIN"的倒序，**不是**"最近采集"。重采的老 ASIN 仍然沉在最底下。
+    * `recent`：`ORDER BY d.updated_at DESC, d.id DESC`，即"最近采的排前面"。
+
+    默认留在 `id` 是因为**游标语义是对外契约**：调用方拿着上一页的 `next_cursor`
+    继续翻，如果服务端某天改了默认排序，同一个游标会翻出语义完全不同的一页，
+    而调用方看不出来。控制台前端显式传 `sort=recent`。
+
+    ⚠ `sort=recent` 且游标那一行已被删除（多半是刚刚在这个页面上删的）
+    -> **422 `cursor_expired`**，调用方应从第一页重来。这里不降级成按 id 比较：
+    那会给出一页语义错误的数据，而且没人看得出来。
     """
+    if sort not in SORT_MODES:
+        raise HTTPException(422, {
+            "error": "invalid_parameter",
+            "message": f"sort 只能是 {' / '.join(SORT_MODES)}，收到 {sort!r}。",
+            "parameter": "sort"})
     cols = None
     if fields is not None:
         cols = [f.strip() for f in fields.split(",") if f.strip()]
@@ -215,16 +238,26 @@ async def api_results(batch_id: int = None,
                 "parameter": "fields",
                 "unknown_fields": unknown})
 
-    result = await _srv().db.get_results(
-        batch_id=batch_id,
-        cursor_id=cursor,
-        limit=limit,
-        search=search,
-        change_filter=change_filter,
-        direction=direction,
-        columns=cols,
-        with_total=with_total,
-    )
+    try:
+        result = await _srv().db.get_results(
+            batch_id=batch_id,
+            cursor_id=cursor,
+            limit=limit,
+            search=search,
+            change_filter=change_filter,
+            direction=direction,
+            columns=cols,
+            with_total=with_total,
+            sort=sort,
+        )
+    except CursorExpired as e:
+        # 游标那一行没了（多半是刚在这个页面上删掉的）。给一个**可操作**的
+        # 422 而不是空页 —— 空页会被读成"数据到头了"。
+        raise HTTPException(422, {
+            "error": "cursor_expired",
+            "message": (f"游标 {e.cursor_id} 指向的行已不存在（可能已被删除）。"
+                        "请从第一页重新开始翻页。"),
+            "parameter": "cursor"})
     return result
 
 

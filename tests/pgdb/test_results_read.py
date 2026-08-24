@@ -289,14 +289,24 @@ async def test_get_results_matches_sqlite(seeded_pg, seeded_sqlite, kw):
     dict(search="GoldenBrand", cursor_id=5, batch_id=1),
     dict(search="Wireless,GoldenBrand", cursor_id=5),
 ])
-async def test_count_bug_is_reproduced(seeded_pg, seeded_sqlite, kw):
-    """决策 D-8：>=3 字符的 search + cursor 今天就是 500，PG 侧必须照样 500。
+async def test_search_with_cursor_no_longer_500s(seeded_pg, seeded_sqlite, kw):
+    """决策 D-8 **已修**：``search`` + ``cursor`` 不再 500，两个后端一起。
 
-    根因是 database.py:2249-2255 那个 ``"d.id" not in p`` 的过滤把搜索谓词
-    连同参数一起从 count 查询里剔了。修法留给 Phase 1.5。
+    ⚠ 这个测试原名 ``test_count_bug_is_reproduced``，断言的是"两边都必须
+    抛异常"——那时崩溃本身是被刻意复现的既有行为（详见 results_read.py
+    模块头第二节）。D-8 自己写着"留给 Phase 1.5 修"，本轮修了：
+
+      根因不是搜索谓词，是 count 查询靠 ``"d.id" not in p`` **猜**哪个谓词
+      是 keyset 游标。搜索快路径的谓词文本里也含 "d.id"，于是被一并剔掉，
+      而 count_params 里仍留着它的 3N 个参数 -> 参数个数对不上 -> 500。
+      现在 count 的谓词与参数在同一时刻快照（keyset 追加之前），从结构上
+      不可能对不齐，也不再依赖任何文本匹配。
+
+    保留三个原参数组合：它们正是当年触发崩溃的那三条路径。
     """
-    assert (await _call(seeded_sqlite, "get_results", **kw))[0] == "raise"
-    assert (await _call(seeded_pg, "get_results", **kw))[0] == "raise"
+    sq = await _call(seeded_sqlite, "get_results", **kw)
+    assert sq[0] == "ok", sq
+    assert await _call(seeded_pg, "get_results", **kw) == sq
 
 
 @pytest.mark.asyncio
