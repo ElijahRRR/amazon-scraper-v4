@@ -20,6 +20,11 @@ from datetime import timedelta
 from common import config
 from common.core.timeutil import now_ts, ts_from, utc_now
 from common.core.error_types import SERVER_REJECT
+# F-010 关键词采集：关键词归一化（截断到主键放得下的长度 + 压空白）。
+# 与 server 侧 HTTP 边界用的是**同一个函数** —— 两处各写一份的话，server 收下的
+# 关键词和落库的关键词会悄悄不同，而 search_discoveries 的主键含 keyword，
+# 结果是翻页去重失效、同一个词在库里裂成两行。
+from common.core.searchurl import normalize_keyword
 
 # ============================================================
 # 与 PG 后端共享的纯 Python 符号 —— 定义在 common/core/（Phase 4.1）。
@@ -412,6 +417,30 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_seller_disc_seller ON seller_discoveries(seller_id);
             CREATE INDEX IF NOT EXISTS idx_seller_disc_asin ON seller_discoveries(asin);
             CREATE INDEX IF NOT EXISTS idx_seller_disc_batch ON seller_discoveries(batch_id);
+
+            -- 关键词搜索发现结果表（F-010）
+            -- 每行 = 某 batch 在某关键词下发现的一个 ASIN。
+            -- 与 seller_discoveries 同构，多出 page_no / rank / is_sponsored：
+            -- 搜索结果的**位置**是关键词采集独有的价值（自然排名），
+            -- 而不记 is_sponsored 的话 rank 这个数字没有意义（广告位混在里面）。
+            -- keyword 进主键，长度由 common/core/searchurl.MAX_KEYWORD_LEN 截断。
+            -- 与 PG 侧 common/pgdb/schema.py 的同名表一一对应（C4）。
+            CREATE TABLE IF NOT EXISTS search_discoveries (
+                batch_id   INTEGER NOT NULL,
+                keyword    TEXT NOT NULL,
+                asin       TEXT NOT NULL,
+                list_title TEXT,
+                list_price TEXT,
+                list_image TEXT,
+                page_no    INTEGER DEFAULT 0,
+                rank       INTEGER DEFAULT 0,
+                is_sponsored INTEGER DEFAULT 0,
+                discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (batch_id, keyword, asin)
+            );
+            CREATE INDEX IF NOT EXISTS idx_search_disc_keyword ON search_discoveries(keyword);
+            CREATE INDEX IF NOT EXISTS idx_search_disc_asin ON search_discoveries(asin);
+            CREATE INDEX IF NOT EXISTS idx_search_disc_batch ON search_discoveries(batch_id);
         """)
 
         # 迁移：为已有 tasks 表添加 lease_epoch 列（CREATE TABLE IF NOT EXISTS 不修改已有表）
@@ -1666,6 +1695,266 @@ class Database:
 
             async with rc.execute(
                 "SELECT COUNT(*) FROM seller_discoveries WHERE batch_id=?", (batch_id,)
+            ) as c:
+                row = await c.fetchone()
+                out["discovered_asins"] = row[0] if row else 0
+        return out
+
+    # ==================== 关键词搜索采集（F-010）====================
+    #
+    # 与上面的 F-009 三件套逐条同构（建批次 / 收结果 / 查进度），差异只有三处，
+    # 都是关键词场景独有的：
+    #
+    #   1. **筛选参数要下发给 worker。** seller 任务只需要一个 seller_id，
+    #      关键词任务还带价格区间 / 配送方式 / 翻页上限 / 站点。它们建批次时
+    #      就写进 `tasks.task_meta`（键 "search"），worker 从 pull_tasks 的
+    #      返回里读——不新增列，也不需要 worker 再回查一次批次。
+    #   2. **收结果时 task_meta 要合并而不是覆盖。** F-009 那条直接
+    #      `SET task_meta=?` 把结果写进去；这里那样写会把筛选参数抹掉，
+    #      于是"这批数据当初是按什么条件采的"永久丢失（重试、对账、导出
+    #      都要用它）。所以先读回来再合并。
+    #   3. **发现结果多三列** page_no / rank / is_sponsored，见建表注释。
+
+    async def create_search_batch(self, name: str, keywords: List[str],
+                                  search_params: Optional[Dict] = None,
+                                  discover_mode: str = "with_detail",
+                                  zip_code: str = "10001",
+                                  needs_screenshot: bool = False) -> Tuple[int, int]:
+        """创建一个 keyword_discovery 批次，每个关键词一个 discover_search 任务。
+
+        - 衍生的 ASIN 详情任务在 discover 任务完成时由
+          accept_search_discovery_result 动态插入（同 F-009）。
+        - `search_params` 应是 `common.core.searchurl.normalize_search_params()`
+          的输出；这里**不再校验**（校验属于 HTTP 边界，重复一份就会分叉），
+          原样序列化进 task_meta。
+        - 截图开关只作用于衍生的详情任务，discover 任务本身不截图。
+
+        Returns: (batch_id, inserted_search_task_count)
+        """
+        if discover_mode not in ("discover_only", "with_detail"):
+            raise ValueError(f"非法 discover_mode: {discover_mode}")
+
+        clean_kws = []
+        seen = set()
+        for kw in keywords or []:
+            kw = normalize_keyword(kw)
+            # 大小写不敏感去重：Amazon 搜索本身不区分，两条只会采出同一批结果，
+            # 但 tasks 的 UNIQUE(batch_id, asin) 是区分大小写的，拦不住。
+            if kw and kw.lower() not in seen:
+                clean_kws.append(kw)
+                seen.add(kw.lower())
+        if not clean_kws:
+            return (0, 0)
+
+        meta_json = json.dumps({"search": search_params or {}}, ensure_ascii=False)
+        ss_val = 1 if needs_screenshot else 0
+        async with self._write_lock:
+            await self._db.execute("BEGIN")
+            try:
+                await self._db.execute(
+                    "INSERT OR IGNORE INTO batches (name, needs_screenshot, is_auto, batch_type, discover_mode) "
+                    "VALUES (?, ?, 0, 'keyword_discovery', ?)",
+                    (name, ss_val, discover_mode)
+                )
+                async with self._db.execute("SELECT id FROM batches WHERE name = ?", (name,)) as c:
+                    row = await c.fetchone()
+                    batch_id = row[0] if row else 0
+                if not batch_id:
+                    await self._db.execute("ROLLBACK")
+                    return (0, 0)
+
+                before = self._db.total_changes
+                await self._db.executemany(
+                    "INSERT OR IGNORE INTO tasks "
+                    "(batch_id, asin, zip_code, needs_screenshot, task_type, task_meta) "
+                    "VALUES (?, ?, ?, 0, 'discover_search', ?)",
+                    [(batch_id, kw, zip_code, meta_json) for kw in clean_kws]
+                )
+                inserted = self._db.total_changes - before
+                await self._db.execute("COMMIT")
+            except Exception:
+                try:
+                    await self._db.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+        return (batch_id, inserted)
+
+    async def accept_search_discovery_result(self, task_id: int, worker_id: str,
+                                             lease_epoch: int, batch_id: int,
+                                             keyword: str,
+                                             items: List[Dict],
+                                             meta: Optional[Dict] = None) -> Dict:
+        """接受 discover_search 任务结果。
+
+        items: [{"asin","title","price","image","page","rank","sponsored"}, ...]
+        meta:  {"pages_scanned": N, "truncated": bool}
+
+        副作用：
+          1. 写入 search_discoveries
+          2. 若 batch.discover_mode='with_detail'，插入对应的 ASIN 详情任务
+          3. 标记 discover 任务为 done（校验 worker_id + lease_epoch）
+
+        Returns: {"accepted","stale","discovered","new_asins","detail_tasks_created"}
+        """
+        now = now_ts()
+        kw = normalize_keyword(keyword) or ""
+        async with self._write_lock:
+            await self._db.execute("BEGIN")
+            try:
+                # Step 1: 先读回既有 task_meta，把筛选参数保住（见本节头注 2）。
+                #   注意这一读必须在 lease 门**之前或同一事务内**——放在门后也行，
+                #   但那样多一次往返，且 rowcount==0 时白读。
+                async with self._db.execute(
+                    "SELECT task_meta FROM tasks WHERE id=?", (task_id,)
+                ) as c:
+                    mrow = await c.fetchone()
+                merged: Dict[str, Any] = {}
+                if mrow and mrow["task_meta"]:
+                    try:
+                        prev = json.loads(mrow["task_meta"])
+                        if isinstance(prev, dict):
+                            merged.update(prev)
+                    except Exception:
+                        pass  # 坏 JSON 不该挡住结果入库，丢掉重写
+                merged.update(meta or {})
+                meta_json = json.dumps(merged, ensure_ascii=False) if merged else None
+
+                cursor = await self._db.execute(
+                    "UPDATE tasks SET status='done', updated_at=?, task_meta=? "
+                    "WHERE id=? AND worker_id=? AND lease_epoch=? AND status='processing'",
+                    (now, meta_json, task_id, worker_id, lease_epoch)
+                )
+                if cursor.rowcount == 0:
+                    await self._db.execute("ROLLBACK")
+                    return {"accepted": False, "stale": True,
+                            "discovered": 0, "new_asins": 0, "detail_tasks_created": 0}
+
+                # Step 2: 读 batch 元信息
+                async with self._db.execute(
+                    "SELECT discover_mode, needs_screenshot, name FROM batches WHERE id=?",
+                    (batch_id,)
+                ) as c:
+                    brow = await c.fetchone()
+                discover_mode = brow["discover_mode"] if brow else None
+                needs_screenshot = bool(brow["needs_screenshot"]) if brow else False
+                ss_val = 1 if needs_screenshot else 0
+
+                # Step 3: 写 search_discoveries（去重靠 PK）
+                disc_rows = []
+                seen_asins = set()
+                for it in items or []:
+                    asin = (it.get("asin") or "").strip().upper()
+                    if not asin or asin in seen_asins:
+                        continue
+                    seen_asins.add(asin)
+                    disc_rows.append((
+                        batch_id, kw, asin,
+                        (it.get("title") or "")[:1000],
+                        (it.get("price") or "")[:64],
+                        (it.get("image") or "")[:1000],
+                        int(it.get("page") or 0),
+                        int(it.get("rank") or 0),
+                        1 if it.get("sponsored") else 0,
+                    ))
+                if disc_rows:
+                    await self._db.executemany(
+                        "INSERT OR IGNORE INTO search_discoveries "
+                        "(batch_id, keyword, asin, list_title, list_price, list_image, "
+                        " page_no, rank, is_sponsored) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        disc_rows
+                    )
+
+                # Step 4: 若 with_detail，为每个 ASIN 插入详情任务（同 batch_id）
+                detail_inserted = 0
+                if discover_mode == "with_detail" and seen_asins:
+                    async with self._db.execute(
+                        "SELECT zip_code FROM tasks WHERE id=?", (task_id,)
+                    ) as c:
+                        zrow = await c.fetchone()
+                    zip_code = zrow["zip_code"] if zrow else "10001"
+
+                    before = self._db.total_changes
+                    await self._db.executemany(
+                        "INSERT OR IGNORE INTO tasks "
+                        "(batch_id, asin, zip_code, needs_screenshot, task_type) "
+                        "VALUES (?, ?, ?, ?, 'asin')",
+                        [(batch_id, a, zip_code, ss_val) for a in seen_asins]
+                    )
+                    detail_inserted = self._db.total_changes - before
+
+                    for a in seen_asins:
+                        async with self._db.execute(
+                            "SELECT 1 FROM asin_data WHERE asin=?", (a,)
+                        ) as c:
+                            exists = await c.fetchone()
+                        await self._db.execute(
+                            "INSERT OR IGNORE INTO batch_asins (batch_id, asin, is_new) VALUES (?, ?, ?)",
+                            (batch_id, a, 0 if exists else 1)
+                        )
+
+                    if needs_screenshot:
+                        await self._db.executemany(
+                            "INSERT OR IGNORE INTO screenshots (asin, batch_id) VALUES (?, ?)",
+                            [(a, batch_id) for a in seen_asins]
+                        )
+
+                await self._db.execute("COMMIT")
+            except Exception:
+                try:
+                    await self._db.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+
+        return {
+            "accepted": True, "stale": False,
+            "discovered": len(seen_asins),
+            "new_asins": len(seen_asins),
+            "detail_tasks_created": detail_inserted,
+        }
+
+    async def get_search_batch_progress(self, batch_id: int) -> Dict:
+        """keyword_discovery 批次的混合进度：discover 任务 + 衍生的 detail 任务。
+
+        比 F-009 的同名方法多一个 `keywords`（本批关键词数）—— 关键词批次的
+        "有多少个种子"不能像卖家批次那样从 discover.total 推断：discover 任务
+        失败重试不改变种子数，但用户问的是"我提交的 12 个词跑到哪了"。
+        """
+        out = {
+            "batch_id": batch_id,
+            "discover": {"pending": 0, "processing": 0, "done": 0, "failed": 0, "total": 0},
+            "detail":   {"pending": 0, "processing": 0, "done": 0, "failed": 0, "total": 0},
+            "discovered_asins": 0,
+            "keywords": 0,
+            "discover_mode": None,
+        }
+        async with self.read() as rc:
+            async with rc.execute(
+                "SELECT discover_mode FROM batches WHERE id=?", (batch_id,)
+            ) as c:
+                row = await c.fetchone()
+                if row:
+                    out["discover_mode"] = row["discover_mode"]
+
+            async with rc.execute(
+                "SELECT task_type, status, COUNT(*) as cnt FROM tasks "
+                "WHERE batch_id=? GROUP BY task_type, status",
+                (batch_id,)
+            ) as c:
+                async for row in c:
+                    tt = row["task_type"] or "asin"
+                    bucket = out["discover"] if tt == "discover_search" else out["detail"]
+                    bucket[row["status"]] = row["cnt"]
+
+            for bucket in (out["discover"], out["detail"]):
+                bucket["total"] = sum(bucket[k] for k in ("pending", "processing", "done", "failed"))
+            out["keywords"] = out["discover"]["total"]
+
+            async with rc.execute(
+                "SELECT COUNT(DISTINCT asin) FROM search_discoveries WHERE batch_id=?",
+                (batch_id,)
             ) as c:
                 row = await c.fetchone()
                 out["discovered_asins"] = row[0] if row else 0

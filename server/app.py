@@ -1115,6 +1115,46 @@ from server.api import sellers as _sellers_api  # noqa: E402
 app.include_router(_sellers_api.router)
 
 
+# ==================== F-010: 关键词搜索采集 ====================
+#
+# 5 个端点在 server/api/searches.py：search-batches（建批次）、search-options、
+# search-batches/{id}/progress、search-batches/{id}/discoveries，外加
+# POST /api/tasks/search-result（worker 提交发现结果，与 seller-result 同位）。
+#
+# 与 F-009 共用同一套 tasks 表 / worker / 租约 / 重试通道，只多一个
+# task_type='discover_search' 和一张 search_discoveries 表；详情阶段
+# 完全复用既有的 ASIN 采集路径。
+#
+# 路径全是静态或新前缀，与既有路由零交集：
+#   /api/search-batches            新前缀
+#   /api/search-batches/{id}/...   同上，且 {id} 不在任何 catch-all 覆盖范围
+#   /api/search-options            静态
+#   /api/tasks/search-result       静态；/api/tasks/ 下没有 {x} catch-all
+#     （那一族六条 + seller-result 全是静态路径，见 worker_queue.py 承重约束 7）
+#
+# 与 F-009 一样，这一族黄金基线一步都没覆盖（建批次的响应含逐次不同的批次名）。
+# 替代网是 tests/test_search_api.py，两个后端都跑。
+from server.api import searches as _searches_api  # noqa: E402
+
+app.include_router(_searches_api.router)
+
+
+# ==================== F-011: 浏览器插件对接 ====================
+#
+# 3 个端点在 server/api/extension.py：ping / collect / resolve-sellers。
+# 全在 `/api/extension/` 这个新前缀下，与既有路由零交集。
+#
+# 与本节上下两族的关键差异：collect 的**同名批次是追加**，不是 409。
+# 那是插件翻页采集（一页一推，必须落进同一批次）的前提，理由写在该模块头注。
+# 它没有新增任何 DB 方法，全部由 create_batch_if_absent / create_tasks /
+# create_seller_batch 三个既有公开方法拼出来。
+#
+# 替代网是 tests/test_extension_api.py（同样没有黄金网：批次名含时间戳）。
+from server.api import extension as _extension_api  # noqa: E402
+
+app.include_router(_extension_api.router)
+
+
 # 11 个端点搬到 server/api/batches.py：POST /api/upload、GET /api/batches、
 # GET /api/progress、批次 status / screenshots-progress / callback-retry /
 # prioritize / retry / delete / delete-bulk / failures。

@@ -257,6 +257,38 @@ DDL_TABLES: List[str] = [
         PRIMARY KEY (batch_id, seller_id, asin)
     );
     """,
+
+    # ---------------- search_discoveries（10 列，F-010）----------------
+    # 关键词搜索发现结果。与 seller_discoveries 同构，多三列：
+    #   page_no / rank  —— 该 ASIN 在搜索结果里的位置。这是关键词采集**独有**
+    #                      的价值（排名），seller 店内列表没有对应语义。
+    #   is_sponsored    —— 广告位。不记下来的话「第 3 名」这个数字毫无意义。
+    #
+    # ⚠ `rank` 是**页内绝对位置（1 起，含广告位）**，不是"自然排名"。
+    #   两者的差别在丢弃广告位（include_sponsored=false，默认）时会现形：
+    #   那时广告位那几行根本不入库，rank 序列会出现空档（1,3,4,…）——
+    #   空档是**有意义的信息**（"这个位置被广告占了"），不是 bug。
+    #   要自然排名就按 rank 排序后重新编号；要还原页面原貌就看空档。
+    #   跨页的绝对名次推不出来：Amazon 每页条数随布局变（16/24/48/60 都见过），
+    #   所以只存 (page_no, rank) 这一对，不存一个合成的全局序号。
+    # keyword 进主键：同一批次里一个关键词下同一个 ASIN 只留一行（翻页去重）。
+    # 长度由 common/core/searchurl.MAX_KEYWORD_LEN(200) 在写入前截断保证 ——
+    # PG 的 B-tree 行宽上限 ~2704 字节，不截断的话一条超长关键词能顶爆索引。
+    f"""
+    CREATE TABLE IF NOT EXISTS search_discoveries (
+        batch_id      bigint NOT NULL,
+        keyword       text COLLATE "C" NOT NULL,
+        asin          text COLLATE "C" NOT NULL,
+        list_title    text COLLATE "C",
+        list_price    text COLLATE "C",
+        list_image    text COLLATE "C",
+        page_no       integer DEFAULT 0,
+        rank          integer DEFAULT 0,
+        is_sponsored  integer DEFAULT 0,
+        discovered_at text COLLATE "C" DEFAULT {TS_DEFAULT},
+        PRIMARY KEY (batch_id, keyword, asin)
+    );
+    """,
 ]
 
 # ------------------------------------------------------------------
@@ -302,6 +334,13 @@ DDL_INDEXES: List[str] = [
     "CREATE INDEX IF NOT EXISTS idx_seller_disc_seller ON seller_discoveries(seller_id)",
     "CREATE INDEX IF NOT EXISTS idx_seller_disc_asin ON seller_discoveries(asin)",
     "CREATE INDEX IF NOT EXISTS idx_seller_disc_batch ON seller_discoveries(batch_id)",
+
+    # F-010：与 seller_discoveries 的三条一一对应。batch 那条服务
+    # /api/search-batches/{id}/discoveries 的默认列表，asin 那条服务
+    # 「这个 ASIN 在哪些关键词下出现过」这类反查。
+    "CREATE INDEX IF NOT EXISTS idx_search_disc_keyword ON search_discoveries(keyword)",
+    "CREATE INDEX IF NOT EXISTS idx_search_disc_asin ON search_discoveries(asin)",
+    "CREATE INDEX IF NOT EXISTS idx_search_disc_batch ON search_discoveries(batch_id)",
 
     "CREATE INDEX IF NOT EXISTS idx_batches_callback_pending "
     "ON batches(callback_status, callback_next_retry_at)",
@@ -397,6 +436,10 @@ EXPECTED_COLUMNS: Dict[str, List[str]] = {
     "seller_discoveries": [
         "batch_id", "seller_id", "asin", "list_title", "list_price",
         "list_image", "discovered_at",
+    ],
+    "search_discoveries": [
+        "batch_id", "keyword", "asin", "list_title", "list_price",
+        "list_image", "page_no", "rank", "is_sponsored", "discovered_at",
     ],
 }
 
@@ -898,9 +941,11 @@ class SchemaMixin:
         """清空全部业务表并把 identity 重置回 1（测试夹具用）。
 
         与 `DELETE /api/database` 的语义一致：不动 seller_discoveries 之外的
-        取舍见 CLEARED_TABLES 注释。这里为了测试可重复性把它也一并清掉。
+        取舍见 CLEARED_TABLES 注释。这里为了测试可重复性把它也一并清掉，
+        search_discoveries（F-010，同样不在 CLEARED_TABLES 里）同理。
         """
         conn = self._write_conn
         await conn.execute(
             "TRUNCATE asin_changes, asin_data, batch_asins, tasks, "
-            "screenshots, batches, seller_discoveries RESTART IDENTITY")
+            "screenshots, batches, seller_discoveries, search_discoveries "
+            "RESTART IDENTITY")

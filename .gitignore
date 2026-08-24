@@ -25,3 +25,9 @@ env/
 # Runtime monitor artifacts
 .agent/monitor/*.jsonl
 .agent/monitor/*_state.json
+
+# 插件的页面识别层有一份 Node 测试（tests/test_extension_page_js.py），
+# 需要 jsdom。它是**可选**依赖：装了就跑，没装就 skip（与 tests/pgdb 连不上
+# PostgreSQL 时的处理同款），所以这里只忽略安装产物，不往仓库里加 package.json。
+node_modules/
+package-lock.json

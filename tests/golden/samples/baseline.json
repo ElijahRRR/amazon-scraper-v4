@@ -1210,6 +1210,57 @@
                 "summary": "Api Export Screenshots"
               }
             },
+            "/api/extension/collect": {
+              "post": {
+                "description": "插件推送：一批 ASIN + 一批卖家 ID。\n\nBody（全部可选，但 `asins` 与 `seller_ids` 至少要有一个非空）:\n\n| 字段 | 默认 | 说明 |\n|---|---|---|\n| `asins` | `[]` | 要采详情的 ASIN |\n| `seller_ids` | `[]` | 要整店发现的卖家 ID |\n| `batch_name` | 自动生成 `ext_<ts>` | **同名 = 追加**（见模块头注） |\n| `zip_code` | 服务端默认 | 配送邮编 |\n| `needs_screenshot` | `false` | 详情阶段是否截图 |\n| `seller_discover_mode` | `with_detail` | 卖家批次的采集深度 |\n| `source` / `page_url` | — | 仅记录用途，不影响行为 |\n\n响应里 `asin_batch` / `seller_batch` 两块各自独立，某一块没提交就是 `null`。",
+                "operationId": "api_extension_collect_api_extension_collect_post",
+                "responses": {
+                  "200": {
+                    "content": {
+                      "application/json": {
+                        "schema": {}
+                      }
+                    },
+                    "description": "Successful Response"
+                  }
+                },
+                "summary": "Api Extension Collect"
+              }
+            },
+            "/api/extension/ping": {
+              "get": {
+                "description": "插件选项页的「测试连接」打这里。\n\n只回**无害**的运行状态：版本、默认邮编、在线 worker 数。\n刻意不回批次列表 / ASIN 数 / 任何业务数据 —— 这个端点存在的唯一目的是\n回答\"地址对不对、服务活没活着\"，多回一个字段就多一份信息泄露面\n（它是插件唯一一个在配置完成**之前**就会被调用的端点）。",
+                "operationId": "api_extension_ping_api_extension_ping_get",
+                "responses": {
+                  "200": {
+                    "content": {
+                      "application/json": {
+                        "schema": {}
+                      }
+                    },
+                    "description": "Successful Response"
+                  }
+                },
+                "summary": "Api Extension Ping"
+              }
+            },
+            "/api/extension/resolve-sellers": {
+              "post": {
+                "description": "按 ASIN 反查**已采到的**卖家（`asin_data.seller_id`）。\n\n用途：商品详情页上读不到三方卖家时（Amazon 改版、自营页、异步渲染没跑完），\n插件拿这个补全，用户就还能勾\"采集该卖家全部商品\"。\n\n**只回库里已经有的**，查不到就不回 —— 这是补全，不是推测。\n返回一个猜的卖家会让用户采回一整店无关商品，而且完全看不出是错的。",
+                "operationId": "api_extension_resolve_sellers_api_extension_resolve_sellers_post",
+                "responses": {
+                  "200": {
+                    "content": {
+                      "application/json": {
+                        "schema": {}
+                      }
+                    },
+                    "description": "Successful Response"
+                  }
+                },
+                "summary": "Api Extension Resolve Sellers"
+              }
+            },
             "/api/progress": {
               "get": {
                 "operationId": "api_progress_api_progress_get",
@@ -1737,6 +1788,184 @@
                 "summary": "Api Screenshot File"
               }
             },
+            "/api/search-batches": {
+              "post": {
+                "description": "按关键词创建一个 keyword_discovery 批次（JSON）。\n\nBody（除 `keywords` 外全部可选）:\n\n| 字段 | 默认 | 说明 |\n|---|---|---|\n| `keywords` | — | 关键词数组，或用换行/逗号分隔的一个字符串 |\n| `min_price` / `max_price` | `null` | 价格区间（站点货币，支持只给一端） |\n| `delivery` | `null` | 配送/履约筛选，取值见 `GET /api/search-options` |\n| `sort` | `null` | 排序：relevance / price_asc / price_desc / newest / review_rank / featured |\n| `rh_extra` | `null` | 逃生口：原样拼进 `rh=` 的 refinement 串 |\n| `max_pages` | 7 | 每个关键词翻几页（上限 20） |\n| `include_sponsored` | `false` | 是否保留广告位结果 |\n| `domain` | `www.amazon.com` | 站点 |\n| `discover_mode` | `with_detail` | `discover_only` 只翻 ASIN；`with_detail` 顺带派发详情采集 |\n| `zip_code` | 服务端默认 | 详情阶段的配送邮编 |\n| `needs_screenshot` | `false` | 详情阶段是否截图（发现任务本身不截图） |\n| `batch_name` | 自动生成 `keywords_<ts>` | 同名会**并入**已存在的批次（见下） |\n\n**同名批次的语义与 `/api/upload` 不同，是有意的**：这里同名 = 往已有批次\n追加关键词（`ON CONFLICT DO NOTHING` + 取回已存在的 id），不是 409。\n理由是关键词采集天然是增量的 —— 先跑 5 个词看看效果、再补 20 个词进同一批\n是常规用法；而 `/api/upload` 的 409 是为了防\"两个调用方撞名后数据悄悄混在\n一起\"，那条场景在这里由调用方显式给出 batch_name 来表达意图。",
+                "operationId": "api_create_search_batch_api_search_batches_post",
+                "responses": {
+                  "200": {
+                    "content": {
+                      "application/json": {
+                        "schema": {}
+                      }
+                    },
+                    "description": "Successful Response"
+                  }
+                },
+                "summary": "Api Create Search Batch"
+              }
+            },
+            "/api/search-batches/{batch_id}/discoveries": {
+              "get": {
+                "description": "列出某批次发现的 ASIN（可按关键词过滤）。\n\n默认按 `(page_no, rank)` 升序 —— 也就是**搜索结果里的原始顺序**。\n这一点与 `sellers.py` 的同名端点（按 `discovered_at DESC`）有意不同：\n关键词采集的核心产出之一就是名次，按时间排会把它打乱，而 `discovered_at`\n在同一次提交里几乎全部相同（同一个事务），根本排不出稳定顺序。",
+                "operationId": "api_search_discoveries_api_search_batches__batch_id__discoveries_get",
+                "parameters": [
+                  {
+                    "in": "path",
+                    "name": "batch_id",
+                    "required": true,
+                    "schema": {
+                      "title": "Batch Id",
+                      "type": "integer"
+                    }
+                  },
+                  {
+                    "in": "query",
+                    "name": "keyword",
+                    "required": false,
+                    "schema": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Keyword"
+                    }
+                  },
+                  {
+                    "in": "query",
+                    "name": "include_sponsored",
+                    "required": false,
+                    "schema": {
+                      "default": true,
+                      "title": "Include Sponsored",
+                      "type": "boolean"
+                    }
+                  },
+                  {
+                    "in": "query",
+                    "name": "limit",
+                    "required": false,
+                    "schema": {
+                      "default": 200,
+                      "title": "Limit",
+                      "type": "integer"
+                    }
+                  },
+                  {
+                    "in": "query",
+                    "name": "offset",
+                    "required": false,
+                    "schema": {
+                      "default": 0,
+                      "title": "Offset",
+                      "type": "integer"
+                    }
+                  }
+                ],
+                "responses": {
+                  "200": {
+                    "content": {
+                      "application/json": {
+                        "schema": {}
+                      }
+                    },
+                    "description": "Successful Response"
+                  },
+                  "422": {
+                    "content": {
+                      "application/json": {
+                        "schema": {
+                          "$ref": "#/components/schemas/HTTPValidationError"
+                        }
+                      }
+                    },
+                    "description": "Validation Error"
+                  }
+                },
+                "summary": "Api Search Discoveries"
+              }
+            },
+            "/api/search-batches/{batch_id}/progress": {
+              "get": {
+                "description": "keyword_discovery 批次专属进度端点：discover + detail + 已发现 ASIN 数。",
+                "operationId": "api_search_batch_progress_api_search_batches__batch_id__progress_get",
+                "parameters": [
+                  {
+                    "in": "path",
+                    "name": "batch_id",
+                    "required": true,
+                    "schema": {
+                      "title": "Batch Id",
+                      "type": "integer"
+                    }
+                  }
+                ],
+                "responses": {
+                  "200": {
+                    "content": {
+                      "application/json": {
+                        "schema": {}
+                      }
+                    },
+                    "description": "Successful Response"
+                  },
+                  "422": {
+                    "content": {
+                      "application/json": {
+                        "schema": {
+                          "$ref": "#/components/schemas/HTTPValidationError"
+                        }
+                      }
+                    },
+                    "description": "Validation Error"
+                  }
+                },
+                "summary": "Api Search Batch Progress"
+              }
+            },
+            "/api/search-options": {
+              "get": {
+                "description": "某站点当前可用的筛选取值。UI 的下拉框与调用方的自检都读它。\n\n存在的理由：`delivery` 背后是 Amazon 的 refinement 节点 ID，**按站点不同、\n且会随 Amazon 改版变化**（见 `common/core/searchurl` 头注）。把可用取值做成\n端点而不是写死在前端，改配置（`SEARCH_DELIVERY_FILTERS`）就能立刻生效，\n不必发版；也让\"这个站点为什么没有 prime 选项\"这个问题有个可查的答案。",
+                "operationId": "api_search_options_api_search_options_get",
+                "parameters": [
+                  {
+                    "in": "query",
+                    "name": "domain",
+                    "required": false,
+                    "schema": {
+                      "default": "www.amazon.com",
+                      "title": "Domain",
+                      "type": "string"
+                    }
+                  }
+                ],
+                "responses": {
+                  "200": {
+                    "content": {
+                      "application/json": {
+                        "schema": {}
+                      }
+                    },
+                    "description": "Successful Response"
+                  },
+                  "422": {
+                    "content": {
+                      "application/json": {
+                        "schema": {
+                          "$ref": "#/components/schemas/HTTPValidationError"
+                        }
+                      }
+                    },
+                    "description": "Validation Error"
+                  }
+                },
+                "summary": "Api Search Options"
+              }
+            },
             "/api/seller-batches/{batch_id}/discoveries": {
               "get": {
                 "description": "列出某批次发现的 ASIN（可按 seller_id 过滤）。",
@@ -2093,6 +2322,23 @@
                   }
                 },
                 "summary": "Api Screenshot Fail"
+              }
+            },
+            "/api/tasks/search-result": {
+              "post": {
+                "description": "接收 worker 的 discover_search 任务结果（F-010）。\n\nPayload: {task_id, batch_id, worker_id, lease_epoch, keyword, items, meta}",
+                "operationId": "api_submit_search_result_api_tasks_search_result_post",
+                "responses": {
+                  "200": {
+                    "content": {
+                      "application/json": {
+                        "schema": {}
+                      }
+                    },
+                    "description": "Successful Response"
+                  }
+                },
+                "summary": "Api Submit Search Result"
               }
             },
             "/api/tasks/seller-result": {
@@ -5906,7 +6152,7 @@
           "__html__": {
             "has_jinja_error": false,
             "has_traceback": false,
-            "size_bucket": 32
+            "size_bucket": 42
           }
         },
         "content_type": "text/html",

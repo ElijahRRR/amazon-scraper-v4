@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>Amazon Scraper 采集助手 · 选项</title>
+  <link rel="stylesheet" href="popup.css">
+  <style>
+    body { width: auto; max-width: 640px; margin: 0 auto; padding: 24px; }
+    h1 { font-size: 18px; margin: 0 0 4px; }
+    h2 { font-size: 14px; margin: 20px 0 8px; }
+    label.field { display: block; margin-bottom: 12px; }
+    label.field > span { display: block; margin-bottom: 4px; font-weight: 500; }
+    input[type="text"], input[type="password"], select {
+      width: 100%; padding: 6px 8px; border: 1px solid var(--border);
+      border-radius: 5px; background: var(--bg); color: var(--fg); font-size: 13px;
+    }
+    input[type="number"] { width: 100px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .btn { width: auto; padding: 7px 16px; display: inline-block; }
+    .btn-row { gap: 8px; margin-top: 16px; }
+    .btn-row .btn { flex: 0 0 auto; }
+  </style>
+</head>
+<body>
+  <h1>采集助手设置</h1>
+  <p class="meta">这些设置保存在浏览器本地，不会上传到任何地方。</p>
+
+  <h2>Server 连接</h2>
+  <label class="field">
+    <span>Server 地址</span>
+    <input type="text" id="serverUrl" placeholder="http://192.168.1.10:8899">
+  </label>
+  <div class="hint">
+    就是你自建的 Amazon Scraper v4 控制台地址。不带路径，例如
+    <code>http://1.2.3.4:8899</code>。
+  </div>
+
+  <label class="field" style="margin-top:12px;">
+    <span>管理令牌（可选）</span>
+    <input type="password" id="adminToken" placeholder="服务端配了 ADMIN_TOKEN 才需要">
+  </label>
+
+  <div class="btn-row" style="display:flex;">
+    <button id="grant" class="btn btn-plain">授权访问该地址</button>
+    <button id="test" class="btn btn-primary">测试连接</button>
+  </div>
+  <div class="hint">
+    浏览器要求扩展显式获得访问某个域名的许可。第一次配好地址后点一次「授权访问」，
+    弹出的系统提示选「允许」即可；换地址后要重新授权。
+  </div>
+
+  <h2>采集默认值</h2>
+  <div class="grid">
+    <label class="field">
+      <span>配送邮编</span>
+      <input type="text" id="zipCode" placeholder="留空则用服务端默认">
+    </label>
+    <label class="field">
+      <span>卖家整店采集深度</span>
+      <select id="sellerDiscoverMode">
+        <option value="with_detail">发现 ASIN + 抓详情</option>
+        <option value="discover_only">仅发现 ASIN</option>
+      </select>
+    </label>
+    <label class="field">
+      <span>翻页上限（默认）</span>
+      <input type="number" id="maxPages" min="1" max="50">
+    </label>
+    <label class="field">
+      <span>翻页间隔（毫秒）</span>
+      <input type="number" id="pageDelayMs" min="500" max="60000" step="500">
+    </label>
+  </div>
+  <div class="hint">
+    翻页间隔别调太小：连着打 Amazon 很快会吃到验证码，那时整个任务会从「慢一点」
+    变成「后面几页全是空的」。
+  </div>
+
+  <h2>开关</h2>
+  <label class="check"><input type="checkbox" id="needsScreenshot"> <span>详情采集时开启网页截图取证</span></label>
+  <label class="check"><input type="checkbox" id="includeSponsored"> <span>保留广告位商品（默认丢弃）</span></label>
+  <label class="check"><input type="checkbox" id="autoPaginate"> <span>弹窗里默认勾上「翻页采集」</span></label>
+
+  <div class="btn-row" style="display:flex;">
+    <button id="save" class="btn btn-primary">保存</button>
+  </div>
+
+  <div id="status" class="status hidden" style="margin-top:16px;"></div>
+
+  <script src="options.js"></script>
+</body>
+</html>

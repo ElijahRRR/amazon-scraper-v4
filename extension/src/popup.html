@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>Amazon Scraper 采集助手</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <span class="brand">Amazon Scraper v4</span>
+    <a href="#" id="openOptions" class="link">选项</a>
+  </header>
+
+  <!-- 页面类型徽标：三种模式共用一个位置 -->
+  <div id="pageBadge" class="badge badge-unknown">识别中…</div>
+  <div id="pageMeta" class="meta"></div>
+
+  <!-- 正在跑的翻页任务（优先于下面所有面板显示） -->
+  <section id="runPanel" class="panel hidden">
+    <div class="row">
+      <strong>翻页采集进行中</strong>
+      <span id="runProgress" class="mono"></span>
+    </div>
+    <div id="runDetail" class="hint"></div>
+    <button id="stopRun" class="btn btn-danger">停止</button>
+  </section>
+
+  <!-- 列表页 / 卖家页共用的采集面板 -->
+  <section id="listPanel" class="panel hidden">
+    <div class="row">
+      <span id="listCount" class="mono">本页 – 个商品</span>
+    </div>
+    <label class="check">
+      <input type="checkbox" id="paginate">
+      <span>翻页采集</span>
+    </label>
+    <div class="row indent" id="pagesRow">
+      <label for="maxPages">最多翻</label>
+      <input type="number" id="maxPages" min="1" max="50" value="5">
+      <span>页</span>
+    </div>
+    <button id="collectList" class="btn btn-primary">采集本页并推送</button>
+    <div class="hint">
+      推送后由 Server 派发给 worker 采集完整详情（价格 / 库存 / 配送 / 卖家 / 变体…）。
+    </div>
+  </section>
+
+  <!-- 卖家页专属：整店采集 -->
+  <section id="sellerPanel" class="panel hidden">
+    <div class="row"><strong>卖家店铺</strong> <span id="sellerId" class="mono"></span></div>
+    <button id="collectSeller" class="btn btn-accent">采集该卖家全部商品</button>
+    <div class="hint">
+      交给 Server 端翻页发现整店 ASIN（不占用浏览器），比在这里逐页翻更快也更全。
+    </div>
+    <div id="sellerWarn" class="warn hidden"></div>
+  </section>
+
+  <!-- 详情页：加入待采队列 -->
+  <section id="detailPanel" class="panel hidden">
+    <div class="row"><strong id="detailAsin" class="mono"></strong></div>
+    <div id="detailTitle" class="meta"></div>
+    <label class="check">
+      <input type="checkbox" id="expandSeller">
+      <span>同时采集该卖家的全部商品</span>
+    </label>
+    <div id="detailSeller" class="hint"></div>
+    <button id="addQueue" class="btn btn-primary">加入待采队列</button>
+  </section>
+
+  <!-- 待采队列：任何页面上都能看到与提交 -->
+  <section id="queuePanel" class="panel">
+    <div class="row">
+      <strong>待采队列</strong>
+      <span id="queueCount" class="mono">0</span>
+    </div>
+    <ul id="queueList" class="queue"></ul>
+    <div class="btn-row">
+      <button id="submitQueue" class="btn btn-primary" disabled>提交队列</button>
+      <button id="resolveSellers" class="btn btn-plain" disabled
+              title="队列里读不到卖家的条目，问服务端要（该 ASIN 以前采过就有）">补全卖家</button>
+      <button id="clearQueue" class="btn btn-plain" disabled>清空</button>
+    </div>
+    <div class="hint" id="queueHint"></div>
+  </section>
+
+  <div id="status" class="status hidden"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

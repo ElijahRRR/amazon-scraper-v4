@@ -2717,32 +2717,67 @@ parser = AmazonParser()
 # 与 server/app.py 共用同一个编译对象；正则本身与旧的本地定义逐字节相同。
 
 
-def parse_seller_listing(html_text: str) -> Dict[str, Any]:
-    """解析三方卖家列表页 /s?me={seller_id}&page=N。
+# ══════════════════════════════════════════════════════════════════
+# 搜索结果网格（`/s?...`）—— 卖家店内列表（F-009）与关键词搜索（F-010）
+# 走的是**同一个页面模板**，所以解析只有一份
+# ══════════════════════════════════════════════════════════════════
+#
+# 为什么要合并成一份：这块是整个解析器里**最易碎**的部分 —— `s-result-item` /
+# `s-pagination-next` 这些类名是 Amazon 的前端产物，改版就变。原先只有
+# `parse_seller_listing` 一处；F-010 再抄一份的话，下次 Amazon 改类名就要
+# 记得改两处，而漏掉的那一处**不会报错**，只会安静地返回 0 个 ASIN，
+# 表现为「这个关键词没搜到东西」或「这个卖家没有商品」。
+#
+# 两个调用方的差异只有"要不要额外字段"，所以做成一个 `extras` 开关：
+#   parse_seller_listing  —— 不要，返回形状与合并前**逐键相同**（老调用方不受影响）
+#   parse_search_listing  —— 要 rank / sponsored（自然排名是关键词采集的核心价值）
 
-    Returns:
-        {
-          "items":   [{"asin","title","price","image"}, ...],
-          "asins":   [...],
-          "has_next": bool,
-          "page_info": str,  # 'No results' / 'CAPTCHA' / 'OK' 等，便于诊断
-        }
+#: 广告位标记。Amazon 目前同时用这三种，且随布局切换，所以三条都查。
+#: 少查一条的后果不是报错，是 rank 这一列悄悄把广告位算成自然排名。
+_SPONSORED_SELECTORS = (
+    '[data-component-type="sp-sponsored-result"]',
+    '.puis-sponsored-label-text',
+    '.s-sponsored-label-text',
+)
+
+_SPONSORED_XPATHS = (
+    './/*[@data-component-type="sp-sponsored-result"]',
+    './/*[contains(@class,"puis-sponsored-label-text")]',
+    './/*[contains(@class,"s-sponsored-label-text")]',
+)
+
+
+def _grid_page_guard(html_text: str) -> Optional[str]:
+    """空页 / 验证码 / 拦截的快速侦测。返回 page_info，正常页返回 None。
+
+    与 `_parse_with_selectolax` 的判定对齐（同一批标记）。
     """
-    out = {"items": [], "asins": [], "has_next": False, "page_info": ""}
     if not html_text:
-        out["page_info"] = "empty_html"
-        return out
-
-    # 验证码 / 拦截快速侦测（与 _parse_with_selectolax 对齐）
+        return "empty_html"
     low = html_text[:4096].lower()
     if "validateCaptcha" in html_text or "/errors/validateCaptcha" in html_text:
-        out["page_info"] = "captcha"
-        return out
+        return "captcha"
     if "robot check" in low or "to discuss automated access" in low:
-        out["page_info"] = "blocked"
+        return "blocked"
+    return None
+
+
+def _parse_result_grid(html_text: str, *, extras: bool = False) -> Dict[str, Any]:
+    """解析 `/s?...` 结果网格。`extras=True` 时每条附带 rank / sponsored。
+
+    `rank` 是**页内**序号（从 1 开始，跳过解析不出 ASIN 的占位 item）。
+    跨页的绝对名次由调用方用 `(page-1) * 每页条数 + rank` 推不出来 ——
+    Amazon 每页条数随布局变（16 / 24 / 48 / 60 都见过），所以这里只给页内序号，
+    页号由 worker 另外记（`search_discoveries.page_no`）。
+    """
+    out: Dict[str, Any] = {"items": [], "asins": [], "has_next": False, "page_info": ""}
+
+    guard = _grid_page_guard(html_text)
+    if guard:
+        out["page_info"] = guard
         return out
 
-    items = []
+    items: List[Dict[str, Any]] = []
     seen = set()
 
     if _USE_SELECTOLAX:
@@ -2775,7 +2810,11 @@ def parse_seller_listing(html_text: str) -> Dict[str, Any]:
             if img:
                 image = (img.attributes.get('src') or '').strip()
 
-            items.append({"asin": asin, "title": title, "price": price, "image": image})
+            item: Dict[str, Any] = {"asin": asin, "title": title, "price": price, "image": image}
+            if extras:
+                item["rank"] = len(items) + 1
+                item["sponsored"] = any(node.css_first(sel) for sel in _SPONSORED_SELECTORS)
+            items.append(item)
 
         # 翻页：a.s-pagination-next 存在且不带 disabled 类
         next_node = tree.css_first('a.s-pagination-next')
@@ -2803,7 +2842,11 @@ def parse_seller_listing(html_text: str) -> Dict[str, Any]:
             price = (price_nodes[0].strip() if price_nodes else "")
             img_nodes = node.xpath('.//img[contains(@class,"s-image")]/@src')
             image = (img_nodes[0].strip() if img_nodes else "")
-            items.append({"asin": asin, "title": title, "price": price, "image": image})
+            item = {"asin": asin, "title": title, "price": price, "image": image}
+            if extras:
+                item["rank"] = len(items) + 1
+                item["sponsored"] = any(node.xpath(xp) for xp in _SPONSORED_XPATHS)
+            items.append(item)
 
         next_nodes = tree.xpath('//a[contains(@class,"s-pagination-next")]')
         has_next = False
@@ -2819,3 +2862,36 @@ def parse_seller_listing(html_text: str) -> Dict[str, Any]:
     out["asins"] = [it["asin"] for it in items]
     out["page_info"] = "ok" if items else "no_results"
     return out
+
+
+def parse_seller_listing(html_text: str) -> Dict[str, Any]:
+    """解析三方卖家列表页 /s?me={seller_id}&page=N。
+
+    Returns:
+        {
+          "items":   [{"asin","title","price","image"}, ...],
+          "asins":   [...],
+          "has_next": bool,
+          "page_info": str,  # 'No results' / 'CAPTCHA' / 'OK' 等，便于诊断
+        }
+    """
+    return _parse_result_grid(html_text, extras=False)
+
+
+def parse_search_listing(html_text: str) -> Dict[str, Any]:
+    """解析关键词搜索结果页 /s?k=...&page=N（F-010）。
+
+    与 `parse_seller_listing` 是同一个页面模板、同一份实现，只多两个字段：
+
+    Returns:
+        {
+          "items":   [{"asin","title","price","image","rank","sponsored"}, ...],
+          "asins":   [...],
+          "has_next": bool,
+          "page_info": str,
+        }
+
+    `rank` 是页内序号（1 起），`sponsored` 是广告位标记。两者要一起看才有意义：
+    只记 rank 的话广告位会冒充自然排名，而广告位每次请求都可能不同。
+    """
+    return _parse_result_grid(html_text, extras=True)
