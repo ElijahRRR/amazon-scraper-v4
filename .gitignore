@@ -25,3 +25,9 @@ env/
 # Runtime monitor artifacts
 .agent/monitor/*.jsonl
 .agent/monitor/*_state.json
+
+# Claude Code 给 subagent 开的隔离 git worktree（isolation: "worktree"）。
+# 每个都是整个仓库的一份副本，是临时的、workflow 结束会自动清掉 ——
+# 只忽略 worktrees/ 而不是整个 .claude/：将来真要提交
+# .claude/settings.json 或 skills 时，它们还能正常出现在 git status 里。
+.claude/worktrees/
