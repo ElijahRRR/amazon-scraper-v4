@@ -205,39 +205,99 @@ let state = {
     total: null,
 };
 
+const CHANGE_FILTERS = ['all', 'price_stock', 'title_bullets', 'new'];
+
+// URL <-> 筛选状态。
+//
+// ⚠ 这一段以前**整个不存在**：state.batchId 初始化成 null 之后就只被下拉框改过，
+// 谁也不读 location.search。于是任务页和仪表盘上那三处
+// `<a href="/results?batch_id=...">` 点进来，打开的是一个**没有筛选**的
+// 结果页 —— 链接看起来好好的，行为上等于死链。
+function readFiltersFromUrl() {
+    const q = new URLSearchParams(location.search);
+    const bid = q.get('batch_id');
+    // 只认纯数字：后面要用它和 <option value> 做 == 比较，也要拼进 API 查询串
+    if (bid && /^\d+$/.test(bid)) state.batchId = bid;
+    const cf = q.get('change_filter');
+    if (cf && CHANGE_FILTERS.includes(cf)) state.changeFilter = cf;
+    const sq = q.get('search');
+    if (sq) state.search = sq;
+}
+
+// 把当前筛选写回地址栏（replaceState：不往历史里塞条目，刷新/收藏/分享都能复现）
+function syncUrl() {
+    const q = new URLSearchParams();
+    if (state.batchId) q.set('batch_id', state.batchId);
+    if (state.changeFilter && state.changeFilter !== 'all') q.set('change_filter', state.changeFilter);
+    if (state.search) q.set('search', state.search);
+    const qs = q.toString();
+    history.replaceState(null, '', qs ? `${location.pathname}?${qs}` : location.pathname);
+}
+
+function resetPaging() {
+    state.nextCursor = null;
+    state.prevCursor = null;
+    state.cursorStack = [];
+    state.currentStartCursor = null;
+}
+
 // 初始化
-document.addEventListener('DOMContentLoaded', () => {
-    loadBatches();
+document.addEventListener('DOMContentLoaded', async () => {
+    readFiltersFromUrl();
+    document.getElementById('changeFilter').value = state.changeFilter;
+    document.getElementById('searchInput').value = state.search;
+
+    // ⚠ 必须**先 await** loadBatches()：它会重建整个 <select> 的 <option>，
+    // 在那之前给 sel.value 赋值会被静默丢弃（没有匹配的 option -> value 变空串）。
+    await loadBatches();
+    const sel = document.getElementById('batchFilter');
+    if (state.batchId) {
+        sel.value = state.batchId;
+        if (sel.value !== state.batchId) {
+            // 批次已被删除 / id 不存在：退回全部批次，并说明为什么，
+            // 而不是让用户对着一个"看起来没筛选"的页面猜。
+            logInvalidBatch(state.batchId);
+            state.batchId = null;
+            sel.value = '';
+        }
+    }
+    syncUrl();
+
     loadResults();
     loadChangeStats();
 
     document.getElementById('batchFilter').addEventListener('change', () => {
         state.batchId = document.getElementById('batchFilter').value || null;
-        state.nextCursor = null;
-        state.prevCursor = null;
-        state.cursorStack = [];
+        resetPaging();
+        syncUrl();
         loadResults();
         loadChangeStats();
     });
 
     document.getElementById('changeFilter').addEventListener('change', () => {
         state.changeFilter = document.getElementById('changeFilter').value;
-        state.nextCursor = null;
-        state.prevCursor = null;
-        state.cursorStack = [];
+        resetPaging();
+        syncUrl();
         loadResults();
     });
 
     document.getElementById('searchInput').addEventListener('keyup', e => {
         if (e.key === 'Enter') {
             state.search = e.target.value;
-            state.nextCursor = null;
-            state.prevCursor = null;
-            state.cursorStack = [];
+            resetPaging();
+            syncUrl();
             loadResults();
         }
     });
 });
+
+function logInvalidBatch(id) {
+    const el = document.getElementById('resultBody');
+    if (el) {
+        el.innerHTML = `<tr><td colspan="14" class="text-center text-warning p-4">`
+            + `批次 ${esc(String(id))} 不存在（可能已被删除），已显示全部批次</td></tr>`;
+    }
+}
 
 async function loadBatches() {
     try {
@@ -286,8 +346,11 @@ async function loadResults(cursor = null, direction = 'next') {
     // 只在首屏要一次。cursor 非空 = 在翻页，直接省掉。
     const needTotal = !cursor;
 
+    // sort=recent = 「最近采的排前面」。服务端默认是 sort=id（首次入库倒序），
+    // 那个默认不能动 —— 游标语义是对外契约，改默认会让老调用方拿着同一个游标
+    // 翻出语义完全不同的一页。所以由前端显式要。
     let url = `/api/results?limit=50&change_filter=${state.changeFilter}&direction=${direction}`
-            + `&fields=${UI_FIELDS}`;
+            + `&fields=${UI_FIELDS}&sort=recent`;
     if (!needTotal) url += '&with_total=false';
     if (state.batchId) url += `&batch_id=${state.batchId}`;
     if (state.search) url += `&search=${encodeURIComponent(state.search)}`;
@@ -295,6 +358,18 @@ async function loadResults(cursor = null, direction = 'next') {
 
     try {
         const resp = await fetch(url);
+        if (!resp.ok) {
+            const err = await resp.clone().json().catch(() => ({}));
+            // 游标那一行被删了（多半就是刚在这个页面上删的）。静默退回第一页，
+            // 别把一个 422 甩给用户 —— 他要的只是"接着看"。
+            if (err?.detail?.error === 'cursor_expired' && cursor) {
+                resetPaging();
+                return loadResults();
+            }
+            document.getElementById('resultBody').innerHTML =
+                `<tr><td colspan="14" class="text-center text-danger p-4">加载失败: ${esc(await window.apiErrText(resp))}</td></tr>`;
+            return;
+        }
         const data = await resp.json();
 
         // 翻页时服务端不再回 total（null）——沿用首屏那次的值，别把计数刷成空

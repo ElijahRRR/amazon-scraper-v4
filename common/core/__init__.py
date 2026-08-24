@@ -74,6 +74,15 @@ from common.core.retry import (
     NO_RETRY_ERROR_TYPES,
     _fail_cap,
 )
+from common.core.results_sort import (
+    CursorExpired,
+    DEFAULT_SORT,
+    SORT_MODES,
+    is_next,
+    keyset_predicate,
+    normalize_sort,
+    order_by,
+)
 from common.core.lockmeter import (
     LOCK_STATS,
     TimedLock,
@@ -111,6 +120,13 @@ __all__ = [
     "NO_AUTO_RETRY_ERROR_TYPES",
     "NO_RETRY_ERROR_TYPES",
     "_fail_cap",
+    "CursorExpired",
+    "DEFAULT_SORT",
+    "SORT_MODES",
+    "is_next",
+    "keyset_predicate",
+    "normalize_sort",
+    "order_by",
     "LOCK_STATS",
     "TimedLock",
     "_NamedLockCtx",

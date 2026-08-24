@@ -244,7 +244,23 @@ ASIN 只有一行，后采的覆盖先采的；而 `/api/results?batch_id=` 的 
     命中少时要扫穿整张表。2026-08 线上就是这么坏的 —— 粘 4 个以上 ASIN
     进搜索框 100% 卡满 60s 返回 500，而 4 个高频词只要 245ms。
     200k 行实测：零命中 10 词 `5273ms → 45ms`。
-- **分页**：keyset cursor 分页，单页上限 1000（近期从 200 上调）
+- **排序**：`sort=id`（默认）/ `sort=recent`。
+  ⚠ **默认那个不是"最近采集"**：`asin_data` 一 ASIN 一行、按 asin UPSERT，
+  `id` 在**首次入库**时分配后永不改变，所以 `ORDER BY d.id DESC` 是"第一次见到
+  这个 ASIN"的倒序 —— 两年前入库、今天刚重采完的 ASIN 仍然沉在最底下。
+  `sort=recent` 才是按 `updated_at` 倒序。**控制台的采集结果页已经默认用它**；
+  API 的默认值保持 `id` 不变，因为游标语义是对外契约（同一个游标在两种排序下
+  含义不同，改默认会让老调用方静默翻错页）。
+  - 排序键是 `COALESCE(updated_at, '')` 而不是裸列，配 `idx_asin_data_updated_id`
+    表达式索引。三条理由（每条都踩过）写在 `common/core/results_sort.py` 的模块头，
+    最要命的一条：行值比较遇 NULL 恒为 NULL，`updated_at` 为空的行会在**第一页
+    之后静默消失**。
+  - `sort=recent` 且游标那一行已被删除 -> **422 `cursor_expired`**，请从第一页
+    重来（控制台会自动重来）。这里不降级成按 id 比较：那会给出一页语义错误的
+    数据，而且没人看得出来。
+- **分页**：keyset cursor 分页，单页上限 1000（近期从 200 上调）。
+  游标始终是一个整数 `id`，`sort=recent` 也一样 —— 服务端按主键把该行的
+  `updated_at` 查出来，调用方不需要理解任何新的游标编码。
 - **两个减负开关**（默认都关，不传就是原行为）：`fields=a,b,c` 只返回指定列、
   `with_total=false` 不算全表 COUNT。本端点没有 `response_model`，**82% 的耗时在
   Python 序列化上**，所以这两个开关冲的是响应体而不是 SQL。

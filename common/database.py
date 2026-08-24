@@ -47,6 +47,13 @@ from common.core import (  # noqa: F401  —— 全部是有意的再导出
     _record_hold,
     record_pool_wait,
     record_stage,
+    # ---- /api/results 排序规则（两个后端逐字共用）----
+    CursorExpired,
+    DEFAULT_SORT,
+    is_next,
+    keyset_predicate,
+    normalize_sort,
+    order_by,
     # ---- 解析失败 / 截图路径归一 ----
     _NA_VALUES,
     _normalize_screenshot_path,
@@ -402,6 +409,15 @@ class Database:
             -- 加了这条就不再依赖统计信息。与 PG 侧
             -- common/pgdb/schema.py 的 idx_screenshots_asin_done 一一对应（C4）。
             CREATE INDEX IF NOT EXISTS idx_screenshots_asin_done ON screenshots(asin) WHERE status = 'done';
+
+            -- /api/results?sort=recent 的排序键。与 PG 侧
+            -- common/pgdb/schema.py 的 idx_asin_data_updated_id 一一对应。
+            -- ⚠ 排序键是 COALESCE(updated_at, '') 而不是裸列，三条理由写在
+            --   common/core/results_sort.py 的模块头（NULL 默认位置两个引擎相反、
+            --   SQLite 索引不接受 NULLS LAST、行值比较遇 NULL 静默丢行）。
+            --   表达式必须与查询里的逐字一致，否则索引静默失效。
+            CREATE INDEX IF NOT EXISTS idx_asin_data_updated_id
+                ON asin_data(COALESCE(updated_at, '') DESC, id DESC);
 
             -- 卖家店铺发现结果表（F-009：seller storefront 模式）
             -- 每行 = 某 batch 在某 seller 店内发现的一个 ASIN
@@ -2239,13 +2255,17 @@ class Database:
                           change_filter: str = "all",
                           direction: str = "next",
                           columns: List[str] = None,
-                          with_total: bool = True) -> Dict:
+                          with_total: bool = True,
+                          sort: str = DEFAULT_SORT) -> Dict:
         """
         获取结果列表（keyset 分页）
         change_filter: all / price_stock / title_bullets / new
         direction: next (向后翻页) / prev (向前翻页)
         columns: 只取这些列（None = 全部 56 列，**默认行为不变**）
         with_total: 算不算 total（False -> total 为 None，**默认行为不变**）
+        sort: "id"（默认，按首次入库倒序）/ "recent"（按 updated_at 倒序）。
+              规则的唯一真源在 common/core/results_sort.py，与 PG 侧共用同一份
+              ORDER BY 与 keyset 谓词文本；游标行已删除时抛 CursorExpired。
         返回: {"items": [...], "has_more": bool, "next_cursor": int, "prev_cursor": int, "total": int|None}
 
         ------------------------------------------------------------------
@@ -2293,6 +2313,23 @@ class Database:
                     if forced not in wanted:
                         wanted.append(forced)
                 proj = ", ".join(f"d.{c}" for c in wanted)
+
+        sort = normalize_sort(sort)
+
+        # recent 模式：游标是 int id，但谓词要 (updated_at, id)。先按主键把那一行的
+        # updated_at 查出来。查不到 = 该行已被删除 -> 抛 CursorExpired 让调用方从
+        # 第一页重来。**不要**退回按 id 比较：那会在 ORDER BY updated_at 下给出
+        # 一页语义错误的数据，而且看不出来。与 PG 侧同构。
+        cursor_ts = None
+        if cursor_id is not None and sort == "recent":
+            async with self.read() as rc, rc.execute(
+                    "SELECT updated_at FROM asin_data WHERE id = ?", (cursor_id,)) as c:
+                row = await c.fetchone()
+            if row is None:
+                raise CursorExpired(cursor_id)
+            # ⚠ 也要过 COALESCE 的等价物：谓词左边是 COALESCE(...,'')，
+            #    右边若绑 None，行值比较又退化成 NULL -> 那一页恒空。
+            cursor_ts = row["updated_at"] or ""
 
         join_parts = []
         count_join_parts = []
@@ -2376,13 +2413,15 @@ class Database:
         count_params = join_params + where_params
         count_where_parts = list(where_parts)
 
-        # keyset 分页
+        # keyset 分页。谓词文本与排序键都来自 common/core/results_sort.py，
+        # 与 PG 侧逐字共用 —— 分叉的症状是"同一个游标在两个后端翻出不同的页"，
+        # 而它不会报错。
         if cursor_id is not None:
-            if direction == "next":
-                where_parts.append("d.id < ?")
+            where_parts.append(keyset_predicate(sort, direction))
+            if sort == "recent":
+                where_params.extend([cursor_ts, cursor_id])
             else:
-                where_parts.append("d.id > ?")
-            where_params.append(cursor_id)
+                where_params.append(cursor_id)
 
         params = join_params + where_params
 
@@ -2390,14 +2429,14 @@ class Database:
         join_clause = " ".join(join_parts) if join_parts else ""
         count_join_clause = " ".join(count_join_parts) if count_join_parts else ""
 
-        order = "DESC" if direction == "next" else "ASC"
+        order_by_clause = order_by(sort, direction)
 
         # 查询数据
         sql = f"""
             SELECT {proj or 'd.*'} FROM asin_data d
             {join_clause}
             WHERE {where_clause}
-            ORDER BY d.id {order}
+            ORDER BY {order_by_clause}
             LIMIT ?
         """
         params.append(limit + 1)  # 多取一条判断 has_more
@@ -2410,7 +2449,7 @@ class Database:
         if has_more:
             items = items[:limit]
 
-        if direction == "prev":
+        if not is_next(direction):
             items.reverse()
 
         await self._hydrate_screenshot_paths(items, batch_id)

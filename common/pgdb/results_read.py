@@ -124,6 +124,14 @@ from common.pgdb._shared import (  # noqa: F401
     _normalize_screenshot_path,
     search_like_pattern,
 )
+from common.core.results_sort import (
+    DEFAULT_SORT,
+    CursorExpired,
+    is_next,
+    keyset_predicate,
+    normalize_sort,
+    order_by as _order_by,
+)
 from common.pgdb.pool import LIKE_NO_ESCAPE, as_int, text_affinity
 
 
@@ -161,13 +169,17 @@ class ResultsReadMixin:
                           change_filter: str = "all",
                           direction: str = "next",
                           columns: List[str] = None,
-                          with_total: bool = True) -> Dict:
+                          with_total: bool = True,
+                          sort: str = DEFAULT_SORT) -> Dict:
         """
         获取结果列表（keyset 分页）
         change_filter: all / price_stock / title_bullets / new
         direction: next (向后翻页) / prev (向前翻页)
         columns: 只取这些列（None = 全部 56 列，**默认行为不变**）
         with_total: 算不算 total（False -> total 为 None，**默认行为不变**）
+        sort: "id"（默认，按首次入库倒序）/ "recent"（按 updated_at 倒序，
+              即"最近采的排前面"）。规则的唯一真源在 common/core/results_sort.py，
+              两个后端共用；``recent`` 且游标行已被删除时抛 CursorExpired。
         返回: {"items": [...], "has_more": bool, "next_cursor": int, "prev_cursor": int, "total": int|None}
 
         ------------------------------------------------------------------
@@ -215,6 +227,24 @@ class ResultsReadMixin:
                     if forced not in wanted:
                         wanted.append(forced)
                 proj = ", ".join(f"d.{c}" for c in wanted)
+
+        sort = normalize_sort(sort)
+
+        # recent 模式：游标是 int id，但谓词要 (updated_at, id)。
+        # 先按主键把那一行的 updated_at 查出来。查不到 = 该行已被删除 ->
+        # 抛 CursorExpired 让调用方从第一页重来。**不要**退回按 id 比较：
+        # 那会在 ORDER BY updated_at 下给出一页语义错误的数据，而且看不出来。
+        cursor_ts = None
+        if cursor_id is not None and sort == "recent":
+            async with self.read() as rc, rc.execute(
+                    "SELECT updated_at FROM asin_data WHERE id = ?",
+                    (as_int(cursor_id),)) as c:
+                row = await c.fetchone()
+            if row is None:
+                raise CursorExpired(cursor_id)
+            # ⚠ 也要过 COALESCE 的等价物：谓词左边是 COALESCE(...,'')，
+            #    右边若绑 None，行值比较又退化成 NULL -> 那一页恒空。
+            cursor_ts = row["updated_at"] or ""
 
         join_parts = []
         count_join_parts = []
@@ -296,19 +326,23 @@ class ResultsReadMixin:
         count_params = join_params + where_params + search_params
         count_where_parts = list(where_parts) + ([search_pred] if search_pred else [])
 
-        # keyset 分页
+        # keyset 分页。谓词文本与排序键都来自 common/core/results_sort.py，
+        # 两个后端逐字共用 —— 分叉的症状是"同一个游标在两个后端翻出不同的页"，
+        # 而它不会报错。
         if cursor_id is not None:
-            if direction == "next":
-                where_parts.append("d.id < ?")
+            where_parts.append(keyset_predicate(sort, direction))
+            if sort == "recent":
+                # recent 模式要 (updated_at, id) 两个值，而对外的游标只有 id。
+                # 按主键把那一行的 updated_at 查出来（一次索引查找）。
+                where_params.extend([cursor_ts, as_int(cursor_id)])
             else:
-                where_parts.append("d.id > ?")
-            where_params.append(as_int(cursor_id))
+                where_params.append(as_int(cursor_id))
 
         where_clause = " AND ".join(where_parts) if where_parts else "1=1"
         join_clause = " ".join(join_parts) if join_parts else ""
         count_join_clause = " ".join(count_join_parts) if count_join_parts else ""
 
-        order = "DESC" if direction == "next" else "ASC"
+        order_by_clause = _order_by(sort, direction)
 
         # 查询数据（d.id 是 PK，非空且无并列，不需要 NULLS 位置和 tiebreaker）
         #
@@ -366,7 +400,7 @@ class ResultsReadMixin:
                     branches.append(
                         f"(SELECT d.id FROM asin_data d {join_clause}"
                         f" WHERE {where_clause} AND {_col_like(col)}"
-                        f" ORDER BY d.id {order} LIMIT ?)")
+                        f" ORDER BY {order_by_clause} LIMIT ?)")
                     branch_params.extend(join_params)
                     branch_params.extend(where_params)
                     branch_params.append(pat)
@@ -379,7 +413,7 @@ class ResultsReadMixin:
                 {join_clause}
                 JOIN search_hit sh ON sh.id = d.id
                 WHERE {where_clause}
-                ORDER BY d.id {order}
+                ORDER BY {order_by_clause}
                 LIMIT ?
             """
             # 参数顺序 = SQL 文本顺序：各分支 -> 外层 join -> 外层 where -> limit
@@ -389,7 +423,7 @@ class ResultsReadMixin:
                 SELECT {proj or 'd.*'} FROM asin_data d
                 {join_clause}
                 WHERE {where_clause}
-                ORDER BY d.id {order}
+                ORDER BY {order_by_clause}
                 LIMIT ?
             """
             params = join_params + where_params
@@ -403,7 +437,7 @@ class ResultsReadMixin:
         if has_more:
             items = items[:limit]
 
-        if direction == "prev":
+        if not is_next(direction):
             items.reverse()
 
         # 注意：读连接已经归还，_hydrate 内部还要再借一条（避免池内嵌套借用）

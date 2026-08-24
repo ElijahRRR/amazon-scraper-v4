@@ -1264,7 +1264,7 @@
                 "summary": "Api Delete Results"
               },
               "get": {
-                "description": "`fields` / `with_total` 是**可选的减负开关**，两个都默认关闭（= 保持原行为）。\n\n上面 MAX_PAGE_LIMIT 那段实测记着「82% 的账在 Python 序列化上」。这两个参数\n冲的就是那 82%，它们**不优化 SQL**：\n\n    实测 100 万行、单页 50 行、宽列有真实内容：\n      SELECT d.*（56 列）+ count      54.4 ms    274.2 KB\n      只取 UI 渲染的 15 列              1.2 ms     17.8 KB\n      其中 COUNT(*) 那一条             48.4 ms\n\n`fields=a,b,c` —— 只返回这些列。**必须默认全给**：`items[]` 的列集是对外\n契约（docs/erpapi_contract.md §3.2 允许单方面**加**字段、不许删），\n窄投影只能是调用方显式要的。\n\n⚠ 服务端会**强制补上** `id` / `asin` / `screenshot_path` / `updated_at`，\n即使你没点名 —— 翻页游标与截图路径归一化都要它们。所以返回的键**可能比你\n要的多**，别按\"键集恰好等于我要的\"来写解析。\n\n`with_total=false` —— 不算 `total`，响应里 `total` 是 `null`。\n它是**全表 COUNT**，随行数线性增长，而翻页途中值恒定不变：只在首屏要一次\n就够了。\n\n非法列名 -> **422 拒绝，不静默丢弃**。与 `limit` 超限那条同一个纪律\n（见上面 MAX_PAGE_LIMIT 的注释）：静默丢弃会让调用方把「这个字段没返回」\n读成「这个字段是空的」。",
+                "description": "`fields` / `with_total` 是**可选的减负开关**，两个都默认关闭（= 保持原行为）。\n\n上面 MAX_PAGE_LIMIT 那段实测记着「82% 的账在 Python 序列化上」。这两个参数\n冲的就是那 82%，它们**不优化 SQL**：\n\n    实测 100 万行、单页 50 行、宽列有真实内容：\n      SELECT d.*（56 列）+ count      54.4 ms    274.2 KB\n      只取 UI 渲染的 15 列              1.2 ms     17.8 KB\n      其中 COUNT(*) 那一条             48.4 ms\n\n`fields=a,b,c` —— 只返回这些列。**必须默认全给**：`items[]` 的列集是对外\n契约（docs/erpapi_contract.md §3.2 允许单方面**加**字段、不许删），\n窄投影只能是调用方显式要的。\n\n⚠ 服务端会**强制补上** `id` / `asin` / `screenshot_path` / `updated_at`，\n即使你没点名 —— 翻页游标与截图路径归一化都要它们。所以返回的键**可能比你\n要的多**，别按\"键集恰好等于我要的\"来写解析。\n\n`with_total=false` —— 不算 `total`，响应里 `total` 是 `null`。\n它是**全表 COUNT**，随行数线性增长，而翻页途中值恒定不变：只在首屏要一次\n就够了。\n\n非法列名 -> **422 拒绝，不静默丢弃**。与 `limit` 超限那条同一个纪律\n（见上面 MAX_PAGE_LIMIT 的注释）：静默丢弃会让调用方把「这个字段没返回」\n读成「这个字段是空的」。\n\n------------------------------------------------------------------\n`sort` —— 排序键，默认 `id`（**默认行为不变**）\n------------------------------------------------------------------\n* `id`（默认）：`ORDER BY d.id DESC`。`asin_data` 一 ASIN 一行、按 asin\n  UPSERT，`id` 在**首次入库**时分配后永不改变 —— 所以这是\"第一次见到这个\n  ASIN\"的倒序，**不是**\"最近采集\"。重采的老 ASIN 仍然沉在最底下。\n* `recent`：`ORDER BY d.updated_at DESC, d.id DESC`，即\"最近采的排前面\"。\n\n默认留在 `id` 是因为**游标语义是对外契约**：调用方拿着上一页的 `next_cursor`\n继续翻，如果服务端某天改了默认排序，同一个游标会翻出语义完全不同的一页，\n而调用方看不出来。控制台前端显式传 `sort=recent`。\n\n⚠ `sort=recent` 且游标那一行已被删除（多半是刚刚在这个页面上删的）\n-> **422 `cursor_expired`**，调用方应从第一页重来。这里不降级成按 id 比较：\n那会给出一页语义错误的数据，而且没人看得出来。",
                 "operationId": "api_results_api_results_get",
                 "parameters": [
                   {
@@ -1342,6 +1342,16 @@
                       "default": true,
                       "title": "With Total",
                       "type": "boolean"
+                    }
+                  },
+                  {
+                    "in": "query",
+                    "name": "sort",
+                    "required": false,
+                    "schema": {
+                      "default": "id",
+                      "title": "Sort",
+                      "type": "string"
                     }
                   }
                 ],
@@ -5936,7 +5946,7 @@
           "__html__": {
             "has_jinja_error": false,
             "has_traceback": false,
-            "size_bucket": 28
+            "size_bucket": 31
           }
         },
         "content_type": "text/html",
