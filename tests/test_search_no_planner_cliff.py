@@ -47,7 +47,6 @@ def test_search_columns_match_the_trgm_indexes():
 @pytest.mark.parametrize("kw", [
     dict(search="B0AAA11111,B0BBB22222,B0CCC33333,B0DDD44444,B0EEE55555,"
                 "B0FFF66666,B0GGG77777,B0HHH88888,B0III99999,B0JJJ00000"),  # 10 个零命中 ASIN
-    dict(search="B0AAA11111,B0BBB22222,B0CCC33333,B0DDD44444", batch_id=1),  # + 批次筛选
     dict(search="B0AAA11111,B0BBB22222,B0CCC33333,B0DDD44444", cursor_id=3),  # + 翻页
     dict(search="Golden,B0BBB22222,B0CCC33333,B0DDD44444"),   # 混合：一个高命中 + 三个零命中
 ])
@@ -98,9 +97,6 @@ async def test_search_sql_uses_per_branch_limits(monkeypatch, kw):
     assert data_sql.count("ORDER BY d.id") == n_terms * len(_SEARCH_COLUMNS) + 1
     assert data_sql.count("LIMIT ?") == n_terms * len(_SEARCH_COLUMNS) + 1
 
-    if kw.get("batch_id"):
-        # 筛选必须推进**每一个**分支：只留在外层会静默丢行（实测丢 51 行）
-        assert data_sql.count("JOIN batch_asins") >= n_terms * len(_SEARCH_COLUMNS)
     if kw.get("cursor_id"):
         assert data_sql.count("d.id < ?") == n_terms * len(_SEARCH_COLUMNS) + 1
 
@@ -195,3 +191,100 @@ async def test_long_terms_still_use_branches(monkeypatch):
     db = PgDatabase.__new__(PgDatabase)
     await PgDatabase.get_results(db, limit=50, with_total=False, search="chair,desk,lamp,sofa")
     assert "WITH search_hit AS MATERIALIZED" in seen["sqls"][0][0]
+
+
+def _capture_sql(monkeypatch):
+    """跑一次 get_results，把它拼出来的 SQL + 参数抓回来（不连库）。"""
+    import contextlib
+    from common.pgdb import Database as PgDatabase
+    seen = []
+
+    class _Cur:
+        def __init__(self): self.rowcount = -1
+        async def fetchall(self): return []
+        async def fetchone(self): return {"updated_at": "2026-01-01 00:00:00"}
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+
+    class _Conn:
+        def execute(self, sql, params=None):
+            seen.append((sql, list(params or [])))
+            return _Cur()
+
+    @contextlib.asynccontextmanager
+    async def fake_read(self):
+        yield _Conn()
+
+    monkeypatch.setattr(PgDatabase, "read", fake_read, raising=False)
+    async def _noop(*a, **k): return None
+    monkeypatch.setattr(PgDatabase, "_hydrate_screenshot_paths", _noop, raising=False)
+    monkeypatch.setattr(PgDatabase, "_hydrate_batch_task_status", _noop, raising=False)
+    return PgDatabase.__new__(PgDatabase), seen
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kw", [
+    dict(search="B0AAA11111,B0BBB22222,B0CCC33333,B0DDD44444", batch_id=1),
+    dict(search="B0AAA11111,B0BBB22222", batch_id=1, cursor_id=7),
+    dict(search="B0AAA11111,B0BBB22222", batch_id=1, change_filter="price_stock"),
+    dict(search="B0AAA11111,B0BBB22222", batch_id=1, change_filter="new"),
+    dict(search="B0AAA11111,B0BBB22222", batch_id=1, sort="recent"),
+])
+async def test_batch_filter_uses_materialized_bset_not_branches(monkeypatch, kw):
+    """⚠ 带 batch_id 时**不许**拆分支 —— 分支里那个 JOIN batch_asins 会被
+    原样复制 3N 份。
+
+    对抗式评审实测（200k 行 asyncpg 直连，行集逐 id 相同）：
+      高命中 4 词 + batch=1    main 596ms  拆分支 2189ms  bset  22ms
+      高命中 10 词 + batch=1   main 607ms  拆分支 4665ms  bset  19ms
+    更糟的是拆分支的开销取决于**批次 id 落在哪一段**：老批次（id 在最底部）
+    要主键倒序穿过几乎整张表才凑够一页。bset 形状与位置无关。
+
+    带 batch_id 时候选集本来就被批次限死（一批约 2000 行），不存在扫穿全表的
+    可能，也就不需要拆分支来防 cliff。
+    """
+    from common.pgdb import Database as PgDatabase
+    db, seen = _capture_sql(monkeypatch)
+    await PgDatabase.get_results(db, limit=50, with_total=False, **kw)
+    sql, params = seen[0]
+    assert "WITH bset AS MATERIALIZED" in sql, sql[:400]
+    assert "search_hit" not in sql, "带 batch_id 不该走分支 CTE"
+    # 主批次连接只出现一次（在 bset 里），不是 3N 次
+    assert sql.count("FROM batch_asins WHERE batch_id") == 1, sql[:400]
+    assert sql.count("JOIN batch_asins ba ") == 0, sql[:400]
+    # change_filter='new' 的那个 ba2 连接要原样保留（它是另一个语义）
+    if kw.get("change_filter") == "new":
+        assert "ba2" in sql, "本批新增的 ba2 连接不该被一起换掉"
+    assert sql.count("?") == len(params), (sql.count("?"), len(params))
+
+
+@pytest.mark.asyncio
+async def test_branch_limit_is_limit_plus_one(monkeypatch):
+    """分支 LIMIT 必须绑 limit+1，不是 limit。
+
+    ⚠ 这条网是对抗式评审逼出来的：把 `branch_params.append(limit + 1)` 改成
+    `limit`，**全套 968 个测试无一发现**（50 条 PG↔SQLite 逐字比对里凡带 search
+    的都用默认 limit=50，而夹具只有 8 行 —— 差一根本体现不出来）。
+
+    差一的后果：只有一个分支有产出时（比如词只命中 title），CTE 里只有
+    top-limit 个 id，外层 LIMIT limit+1 凑不满 -> has_more=False -> 前端认为
+    "到头了"。实测 60 行数据、limit=10 时只能翻出 10 行，丢掉一整段，
+    两个后端都不报错。
+
+    所以这里直接盯**绑定值**，不是盯 SQL 文本里 "LIMIT ?" 的个数
+    （原来那条断言只数个数，正是它放过了这个差一）。
+    """
+    from common.pgdb import Database as PgDatabase
+    for limit in (1, 10, 50, 999):
+        db, seen = _capture_sql(monkeypatch)
+        await PgDatabase.get_results(db, limit=limit, with_total=False,
+                                     search="B0AAA11111,B0BBB22222")
+        sql, params = seen[0]
+        assert "search_hit" in sql
+        limits = [p for p in params if p == limit + 1]
+        n_branches = 2 * len(_SEARCH_COLUMNS)
+        # 每个分支一个 + 外层一个
+        assert len(limits) == n_branches + 1, \
+            f"limit={limit}: 期望 {n_branches + 1} 个 {limit + 1}，实得 {len(limits)}；params={params}"
+        assert limit not in params, \
+            f"limit={limit}: 参数里出现了裸 limit，分支 LIMIT 绑错了；params={params}"

@@ -403,7 +403,53 @@ class ResultsReadMixin:
         #
         # 只有数据查询需要这层保护：count 查询既没有 ORDER BY 也没有 LIMIT，
         # 触发不了这个计划，所以它照旧把扁平 OR 放在 WHERE 里。
-        if search_patterns:
+        if search_patterns and batch_id:
+            # ============================================================
+            # 带批次筛选时：**不拆分支**。先把该批次的 ASIN 集合物化一次，
+            # 再在这个小集合上跑扁平 OR。
+            # ============================================================
+            # 拆分支的前提是"每个分支只有一个 LIKE 谓词，规划器估得准"。但分支里
+            # 那个 `JOIN batch_asins` 是**原样复制 3N 份**的，批次连接的工作量也
+            # 跟着乘 3N。更糟的是它的开销取决于**批次的 id 落在哪一段**：主键倒序
+            # 扫遇到老批次（id 在最底部）要穿过几乎整张表才凑够 51 行。
+            #
+            # 而带 batch_id 时候选集本来就被批次限死了（一批约 2000 行），
+            # 根本不存在"扫穿全表"的可能 —— 也就不需要拆分支来防那个 cliff。
+            # 把 bset 物化一次当驱动表，扁平 OR 只在这 2000 行上跑。
+            #
+            # 200k 行 asyncpg 直连实测（3 次取最小，四种形状行集逐 id 相同）：
+            #                            改动前   拆分支   本形状
+            #   高命中 4 词 + batch=1      596ms   2189ms     22ms
+            #   高命中 10 词 + batch=1     607ms   4665ms     19ms
+            #   高命中 10 词 + batch=99     13ms    107ms     20ms
+            #   高命中 10 词 + batch=100     9ms     76ms     18ms
+            #   低命中 10 词 + batch=1       2ms      2ms    158ms
+            #   高命中4词+batch1+变动筛选     7ms     23ms      7ms
+            # 最后两行是代价：低命中时扁平 OR 要在 2000 行上算 3N 次 LIKE，
+            # 而拆分支能靠 trgm 索引秒答。158ms 的绝对值可接受，换来的是
+            # **与批次 id 位置无关、有界的最坏情况**（拆分支最坏 4.7 秒）。
+            #
+            # ⚠ 只换掉**主批次连接**。change_filter='new' 会再加一个
+            #   `JOIN batch_asins ba2 ... is_new = 1`，那条原样保留 —— 它是另一个
+            #   语义（"本批新增"），不是候选集限制。
+            other_joins = [j for j in join_parts if "batch_asins ba " not in j]
+            # join_params 的第一个就是主批次连接的 batch_id（它最先 append）
+            other_join_params = join_params[1:]
+            sql = f"""
+                WITH bset AS MATERIALIZED (
+                    SELECT asin FROM batch_asins WHERE batch_id = ?
+                )
+                SELECT {proj or 'd.*'} FROM asin_data d
+                JOIN bset ON bset.asin = d.asin
+                {' '.join(other_joins)}
+                WHERE {where_clause} AND {search_pred}
+                ORDER BY {order_by_clause}
+                LIMIT ?
+            """
+            # 参数顺序 = SQL 文本顺序：bset -> 其余 join -> where -> search -> limit
+            params = ([as_int(batch_id)] + other_join_params
+                      + where_params + search_params)
+        elif search_patterns:
             # 每个 (词 × 列) 一个分支，各自 ORDER BY + LIMIT，再 UNION。
             #
             # 为什么正确（全局前 N ⊆ 各分支前 N 的并集）：设 x 属于全局前 N，
