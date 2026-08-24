@@ -432,13 +432,12 @@ async function deleteSelected() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body),
         });
-        const data = await resp.json();
-        if (resp.ok) {
-            loadResults();
-            loadChangeStats();
-        } else {
-            alert('删除失败: ' + (data.detail || '未知错误'));
+        if (!resp.ok) {
+            alert('删除失败: ' + await window.apiErrText(resp));
+            return;
         }
+        loadResults();
+        loadChangeStats();
     } catch(e) {
         alert('网络错误: ' + e.message);
     }
@@ -565,15 +564,17 @@ async function clearData() {
         } else {
             resp = await fetch('/api/database', { method: 'DELETE' });
         }
+        if (!resp.ok) {
+            alert('删除失败: ' + await window.apiErrText(resp));
+            return;
+        }
         const data = await resp.json();
-        if (resp.ok) {
+        {
             const deleted = data.deleted != null ? `已删除 ${data.deleted} 条` : '数据已清空';
             alert(deleted);
             loadResults();
             loadChangeStats();
             loadBatches();
-        } else {
-            alert('删除失败: ' + (data.detail || '未知错误'));
         }
     } catch(e) {
         alert('网络错误: ' + e.message);
@@ -587,15 +588,15 @@ async function deleteByFile(input) {
     input.value = '';  // 重置，允许重复上传同一文件
     try {
         const resp = await fetch('/api/results/delete-by-file', { method: 'POST', body: fd });
-        const data = await resp.json();
-        if (resp.ok) {
-            alert(`已删除 ${data.deleted} 条数据（文件中识别到 ${data.asin_count} 个 ASIN）`);
-            loadResults();
-            loadChangeStats();
-            loadBatches();
-        } else {
-            alert('删除失败: ' + (data.detail || '未知错误'));
+        if (!resp.ok) {
+            alert('删除失败: ' + await window.apiErrText(resp));
+            return;
         }
+        const data = await resp.json();
+        alert(`已删除 ${data.deleted} 条数据（文件中识别到 ${data.asin_count} 个 ASIN）`);
+        loadResults();
+        loadChangeStats();
+        loadBatches();
     } catch(e) {
         alert('网络错误: ' + e.message);
     }

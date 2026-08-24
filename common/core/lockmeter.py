@@ -52,6 +52,23 @@ def _record_hold(caller: str, ms: float):
             del sh[:250]
 
 
+#: 读池 acquire 的等待时间记在 ``waits`` 里的这个 caller 名下。
+#: 它和写锁的 caller（pull_tasks / accept_results_batch / other / optimize）
+#: 并排出现在 ``/api/_debug/lock-stats`` 的同一张表里 —— 刻意的：诊断"页面为什么慢"
+#: 时要回答的第一个问题就是"卡在写锁还是卡在借连接"，两个数放一起才比得了。
+POOL_WAIT_CALLER = "read_pool"
+
+
+def record_pool_wait(ms: float):
+    """记一次读池 ``acquire()`` 的排队时长（毫秒）。
+
+    ⚠ 两个后端都必须调，而且**回退分支也要调**（池未就绪时退化到写连接）。
+    只在其中一个后端记，``/api/_debug/lock-stats`` 的 key 集就会随后端漂移，
+    而黄金基线是**同一份**、要在两个后端上都逐字通过的 —— 那会直接红。
+    """
+    _record_wait(POOL_WAIT_CALLER, ms)
+
+
 def record_stage(stage: str, ms: float):
     """供锁内分阶段计时用（如 accept_results_batch 内部）"""
     arr = LOCK_STATS["stage_timings"][stage]

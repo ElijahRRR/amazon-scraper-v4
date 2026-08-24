@@ -5862,6 +5862,14 @@
               "p50": "<NUM>",
               "p95": "<NUM>",
               "p99": "<NUM>"
+            },
+            "read_pool": {
+              "count": "<NUM>",
+              "max": "<NUM>",
+              "mean": "<NUM>",
+              "p50": "<NUM>",
+              "p95": "<NUM>",
+              "p99": "<NUM>"
             }
           }
         },
@@ -5884,7 +5892,7 @@
           "__html__": {
             "has_jinja_error": false,
             "has_traceback": false,
-            "size_bucket": 13
+            "size_bucket": 14
           }
         },
         "content_type": "text/html",
@@ -5906,7 +5914,7 @@
           "__html__": {
             "has_jinja_error": false,
             "has_traceback": false,
-            "size_bucket": 32
+            "size_bucket": 33
           }
         },
         "content_type": "text/html",
@@ -5928,7 +5936,7 @@
           "__html__": {
             "has_jinja_error": false,
             "has_traceback": false,
-            "size_bucket": 27
+            "size_bucket": 28
           }
         },
         "content_type": "text/html",
@@ -5950,7 +5958,7 @@
           "__html__": {
             "has_jinja_error": false,
             "has_traceback": false,
-            "size_bucket": 17
+            "size_bucket": 18
           }
         },
         "content_type": "text/html",
@@ -5972,7 +5980,7 @@
           "__html__": {
             "has_jinja_error": false,
             "has_traceback": false,
-            "size_bucket": 41
+            "size_bucket": 42
           }
         },
         "content_type": "text/html",

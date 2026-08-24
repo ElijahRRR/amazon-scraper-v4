@@ -47,7 +47,21 @@ terms 为空则**完全不加 where 子句**（静默返回全量）——全部
   （HashAggregate 整个 id 集）。
 
 --------------------------------------------------------------------------
-二、⚠ COUNT 查询的 bug：必须**刻意**复现（决策 D-8）
+二、COUNT 查询的 bug（决策 D-8）—— **已修**，本节保留为病历
+--------------------------------------------------------------------------
+⚠ 下面整节描述的是**历史状态**。D-8 当年的决定是"照着复现这个崩溃"，并注明
+"修它是 Phase 1.5 的事"。本轮修了，改动有三处，缺一不可：
+  1. count 的谓词与参数改成**同一时刻快照**（keyset 谓词追加之前），
+     不再用 ``[p for p in where_parts if "d.id" not in p]`` 猜哪个是游标谓词。
+  2. 搜索谓词不再需要 ``d.id IS NOT NULL`` 那层"标记壳"，
+     ``any(len(t) < 3 ...)`` 的分支判断随之删除（两条分支行集本就相同）。
+  3. 测试 ``test_count_bug_is_reproduced`` 改名 ``test_search_with_cursor_no_longer_500s``
+     并改成断言两边都是 200 且逐字相等；SQLite 裁判快照里那 3 条
+     ``["raise"]`` 已重录成正常返回值。
+根因值得记住：**靠文本匹配识别"这个谓词是什么"从来都不成立**。
+任何一个新谓词只要碰巧提到 d.id 就会重蹈覆辙，而症状是 500，不是错结果。
+
+（以下为原文，描述修复前的行为）
 --------------------------------------------------------------------------
 database.py:2249-2255 在有 cursor 时会把所有文本里含 ``"d.id"`` 的 where 片段
 从 count 查询里剔掉——本意是剔掉 keyset 谓词 ``d.id < ?``，但 FTS 快路径的
@@ -116,9 +130,16 @@ from common.pgdb.pool import LIKE_NO_ESCAPE, as_int, text_affinity
 # 一个 term 的三列 OR 谓词。写成 ascii_lower(...) LIKE ascii_lower(?) 而不是
 # ILIKE：见模块头注释与 OWNERSHIP.md D-5。表达式必须与 schema.py 建的
 # 表达式 GIN 索引（public.ascii_lower(col) public.gin_trgm_ops）对得上。
-_TERM_OR = ("(ascii_lower(d.asin) LIKE ascii_lower(?)" + LIKE_NO_ESCAPE +
-            " OR ascii_lower(d.title) LIKE ascii_lower(?)" + LIKE_NO_ESCAPE +
-            " OR ascii_lower(d.brand) LIKE ascii_lower(?)" + LIKE_NO_ESCAPE + ")")
+_SEARCH_COLUMNS = ("asin", "title", "brand")
+
+
+def _col_like(col: str) -> str:
+    """单列单词的 LIKE 谓词。``_TERM_OR`` 与搜索 CTE 的分支都由它拼出来，
+    保证两处与表达式 GIN 索引**逐字**同源（改一处漏一处 = 索引静默失效）。"""
+    return f"ascii_lower(d.{col}) LIKE ascii_lower(?)" + LIKE_NO_ESCAPE
+
+
+_TERM_OR = "(" + " OR ".join(_col_like(c) for c in _SEARCH_COLUMNS) + ")"
 
 
 # ``%term%``，不转义。**唯一真源在 common/database.py**（经 _shared 再导出）——
@@ -246,9 +267,14 @@ class ResultsReadMixin:
         # 索引加速；扁平 OR 而不是 d.id IN (... UNION ...)，200k 行实测非选择性
         # 词条 2.2ms vs 536ms（后者要 HashAggregate 整个 id 集）。
         #
-        # ⚠ ``any(len(t) < 3 ...)`` 这个分支判断必须保留：它现在唯一的作用是
-        # 决定谓词文本里要不要带 "d.id" 这个标记，从而**刻意复现** count 查询
-        # 那个崩溃（决策 D-8，详见模块头注释第二节）。
+        # ⚠ ``any(len(t) < 3 ...)`` 的分支判断已经**去掉**：它此前唯一的作用是
+        # 决定谓词文本里要不要带 "d.id" 标记，用来刻意复现 count 查询那个崩溃
+        # （决策 D-8）。D-8 已按它自己写的"留给 Phase 1.5 修"修掉（见下方
+        # count_where 处），标记失去意义，两条分支产生的行集本来就完全相同
+        # （实测 37 个非空探针一致）。
+        search_pred = ""
+        search_params: list = []
+        search_patterns: List[str] = []
         if search:
             # 单个请求最多 500 字符、最多 10 个关键词，每个关键词截断到 100 字符
             search = str(search)[:500]
@@ -258,22 +284,17 @@ class ResultsReadMixin:
                 for t in terms:
                     or_clauses.append(_TERM_OR)
                     like_pattern = _like_pattern(t)
-                    where_params.extend([like_pattern, like_pattern, like_pattern])
-                flat_or = f"({' OR '.join(or_clauses)})"
-                if any(len(t) < 3 for t in terms):
-                    # 慢路径：含 < 3 字符的 term。谓词文本里没有 "d.id"，
-                    # 所以下面的 count 过滤不会把它剔掉 —— 与 SQLite 一致。
-                    where_parts.append(flat_or)
-                else:
-                    # 快路径：SQLite 这里是 ``d.id IN (SELECT rowid FROM
-                    # asin_data_fts ... UNION ...)``。行集与扁平 OR 相同，但
-                    # 文本里那个 "d.id" 是 count 过滤的触发条件。套一层恒真的
-                    # ``d.id IS NOT NULL`` 把标记还原：行集不变、GIN 计划不变、
-                    # ``"d.id" not in p`` 照样命中 -> 参数个数对不上 -> 500。
-                    where_parts.append(f"(d.id IS NOT NULL AND {flat_or})")
+                    search_patterns.append(like_pattern)
+                    search_params.extend([like_pattern] * len(_SEARCH_COLUMNS))
+                search_pred = f"({' OR '.join(or_clauses)})"
 
-        # 构建 count 查询参数（join_params + where_params，不含 cursor）
-        count_params = join_params + where_params
+        # 构建 count 查询的参数**与谓词**——两者必须在同一时刻快照，
+        # 也就是 keyset 谓词追加**之前**。见下面 count_where 处的注释。
+        # 搜索谓词在数据查询里被搬进了 CTE（见下），但 count 仍然要它，
+        # 所以在这里**追加到末尾**：AND 可交换，行集不变，而放末尾能让
+        # count_params 的拼接顺序（join -> where -> search）与 SQL 文本一致。
+        count_params = join_params + where_params + search_params
+        count_where_parts = list(where_parts) + ([search_pred] if search_pred else [])
 
         # keyset 分页
         if cursor_id is not None:
@@ -283,8 +304,6 @@ class ResultsReadMixin:
                 where_parts.append("d.id > ?")
             where_params.append(as_int(cursor_id))
 
-        params = join_params + where_params
-
         where_clause = " AND ".join(where_parts) if where_parts else "1=1"
         join_clause = " ".join(join_parts) if join_parts else ""
         count_join_clause = " ".join(count_join_parts) if count_join_parts else ""
@@ -292,13 +311,88 @@ class ResultsReadMixin:
         order = "DESC" if direction == "next" else "ASC"
 
         # 查询数据（d.id 是 PK，非空且无并列，不需要 NULLS 位置和 tiebreaker）
-        sql = f"""
-            SELECT {proj or 'd.*'} FROM asin_data d
-            {join_clause}
-            WHERE {where_clause}
-            ORDER BY d.id {order}
-            LIMIT ?
-        """
+        #
+        # ⚠ 搜索谓词必须待在 ``WITH ... AS MATERIALIZED`` 里，**不能**放进
+        # 外层 WHERE。原因是外层有 ``ORDER BY d.id DESC LIMIT 51``：
+        #
+        #   词数越多，OR 分支越多，规划器估计的命中行数就越大（实测估算值
+        #   随词数线性上涨）。一旦越过某个点，它就认为"反正命中很多，沿主键
+        #   倒序扫、凑够 51 行就停，还省掉排序"比"GIN 位图 + 排序"便宜 ——
+        #   于是**丢掉三个 trgm 索引**改成全表逐行过滤。
+        #   命中多时这个计划确实快（几百行就凑满）；命中少时它要扫穿整张表，
+        #   直接撞 PG_COMMAND_TIMEOUT=60s -> 500。
+        #   线上表现：4 个高频词 245ms，4 个 ASIN（低命中）60s 超时。
+        #   而搜索框明写着"支持批量、逗号分隔"，粘一串 ASIN 进去就是必崩路径。
+        #
+        # 关键在于**每个分支只有一个 LIKE 谓词**，估算不再被 OR 的数量推高，
+        # 规划器对单谓词的选择性判断是准的：命中多 -> 主键倒序早退，
+        # 命中少 -> trgm 位图。两个方向都对，不需要我们替它选。
+        # MATERIALIZED 关键字不可省 —— PG 12+ 会把只被引用一次的 CTE **内联**
+        # 回外层，内联之后外层的 LIMIT 又能影响分支的扫描方式，等于没改。
+        #
+        # 200k 行实测（psql 启动开销约 40ms 已含在内）：
+        #                        现状扁平 OR   本形状
+        #   高命中 1 词              63ms       60ms
+        #   高命中 4 词              45ms       60ms
+        #   零命中 4 词              42ms       42ms
+        #   零命中 10 词           5273ms       45ms   ← 就是线上那条 60s 超时
+        #   chair + 零命中 ×9       475ms       63ms
+        # 六组用例行集逐个 id 相同。
+        #
+        # 试过但**不行**的两种写法，别再走回头路：
+        #   * 单个 MATERIALIZED CTE 包住整个扁平 OR：零命中 10 词好了（42ms），
+        #     但高命中 4 词从 45ms 劣化到 3179ms —— 它要把全部命中行物化一遍，
+        #     拿灾难换了平庸。
+        #   * enable_seqscan=off：完全无效（5295ms）。因为坏计划**不是** seq scan，
+        #     是主键倒序 Index Scan + Filter，那个开关管不着它。
+        #
+        # 只有数据查询需要这层保护：count 查询既没有 ORDER BY 也没有 LIMIT，
+        # 触发不了这个计划，所以它照旧把扁平 OR 放在 WHERE 里。
+        if search_patterns:
+            # 每个 (词 × 列) 一个分支，各自 ORDER BY + LIMIT，再 UNION。
+            #
+            # 为什么正确（全局前 N ⊆ 各分支前 N 的并集）：设 x 属于全局前 N，
+            # 则 x 至少满足一个分支的谓词；在那个分支里排在 x 前面的行，是
+            # 全局里排在 x 前面的行的子集，不足 N 个 —— 所以 x 必在该分支的前 N。
+            #
+            # ⚠ **其余筛选（batch join / change_filter / keyset 游标）必须原样
+            # 推进每一个分支**，不能只留在外层。否则分支取的是"全局前 N"，
+            # 外层再拿 batch 一滤可能一条不剩，而更靠后其实还有合格行 ——
+            # 静默丢行。实测：不推进去时 batch 筛选 + 高命中词丢了整整 51 行。
+            branches = []
+            branch_params: list = []
+            for pat in search_patterns:
+                for col in _SEARCH_COLUMNS:
+                    branches.append(
+                        f"(SELECT d.id FROM asin_data d {join_clause}"
+                        f" WHERE {where_clause} AND {_col_like(col)}"
+                        f" ORDER BY d.id {order} LIMIT ?)")
+                    branch_params.extend(join_params)
+                    branch_params.extend(where_params)
+                    branch_params.append(pat)
+                    branch_params.append(limit + 1)
+            sql = f"""
+                WITH search_hit AS MATERIALIZED (
+                    {' UNION '.join(branches)}
+                )
+                SELECT {proj or 'd.*'} FROM asin_data d
+                {join_clause}
+                JOIN search_hit sh ON sh.id = d.id
+                WHERE {where_clause}
+                ORDER BY d.id {order}
+                LIMIT ?
+            """
+            # 参数顺序 = SQL 文本顺序：各分支 -> 外层 join -> 外层 where -> limit
+            params = branch_params + join_params + where_params
+        else:
+            sql = f"""
+                SELECT {proj or 'd.*'} FROM asin_data d
+                {join_clause}
+                WHERE {where_clause}
+                ORDER BY d.id {order}
+                LIMIT ?
+            """
+            params = join_params + where_params
         params.append(limit + 1)  # 多取一条判断 has_more
 
         async with self.read() as rc, rc.execute(sql, params) as c:
@@ -317,14 +411,20 @@ class ResultsReadMixin:
         if batch_id:
             await self._hydrate_batch_task_status(items, batch_id)
 
-        # 查询总数
-        count_where = " AND ".join(
-            [p for p in (where_parts[:-1] if cursor_id is not None else where_parts)]
-        ) if where_parts else "1=1"
-        # 移除 cursor 条件
-        if cursor_id is not None and where_parts:
-            count_where_parts = [p for p in where_parts if "d.id" not in p]
-            count_where = " AND ".join(count_where_parts) if count_where_parts else "1=1"
+        # 查询总数。
+        #
+        # count_where_parts 与 count_params 在**同一时刻**快照（keyset 谓词追加
+        # 之前），所以它天然不含 cursor 条件，谓词与参数不可能对不齐。
+        #
+        # ⚠ 这里以前是靠 `[p for p in where_parts if "d.id" not in p]` 猜的 ——
+        #   本意只想剔掉 keyset 谓词 `d.id < ?`，但搜索快路径的谓词文本里也带
+        #   "d.id"，于是被一并剔掉，而 count_params 里仍留着它那 3N 个参数
+        #   -> 参数个数对不上 -> asyncpg/sqlite3 抛错 -> 500。
+        #   也就是说 `?search=GoldenBrand&cursor=3` 一直是必崩的（决策 D-8 把它
+        #   当既有行为**刻意复现**过；本轮按 D-8 自己写的"留给 Phase 1.5 修"修掉）。
+        #   靠文本匹配识别"哪个谓词是 cursor"本身就是错的方案：任何一个新谓词
+        #   只要碰巧提到 d.id 就会重蹈覆辙。快照法从结构上消灭这一整类。
+        count_where = " AND ".join(count_where_parts) if count_where_parts else "1=1"
 
         # with_total=False -> 整条 count 都不发。它随行数线性增长、且翻页途中
         # 值恒定不变，前端只在首屏要它。

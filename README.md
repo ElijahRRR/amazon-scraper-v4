@@ -238,6 +238,12 @@ ASIN 只有一行，后采的覆盖先采的；而 `/api/results?batch_id=` 的 
 - **搜索**：支持 ASIN、标题、品牌模糊搜索，多个关键词用换行或逗号分隔
   - 走 `pg_trgm` GIN 表达式索引，百万级数据下 5-50ms 量级（比 LIKE 全表扫快 ~1000 倍）
   - 短查询（<3 字符）自动 fallback 到 LIKE 路径保证正确性
+  - PG 侧的 SQL 形状是「每个 (词 × 列) 一个分支，各自 `ORDER BY id LIMIT n`，
+    再 UNION 进 `MATERIALIZED` CTE」。**不要**改回扁平 OR：OR 分支一多，
+    规划器估计的命中行数就被推高，进而丢掉 trgm 索引改走主键倒序扫，
+    命中少时要扫穿整张表。2026-08 线上就是这么坏的 —— 粘 4 个以上 ASIN
+    进搜索框 100% 卡满 60s 返回 500，而 4 个高频词只要 245ms。
+    200k 行实测：零命中 10 词 `5273ms → 45ms`。
 - **分页**：keyset cursor 分页，单页上限 1000（近期从 200 上调）
 - **两个减负开关**（默认都关，不传就是原行为）：`fields=a,b,c` 只返回指定列、
   `with_total=false` 不算全表 COUNT。本端点没有 `response_model`，**82% 的耗时在
@@ -254,6 +260,12 @@ ASIN 只有一行，后采的覆盖先采的；而 `/api/results?batch_id=` 的 
   **不出现**。⚠️ 从没采过的 ASIN 在这个端点**整行不返回**（INNER JOIN），
   要查覆盖率用 `GET /api/export/batch/{name}/records` 的 `coverage`。
 - **选中删除**：勾选行 checkbox，点击"删除选中"（同时删除关联截图文件）
+  - 删除类操作失败时，前端弹的是**服务端给的原因**（`window.apiErrText`，定义在
+    `base.html`，四个删除入口共用）。最常见的一条是配了 `ADMIN_TOKEN` 却没在
+    「设置」页填 —— 那会 401，以前只显示一个光秃秃的 `401`。
+  - 删批次是**逐批次**发 DELETE 的，不是一条 `IN (全部 id)`：超时按语句计
+    （`PG_COMMAND_TIMEOUT`，默认 60s），一条语句删几十万行迟早会跨过去。
+    仍在同一个事务里，原子性不变。
 - **清空数据**：根据当前筛选条件智能删除
   - 选了批次 → 只删该批次数据
   - 输了搜索词 → 只删匹配数据
@@ -912,7 +924,49 @@ curl http://<SERVER>:8899/api/_debug/lock-stats | python3 -m json.tool
 # - pull_tasks.waits.p99 高 → 锁竞争严重
 # - accept_results_batch.holds.max 大 → commit 抖动
 # - stage_timings.commit 大 → SSD/fsync 问题
+# - waits.read_pool.p99 高 → 读池被占满，页面查询在排队等连接
+#   （不是锁竞争。两者并排在同一张表里，就是为了先分清卡在哪一侧）
 ```
+
+`waits.read_pool` 记的是 `db.read()` 里 `acquire()` 的排队时长，两个后端都记
+（SQLite 记 `asyncio.Queue.get()`，PG 记 `asyncpg` 池）。它接近 0 就说明池
+够用，"页面慢"要往别处查——通常是磁盘 I/O（见下一节）。
+
+### 页面慢：先分清是排队、是锁、还是磁盘
+
+一次「采集结果」页首屏会并发发三个请求：`/api/batches`、`/api/results`、
+`/api/changes/stats`。三者同时变慢、而纯内存端点（`/api/coordinator`）仍然
+毫秒级返回，说明**不是** event loop 被堵住，而是都在等同一份资源：
+
+| 现象 | 指向 | 怎么确认 |
+|---|---|---|
+| `waits.read_pool.p99` 高 | 读池不够用 | 调 `PG_POOL_MAX` |
+| `waits.*.p99` 高（pull_tasks / accept_results_batch） | 写锁竞争 | worker 太猛 |
+| 三者都低，但**第一次**慢、紧接着重试快十几倍 | 磁盘冷读 | 见下 |
+
+最后一种最常见，也最容易误判成"SQL 写得差"。判据是 PG 的 `DataFileRead` /
+`BufferIo` / `BtreePage` 等待占多数，且 `pg_stat_database` 的 cache hit 明显
+低于 99%。根因通常是**数据集大于可用内存**——此时任何"要扫一遍"的查询都会
+退化成磁盘读，而同一条查询在热缓存下只要几十毫秒。
+
+两个便宜且见效大的动作：
+
+```sql
+-- 1. 可见性图（VM）被死行打穿时，COUNT(*) 会从「只读主键索引」退化成
+--    「索引 + 全堆随机读」。20 万行实测：552 个 buffer -> 27,440 个，差 50 倍。
+--    在线执行，不锁 DML；VACUUM FULL 才锁表，别用。
+VACUUM (ANALYZE) asin_data;
+VACUUM (ANALYZE) tasks;
+
+-- 2. tasks 写得太频繁，默认 20% 的 autovacuum 阈值对它太松，会反复退化
+ALTER TABLE tasks     SET (autovacuum_vacuum_scale_factor = 0.02,
+                           autovacuum_analyze_scale_factor = 0.01);
+ALTER TABLE asin_data SET (autovacuum_vacuum_scale_factor = 0.05);
+```
+
+再往下才轮到 `shared_buffers` / `work_mem`（默认的 128MB / 4MB 对百万行量级
+偏小）。⚠ PG 跑在容器里时，调大 `shared_buffers` 要连容器的 `--shm-size`
+一起调大，否则并行查询会**偶发**报 `could not resize shared memory segment`。
 
 ### PostgreSQL 事件流诊断（仅 PostgreSQL 后端）
 

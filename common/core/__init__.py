@@ -80,6 +80,7 @@ from common.core.lockmeter import (
     _NamedLockCtx,
     _record_wait,
     _record_hold,
+    record_pool_wait,
     record_stage,
 )
 from common.core.asindata import (
@@ -115,6 +116,7 @@ __all__ = [
     "_NamedLockCtx",
     "_record_wait",
     "_record_hold",
+    "record_pool_wait",
     "record_stage",
     "_NA_VALUES",
     "_normalize_screenshot_path",
