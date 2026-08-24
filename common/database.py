@@ -75,6 +75,7 @@ from common.core import (  # noqa: F401  —— 全部是有意的再导出
     CLEAR_TABLES,
     # ---- 按 ASIN 删除 / 模糊搜索（DELETE /api/results）----
     ASIN_DELETE_CHUNK,
+    BATCH_DELETE_CHUNK,
     ASIN_DELETE_TABLES,
     search_like_pattern,
 )
@@ -1484,21 +1485,29 @@ class Database:
         async with self._write_lock:
             await self._db.execute("BEGIN")
             try:
-                # ⚠ **逐批次**删，不是一条 `IN (全部 id)`。
+                # ⚠ **按 BATCH_DELETE_CHUNK 个批次一组**删，既不是一条
+                # `IN (全部 id)`，也不是"每个批次一条"。
                 #
                 # 超时是**按语句**计的（asyncpg 的 command_timeout，默认 60s，
                 # 见 config.PG_COMMAND_TIMEOUT）。一条 `DELETE ... WHERE
-                # batch_id IN (...500 个 id...)` 在百万行量级的库上是一次
-                # 无上界的操作：删得越多越久，某一天就会跨过 60s，然后
-                # 整个事务回滚、前端只看到一个 500。拆成每批次一条之后，
-                # 每条语句的工作量被"单个批次的行数"钉住，与选了多少个批次无关。
+                # batch_id IN (...500 个 id...)` 的工作量无上界，某天会跨过 60s，
+                # 然后整个事务回滚、前端只看到一个 500。
+                #
+                # 但"每个批次一条"矫枉过正：语句数变成 4N，而 pool.py 是
+                # statement_cache_size=0（决策 D-7），每条都要重新 Parse/Bind/
+                # Execute，这些往返**全发生在写锁内** —— worker 的 pull/result
+                # 会被一起挡住。实测 500 批 × 每表 20 行：一条 28ms、每批次一条
+                # 264ms（9.4 倍，全是 2000 次往返的固定成本）、50 个一组 29ms。
+                # 分组大小与实测表见 common/core/dbtables.py:BATCH_DELETE_CHUNK。
                 #
                 # 仍在**同一个事务**里：原子性是这个方法的既有语义（要么全删、
-                # 要么全不删），分块只改语句粒度，不改事务边界。
+                # 要么全不删），分组只改语句粒度，不改事务边界。
                 for tbl in ("tasks", "batch_asins", "screenshots", "asin_changes"):
-                    for bid in ids:
+                    for grp in (ids[i:i + BATCH_DELETE_CHUNK]
+                                for i in range(0, len(ids), BATCH_DELETE_CHUNK)):
+                        gph = ",".join("?" * len(grp))
                         await self._db.execute(
-                            f"DELETE FROM {tbl} WHERE batch_id = ?", (bid,))
+                            f"DELETE FROM {tbl} WHERE batch_id IN ({gph})", grp)
                 # batches 本身一行一个批次，一条语句就够，不需要拆
                 await self._db.execute(
                     f"DELETE FROM batches WHERE id IN ({ph})", ids)

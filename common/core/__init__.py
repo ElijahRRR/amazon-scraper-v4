@@ -110,6 +110,7 @@ from common.core.asindata import (
 from common.core.dbtables import (
     CLEAR_TABLES,
     ASIN_DELETE_CHUNK,
+    BATCH_DELETE_CHUNK,
     ASIN_DELETE_TABLES,
     search_like_pattern,
 )
@@ -149,6 +150,7 @@ __all__ = [
     "_ASIN_DATA_COLUMN_SET",
     "CLEAR_TABLES",
     "ASIN_DELETE_CHUNK",
+    "BATCH_DELETE_CHUNK",
     "ASIN_DELETE_TABLES",
     "search_like_pattern",
     "as_int",

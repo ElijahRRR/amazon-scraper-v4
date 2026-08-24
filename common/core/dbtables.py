@@ -26,6 +26,26 @@ CLEAR_TABLES = ("asin_changes", "asin_data", "batch_asins", "tasks",
 # 失败（两侧都在一个事务里，所以只会整体回滚），排障时对不上号。
 ASIN_DELETE_CHUNK = 500
 
+# 删批次时每条 DELETE 覆盖多少个 batch_id。两个后端**必须用同一个值**，
+# 理由同上（分块边界不同 = 两边发出的语句序列不同，排障时对不上号）。
+#
+# 为什么不是 1（"每个批次一条"）也不是"一条 IN(全部)"：
+#   * 一条 IN(全部) 的工作量**无上界** —— 选 500 个批次就是一次删几百万行，
+#     某天会跨过 asyncpg 的 command_timeout（PG_COMMAND_TIMEOUT，默认 60s），
+#     然后整个事务回滚、前端只看到一个 500。这正是本轮要修的那条路径。
+#   * 每个批次一条能把单条语句钉死，但语句数变成 4N —— 而 pool.py 是
+#     statement_cache_size=0（决策 D-7），每条 DELETE 都要重新 Parse/Bind/Execute。
+#     这些往返全部发生在**写锁内**，worker 的 pull/result 会被一起挡住。
+#
+# 实测（PG 17，asyncpg 直连，量的是"锁内那串 DELETE"的总耗时）：
+#   500 批 × 每表 20 行（往返成本主导）：一条 28.0ms / 每批次 264.3ms / 50 个一组 29.2ms
+#   500 批 × 每表 500 行（100 万行）  ：一条 575.3ms / 每批次 666.8ms / 50 个一组 457.0ms
+#   50 批 × 每表 2000 行（40 万行）   ：一条 151.1ms / 每批次 191.0ms / 50 个一组 147.0ms
+# 50 个一组在三种形状上都追平或好于"一条 IN(全部)"，同时把单条语句的工作量
+# 限死在 50 个批次的行数内（约为原来最坏情况的 1/10）。
+# 50 个占位符也远低于 SQLite 的 SQLITE_MAX_VARIABLE_NUMBER（默认 999）。
+BATCH_DELETE_CHUNK = 50
+
 # 按 ASIN 删除要清的四张表（顺序：子表在前）。asin_data 最后 —— PG 侧
 # asin_changes / screenshots / batch_asins 都可能引用它。
 ASIN_DELETE_TABLES = ("asin_changes", "screenshots", "batch_asins", "asin_data")

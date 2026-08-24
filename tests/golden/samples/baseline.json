@@ -5946,7 +5946,7 @@
           "__html__": {
             "has_jinja_error": false,
             "has_traceback": false,
-            "size_bucket": 31
+            "size_bucket": 32
           }
         },
         "content_type": "text/html",
@@ -5968,7 +5968,7 @@
           "__html__": {
             "has_jinja_error": false,
             "has_traceback": false,
-            "size_bucket": 18
+            "size_bucket": 19
           }
         },
         "content_type": "text/html",

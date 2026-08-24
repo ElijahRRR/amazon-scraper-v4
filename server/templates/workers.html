@@ -267,22 +267,47 @@
     setInterval(refresh, 5000);
 
     // Expose global actions
+    //
+    // ⚠ 这三个打的都是 server/authz.py 的 _PROTECTED 端点（DELETE /api/workers、
+    // DELETE /api/workers/{id}、POST /api/workers/{id}/restart）。配了 ADMIN_TOKEN
+    // 却没在「设置」页填时它们会 401，而原来的写法是
+    //     await fetch(...); refresh();
+    // —— 完全不看响应：页面照常刷新、worker 还在原地、一句提示都没有。
+    // 与 tasks.html / results.html 那四个删除入口是同一个病，统一用 base.html 的
+    // window.apiErrText 把服务端那句话显示出来。
     window.removeWorker = async function(workerId) {
-        await fetch('/api/workers/' + encodeURIComponent(workerId), { method: 'DELETE' });
+        try {
+            const resp = await fetch('/api/workers/' + encodeURIComponent(workerId), { method: 'DELETE' });
+            if (!resp.ok) { alert('移除失败：' + await window.apiErrText(resp)); return; }
+        } catch (e) {
+            alert('移除异常：' + e);
+            return;
+        }
         refresh();
     };
 
     window.clearOffline = async function() {
-        const resp = await fetch('/api/workers', { method: 'DELETE' });
-        const data = await resp.json();
+        try {
+            const resp = await fetch('/api/workers', { method: 'DELETE' });
+            if (!resp.ok) { alert('清理失败：' + await window.apiErrText(resp)); return; }
+        } catch (e) {
+            alert('清理异常：' + e);
+            return;
+        }
         refresh();
     };
 
     window.restartWorker = async function(workerId) {
         if (!confirm(`确定软重启 ${workerId}？将重建 session（新指纹、新 cookies），采集不中断。`)) return;
-        const resp = await fetch('/api/workers/' + encodeURIComponent(workerId) + '/restart', { method: 'POST' });
-        const data = await resp.json();
-        alert(data.message || '指令已下发');
+        try {
+            const resp = await fetch('/api/workers/' + encodeURIComponent(workerId) + '/restart', { method: 'POST' });
+            if (!resp.ok) { alert('重启失败：' + await window.apiErrText(resp)); return; }
+            const data = await resp.json();
+            alert(data.message || '指令已下发');
+        } catch (e) {
+            alert('重启异常：' + e);
+            return;
+        }
         refresh();
     };
 })();

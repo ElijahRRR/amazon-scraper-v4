@@ -202,3 +202,64 @@ async def test_default_sort_is_unchanged(seeded_pg, seeded_sqlite):
     for db in (seeded_pg, seeded_sqlite):
         await _shuffle(db)
         assert await _ids(db) == await _ids(db, sort="id")
+
+
+# ==================== 对抗式评审补的网（三条都曾是零覆盖） ====================
+
+@pytest.mark.asyncio
+async def test_recent_prev_walk_is_the_mirror_of_next(seeded_pg, seeded_sqlite):
+    """⚠ `sort=recent` + `direction=prev` + **带游标**在本文件里曾经零覆盖。
+
+    参数表里带 cursor 的只有 next 方向（cursor_id=5），而 direction='prev'
+    那条不带 cursor —— cursor_id 为 None 时整个 keyset 分支根本不执行。
+    于是 recent 模式下 prev 方向的**绑定值**没有任何网：把
+    `where_params.extend([cursor_ts, as_int(cursor_id)])` 改成 prev 方向绑空串，
+    点"上一页"会拿回一整页语义错误的行、两个后端还会静默分叉，
+    而全套 980 个测试无一发现（评审实测 461 passed 全绿）。
+
+    这里从全序的中间取一个游标往回翻，断言它正好等于全序里该游标**之前**的
+    那几行 —— prev 必须是 next 的镜像。
+    """
+    for db in (seeded_pg, seeded_sqlite):
+        await _shuffle(db)
+        full = await _ids(db, sort="recent", limit=50)
+        assert len(full) >= 6, full
+        for pos in (2, 4, len(full) - 2):
+            cur = full[pos]
+            back = await _ids(db, sort="recent", limit=2,
+                              cursor_id=cur, direction="prev")
+            expected = full[max(0, pos - 2):pos]
+            assert back == expected, (
+                f"{type(db).__module__}: 从 full[{pos}]={cur} 往回翻 "
+                f"得到 {back}，应为 {expected}（全序 {full}）")
+
+
+@pytest.mark.asyncio
+async def test_cursor_row_with_null_updated_at(seeded_pg, seeded_sqlite):
+    """⚠ 游标行**自身** updated_at 为 NULL 时的绑定值曾经零覆盖。
+
+    results_sort.py 模块头把「绑定游标值也要过 COALESCE 的等价物
+    （`row["updated_at"] or ""`）」列为最要命的一条，但参数表里所有 cursor
+    都是 updated_at 非空的行；而夹具里唯一 NULL 的那行在 recent 序里排最后，
+    逐页走查永远走不到拿它当游标。
+
+    去掉那个 `or ""` 的后果：行值比较恒为 NULL，PG 返回**空页**
+    （has_more=False，调用方读成"数据到头了"），SQLite 照常返回数据 ——
+    两个后端静默分叉，而全套测试全绿。
+    """
+    results = {}
+    for db in (seeded_pg, seeded_sqlite):
+        await _shuffle(db)
+        full = await db.get_results(sort="recent", limit=50, with_total=False)
+        items = full["items"]
+        null_row = next(i for i in items if i["updated_at"] is None)
+        idx = [i["id"] for i in items].index(null_row["id"])
+        # 拿这一行当游标，两个方向各翻一次
+        nxt = await _ids(db, sort="recent", limit=3, cursor_id=null_row["id"])
+        prv = await _ids(db, sort="recent", limit=3,
+                         cursor_id=null_row["id"], direction="prev")
+        all_ids = [i["id"] for i in items]
+        assert nxt == all_ids[idx + 1:idx + 4], (nxt, all_ids, idx)
+        assert prv == all_ids[max(0, idx - 3):idx], (prv, all_ids, idx)
+        results[type(db).__module__] = (tuple(nxt), tuple(prv))
+    assert len(set(results.values())) == 1, f"两个后端分叉了: {results}"
