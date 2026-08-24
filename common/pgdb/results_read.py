@@ -297,11 +297,22 @@ class ResultsReadMixin:
         # 索引加速；扁平 OR 而不是 d.id IN (... UNION ...)，200k 行实测非选择性
         # 词条 2.2ms vs 536ms（后者要 HashAggregate 整个 id 集）。
         #
-        # ⚠ ``any(len(t) < 3 ...)`` 的分支判断已经**去掉**：它此前唯一的作用是
-        # 决定谓词文本里要不要带 "d.id" 标记，用来刻意复现 count 查询那个崩溃
-        # （决策 D-8）。D-8 已按它自己写的"留给 Phase 1.5 修"修掉（见下方
-        # count_where 处），标记失去意义，两条分支产生的行集本来就完全相同
-        # （实测 37 个非空探针一致）。
+        # ⚠ ``any(len(t) < 3 ...)`` 这个分支判断**必须保留**，但它的用途变了。
+        #
+        # 它原来的作用是决定谓词文本里要不要带 "d.id" 标记，用来刻意复现 count
+        # 查询那个崩溃（决策 D-8）。D-8 已修（见下方 count_where 处），标记失去
+        # 意义 —— 但这个判断本身获得了一个**真正的**用途：决定 SQL 形状。
+        #
+        # 因为 pg_trgm 索引**服务不了 1~2 字符的模式**（trigram 的最小单位就是
+        # 3 字符）。对这种词，"每个 (词 × 列) 一个分支"没有任何索引可用，
+        # 等于把原来的**一次**全表扫变成 **3N 次**全表扫。
+        # 200k 行实测：零命中 10 个短词 12171ms，而同样 10 个长词只要 19ms。
+        # 放到百万行上就是 60s 超时 —— 等于把洞从"粘 ASIN"挪到了"手输短词"。
+        #
+        # 所以：只要有一个词短于 3 字符，就退回扁平 OR（一次扫描，与改动前
+        # 完全相同的行为）；全部 >= 3 字符时才用分支形状。
+        # 混合输入（"chair,qz"）也走扁平 OR：OR 里只要有一个分支用不上索引，
+        # 整条查询就必须全表扫，拆分支只会把这次扫描乘以 3N。
         search_pred = ""
         search_params: list = []
         search_patterns: List[str] = []
@@ -317,6 +328,10 @@ class ResultsReadMixin:
                     search_patterns.append(like_pattern)
                     search_params.extend([like_pattern] * len(_SEARCH_COLUMNS))
                 search_pred = f"({' OR '.join(or_clauses)})"
+                if any(len(t) < 3 for t in terms):
+                    # 短词路径：trgm 用不上，分支拆分只会放大扫描次数。
+                    # 清空 search_patterns -> 下面走扁平 OR 的那条分支。
+                    search_patterns = []
 
         # 构建 count 查询的参数**与谓词**——两者必须在同一时刻快照，
         # 也就是 keyset 谓词追加**之前**。见下面 count_where 处的注释。
@@ -373,6 +388,12 @@ class ResultsReadMixin:
         #   chair + 零命中 ×9       475ms       63ms
         # 六组用例行集逐个 id 相同。
         #
+        # ⚠ 上表全部是 **>= 3 字符**的词。短词（1~2 字符）走不到这里 ——
+        #   它们被上面那个 `any(len(t) < 3 ...)` 判断挡回扁平 OR 了，理由见那段
+        #   注释。短词零命中 10 个：扁平 OR 6028ms / 拆分支 12171ms，
+        #   而扁平 OR 那个数与改动前逐字相同（main 实测 6229ms）。
+        #   也就是说短词的慢是**既有行为**，本轮既没修好也没改坏它。
+        #
         # 试过但**不行**的两种写法，别再走回头路：
         #   * 单个 MATERIALIZED CTE 包住整个扁平 OR：零命中 10 词好了（42ms），
         #     但高命中 4 词从 45ms 劣化到 3179ms —— 它要把全部命中行物化一遍，
@@ -419,14 +440,21 @@ class ResultsReadMixin:
             # 参数顺序 = SQL 文本顺序：各分支 -> 外层 join -> 外层 where -> limit
             params = branch_params + join_params + where_params
         else:
+            # 无 search，或短词路径（见上）。短词路径要把扁平 OR 谓词接回 WHERE，
+            # 参数顺序 = SQL 文本顺序：join -> where -> search -> limit。
+            flat_where = where_clause
+            flat_params = join_params + where_params
+            if search_pred:
+                flat_where = f"{where_clause} AND {search_pred}"
+                flat_params = flat_params + search_params
             sql = f"""
                 SELECT {proj or 'd.*'} FROM asin_data d
                 {join_clause}
-                WHERE {where_clause}
+                WHERE {flat_where}
                 ORDER BY {order_by_clause}
                 LIMIT ?
             """
-            params = join_params + where_params
+            params = flat_params
         params.append(limit + 1)  # 多取一条判断 has_more
 
         async with self.read() as rc, rc.execute(sql, params) as c:
