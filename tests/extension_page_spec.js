@@ -252,6 +252,27 @@ const DETAIL = `
 }
 
 {
+  // 计数必须拆成自然位 / 广告位。
+  //
+  // 真机上这条的表现：Amazon 页面顶部写 "1-24 of over 40,000"，插件报 32 ——
+  // 差的 8 个是广告位（顶部 Sponsored Brands 横幅 + 网格里穿插的 Sponsored
+  // 卡片），Amazon 那个 24 只数自然位。而推送时默认丢广告位，所以只报总数
+  // 的话用户看到 32、实际入队 24，差额没处可查，跟"抓漏了"表现一样。
+  const d = docOf(`<html><body><div class="s-main-slot">
+    <div class="AdHolder"><div class="s-result-item" data-asin="B0ADBANNR1"></div></div>
+    <div class="s-result-item" data-asin="B0NAT00001">
+      <span class="puis-sponsored-label-text">Sponsored</span></div>
+    <div class="s-result-item" data-asin="B0NAT00002"></div>
+    <div class="s-result-item" data-asin="B0NAT00003"></div>
+  </div></body></html>`);
+  const info = P.detectPage('https://www.amazon.com/s?k=x', d);
+  check('计数：总数含广告位', info.itemCount, 4);
+  check('计数：自然位', info.naturalCount, 2);
+  check('计数：广告位', info.sponsoredCount, 2);
+  check('计数：三者自洽', info.naturalCount + info.sponsoredCount, info.itemCount);
+}
+
+{
   // Sponsored Brands 横幅走的是 AdHolder，没有那三种 label。
   // 只看 label 的话它会被当成自然位 —— 默认丢广告位时也丢不掉。
   const d = docOf(`<html><body><div class="s-main-slot">

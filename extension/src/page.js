@@ -110,7 +110,11 @@
       sellerName: null,
       hasGrid: false,
       hasNextPage: false,
+      // itemCount 是结果区里的**全部**商品卡片，含广告位。
+      // natural/sponsored 是它的拆分 —— 弹窗必须按拆分显示，理由见 countGridItems。
       itemCount: 0,
+      naturalCount: 0,
+      sponsoredCount: 0,
       isAmazonSelf: false,
       keyword: null,
     };
@@ -155,7 +159,7 @@
       out.sellerId = sellerId;
       out.sellerName = sellerNameFromDom(doc);
       out.isAmazonSelf = AMAZON_SELF_MERCHANTS.has(sellerId);
-      out.itemCount = countGridItems(doc);
+      applyCounts(out, countGridItems(doc));
       return out;
     }
 
@@ -173,11 +177,18 @@
     if (pathHit || out.hasGrid) {
       out.type = PAGE_TYPES.LIST;
       out.keyword = u.searchParams.get('k') || u.searchParams.get('keywords') || null;
-      out.itemCount = countGridItems(doc);
+      applyCounts(out, countGridItems(doc));
       return out;
     }
 
     return out;
+  }
+
+  /** 把 countGridItems 的拆分摊进 detectPage 的返回值。 */
+  function applyCounts(out, counts) {
+    out.itemCount = counts.total;
+    out.naturalCount = counts.natural;
+    out.sponsoredCount = counts.sponsored;
   }
 
   // ────────────────────────────────────────────────────────────
@@ -238,8 +249,24 @@
     return false;
   }
 
+  /**
+   * 结果区商品数的**拆分**：{ total, natural, sponsored }。
+   *
+   * ⚠ 必须拆开给弹窗看，不能只报 total ——
+   *
+   *   Amazon 页面顶部写的 "1-24 of over 40,000" 只数**自然位**；结果区里
+   *   还夹着广告位（顶部 Sponsored Brands 横幅 + 网格里穿插的 Sponsored
+   *   卡片），它们不计入那个 24，但确实在这一页上。所以 total 比页面上
+   *   那个数大是**正常的**，不是抓多了。
+   *
+   *   而推送时默认**丢弃广告位**（`include_sponsored` 开关）。只报 total
+   *   的话，用户看到 32、实际入队 24，差额没有任何地方能看出来 ——
+   *   跟"抓漏了 8 个"的表现完全一样，没法自证清白。
+   */
   function countGridItems(doc) {
-    return collectListItems(doc).length;
+    const items = collectListItems(doc);
+    const sponsored = items.filter((it) => it.sponsored).length;
+    return { total: items.length, natural: items.length - sponsored, sponsored };
   }
 
   /**

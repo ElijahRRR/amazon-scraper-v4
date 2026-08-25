@@ -85,7 +85,24 @@ function renderPage(info) {
 
   if (info.type === 'list' || info.type === 'seller') {
     $('listPanel').classList.remove('hidden');
-    $('listCount').textContent = `本页 ${info.itemCount} 个商品`;
+    // 按「会推多少」来显示，而不是「读到多少」。
+    //
+    // 这两个数不一样：Amazon 页面顶部那个 "1-24 of over 40,000" 只数自然位，
+    // 而结果区里还夹着广告位（顶部 Sponsored Brands 横幅 + 网格里穿插的
+    // Sponsored 卡片）。推送时默认丢弃广告位，所以只报总数的话，用户看到 32、
+    // 实际入队 24，差额没有任何地方能看出来 —— 跟"抓漏了 8 个"表现完全一样。
+    const keep = settings.includeSponsored ? info.itemCount : info.naturalCount;
+    let countText = `本页将采 ${keep} 个`;
+    if (info.sponsoredCount) {
+      countText += settings.includeSponsored
+        ? `（含 ${info.sponsoredCount} 个广告位）`
+        : `（另有 ${info.sponsoredCount} 个广告位已排除）`;
+    }
+    $('listCount').textContent = countText;
+    $('listCount').title =
+      `结果区共 ${info.itemCount} 个商品卡片：自然位 ${info.naturalCount}、` +
+      `广告位 ${info.sponsoredCount}。\n` +
+      'Amazon 页面顶部写的 "1-24 of ..." 只数自然位，所以总数比它大是正常的。';
     $('pageMeta').textContent = info.keyword ? `关键词：${info.keyword}` : '';
     syncPagesRow();
     if (!info.hasNextPage) {
@@ -412,6 +429,11 @@ $('paginate').addEventListener('change', (e) => {
   syncPagesRow();
   bg('SET_SETTINGS', { patch: { autoPaginate: e.target.checked } });
 });
+
+// 选项页改了「保留广告位」之后重新打开弹窗，上面那行数字要跟着变。
+// settings 是 init() 里拉的快照，renderPage 读它 —— 所以只要 init 顺序
+// 是「先拉 settings 再 renderPage」就自动正确（当前就是）。这里留个注，
+// 免得将来有人把两者调换顺序：那会让数字停在上一次的开关状态上。
 $('maxPages').addEventListener('change', (e) => {
   bg('SET_SETTINGS', { patch: { maxPages: parseInt(e.target.value, 10) || 5 } });
 });
