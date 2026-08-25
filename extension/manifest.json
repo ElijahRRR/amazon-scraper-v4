@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Amazon Scraper v4 采集助手",
-  "version": "1.0.0",
-  "description": "在亚马逊页面上一键采集：自动识别产品列表 / 卖家店铺 / 产品详情三种页面，把 ASIN 推送到自建 Server 由 worker 采详情。",
+  "version": "1.1.0",
+  "description": "在亚马逊页面上一键采集：页内常驻悬浮球 + 右侧面板，实时识别产品列表 / 卖家店铺 / 产品详情，把 ASIN 推送到自建 Server 由 worker 采详情。",
   "permissions": [
     "storage",
     "tabs"
@@ -78,5 +78,34 @@
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
   },
-  "options_page": "src/options.html"
+  "options_page": "src/options.html",
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "src/popup.html",
+        "src/popup.css",
+        "src/popup.js"
+      ],
+      "matches": [
+        "*://*.amazon.com/*",
+        "*://*.amazon.co.uk/*",
+        "*://*.amazon.de/*",
+        "*://*.amazon.fr/*",
+        "*://*.amazon.it/*",
+        "*://*.amazon.es/*",
+        "*://*.amazon.ca/*",
+        "*://*.amazon.co.jp/*",
+        "*://*.amazon.com.au/*",
+        "*://*.amazon.com.mx/*",
+        "*://*.amazon.in/*",
+        "*://*.amazon.nl/*",
+        "*://*.amazon.se/*",
+        "*://*.amazon.pl/*",
+        "*://*.amazon.com.br/*",
+        "*://*.amazon.ae/*",
+        "*://*.amazon.sa/*",
+        "*://*.amazon.sg/*"
+      ]
+    }
+  ]
 }

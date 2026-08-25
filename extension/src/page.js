@@ -117,6 +117,8 @@
       sponsoredCount: 0,
       isAmazonSelf: false,
       keyword: null,
+      // 页面骨架是否已渲染。只对详情页有意义（列表页有网格就说明已渲染）。
+      ready: true,
     };
 
     let u;
@@ -130,19 +132,35 @@
     out.hasNextPage = hasNextPage(doc);
 
     // ── 1) 详情页 ──────────────────────────────────────────────
-    // URL 是首要判据；`#ASIN` 隐藏输入是兜底（有些促销落地页的路径不带 /dp/）。
-    const urlAsin = asinFromUrl(u.pathname + u.search);
+    //
+    // ⚠ **pathname 与 search 分两档判**，这是承重的：
+    //
+    //   pathname 里的 `/dp/ASIN` 是**无歧义**的 —— 只有详情页会长这样。
+    //   所以它一命中就直接认，不等 DOM。
+    //
+    //   search 里匹配到的则**必须**有 DOM 佐证：搜索结果页的 URL 上
+    //   （`ref=`、`url=` 之类参数里）也会出现 `/dp/XXXX`，只看 URL 会误判。
+    //
+    // 合并成一个判据（旧写法：`(urlAsin || domAsin) && looksDetail`）的后果
+    // 实测踩到了：Amazon 详情页的 `#dp` / `#productTitle` 是**异步渲染**的，
+    // 页面刚打开时还不存在 —— 这时点插件会显示"未识别到页面"，关掉重开
+    // 才好。用户看到的是一个时灵时不灵的功能，而不是"还没加载完"。
+    const pathAsin = asinFromUrl(u.pathname);
+    const queryAsin = pathAsin ? null : asinFromUrl(u.search);
     const domAsin = normalizeAsin(
       (doc.querySelector('#ASIN') || {}).value ||
       (doc.querySelector('input#ASIN') || {}).value ||
       (doc.querySelector('[data-asin][data-component-type="s-product-image"]') || {}).getAttribute?.('data-asin')
     );
-    // `#dp` / `#dp-container` 是详情页骨架的稳定锚点；只靠 URL 的话，
-    // 搜索结果页里带 /dp/ 的**跳转链接**在某些 A/B 分桶下也会进 URL。
+    // `#dp` / `#dp-container` 是详情页骨架的稳定锚点。
     const looksDetail = !!doc.querySelector('#dp, #dp-container, #productTitle, #centerCol');
-    if ((urlAsin || domAsin) && looksDetail) {
+    const urlAsin = pathAsin || queryAsin;
+    if (pathAsin || ((queryAsin || domAsin) && looksDetail)) {
       out.type = PAGE_TYPES.DETAIL;
       out.asin = urlAsin || domAsin;
+      // 详情页骨架渲染好了没有。false = 认出来了但页面还在加载，
+      // 标题/卖家可能暂时是空的 —— 界面据此显示"加载中"而不是"读不到"。
+      out.ready = looksDetail;
       const t = doc.querySelector('#productTitle, #title');
       out.title = t ? (t.textContent || '').trim().replace(/\s+/g, ' ') : '';
       const seller = extractDetailSeller(doc);

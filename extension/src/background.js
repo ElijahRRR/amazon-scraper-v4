@@ -442,6 +442,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 // 标签页关掉了就把任务收掉，不然角标会一直挂着一个永远不会推进的数字
+// ⚠ 这里**故意没有** chrome.action.onClicked：manifest 里配了
+//   `action.default_popup`，配了之后 onClicked **永远不会触发**（浏览器
+//   直接开弹窗）。想让图标改成开合页内面板，就得删掉 default_popup ——
+//   那会让「工具栏图标」这个入口在非亚马逊页面上完全失效（没有 content
+//   script 可以通信），得不偿失。
+//
+//   所以分工是：工具栏图标 = 弹窗（任何页面都能开，用来配置和看队列），
+//   页内悬浮球 = 右侧面板（只在亚马逊页面上有，用来干活）。
+//   两者装的是同一份 popup.html。
+
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   const run = await getRun();
   if (run && run.tabId === tabId && run.active) {

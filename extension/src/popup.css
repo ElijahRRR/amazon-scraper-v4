@@ -194,3 +194,17 @@ input[type="number"] {
 .status.busy { background: var(--panel); color: var(--muted); }
 
 .hidden { display: none !important; }
+
+/* ──────────────────────────────────────────────────────────────
+   面板模式（同一份 popup.html 被 content.js 用 iframe 装在页面右侧）
+   ──────────────────────────────────────────────────────────────
+   差别只有尺寸：弹窗是浏览器给的固定 340px 小窗，面板要撑满 iframe
+   的高度并能滚动。功能与结构一字不改 —— 那正是复用同一份的意义。 */
+body.in-panel {
+  width: auto;
+  min-height: 100%;
+  padding: 12px 14px 20px;
+}
+
+/* 面板里队列可以给更多高度：它不像弹窗那样受浏览器窗口高度限制。 */
+body.in-panel .queue { max-height: 260px; }

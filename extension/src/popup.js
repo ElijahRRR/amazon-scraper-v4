@@ -1,13 +1,24 @@
 /**
- * popup.js —— 弹窗界面。
+ * popup.js —— 操作界面。**两个宿主共用这一份**：
+ *
+ *   1. 工具栏那个弹窗（manifest 的 action.default_popup）
+ *   2. 页内右侧面板 —— content.js 用 iframe 装的就是同一个 popup.html
+ *
+ * 复用而不是写两份，是因为两份 UI 一定会分叉：以后每加一个按钮都要改
+ * 两处，漏掉的那处**不会报错**，只会安静地少一个功能。
  *
  * 三种页面对应三套面板，由 content script 的识别结果决定显示哪一套。
  * popup 自己**不碰 DOM 也不发网络请求**：前者要问 content script，
  * 后者要问 service worker（跨源只有它能做，见 background.js 头注）。
  *
- * ⚠ popup 是**每次打开都重新执行**的一个页面，关掉即销毁。所以这里不存
- * 任何状态 —— 打开时把队列、设置、翻页任务的当前态全部重新拉一遍。
- * 想在这里缓存点什么的话，用户关掉再打开就会看到过期数据。
+ * ⚠ 两个宿主的生命周期**完全不同**，这决定了刷新策略：
+ *
+ *   弹窗：每次打开都重新执行，关掉即销毁 —— 打开时拉一次就够。
+ *   面板：**一直开着**，页面在它眼皮底下翻页、导航、异步渲染 ——
+ *         拉一次远远不够，必须持续接收 content script 的广播。
+ *
+ * 所以这里不存任何状态（关掉再打开会看到过期数据），并且同时监听两条
+ * 更新通道：postMessage（在 iframe 里时）与 runtime 消息（在弹窗里时）。
  */
 
 const $ = (id) => document.getElementById(id);
@@ -15,6 +26,10 @@ const $ = (id) => document.getElementById(id);
 let pageInfo = null;
 let settings = null;
 let activeTabId = null;
+
+//: 自己是不是被 content.js 用 iframe 装在页面右侧。
+//  两个宿主的差别只有两处：面板要显示"收起"按钮，且要持续接收广播。
+const IN_PANEL = window.top !== window.self;
 
 // ──────────────────────────────────────────────────────────────
 // 与两侧通信
@@ -128,14 +143,21 @@ function renderPage(info) {
   if (info.type === 'detail') {
     $('detailPanel').classList.remove('hidden');
     $('detailAsin').textContent = info.asin || '(未识别 ASIN)';
-    $('detailTitle').textContent = info.title || '';
+    $('detailTitle').textContent = info.title || (info.ready ? '' : '页面加载中…');
     $('detailTitle').title = info.title || '';
     $('addQueue').disabled = !info.asin;
     $('pageMeta').textContent = '';
 
     const sellerBox = $('detailSeller');
     const expand = $('expandSeller');
-    if (info.sellerId) {
+    // ⚠ `ready === false` 是「认出来了但骨架还没渲染完」，与「渲染完了但
+    //   读不到卖家」是两回事。不分开的话，页面刚打开那一瞬会显示
+    //   "这一页读不到三方卖家" —— 一个过两秒就自己变对的错误结论，
+    //   用户只会记住它错过一次。
+    if (!info.ready) {
+      sellerBox.textContent = '页面还在加载，卖家信息稍后出现…';
+      expand.disabled = true;
+    } else if (info.sellerId) {
       sellerBox.textContent = `卖家：${info.sellerName || info.sellerId}（${info.sellerId}）`;
       expand.disabled = false;
     } else if (info.isAmazonSelf) {
@@ -385,9 +407,55 @@ async function init() {
   }
 }
 
+// ──────────────────────────────────────────────────────────────
+// 页面变化的两条更新通道
+// ──────────────────────────────────────────────────────────────
+//
+// content.js 每次重新识别出**不一样**的页面就广播一次。面板常驻，
+// 页面在它眼皮底下翻页/导航/异步渲染完，全靠这条通道跟上 ——
+// 没有它，面板会一直显示打开那一刻的状态，而用户完全看不出它已经过期。
+
+function onPageInfo(info) {
+  if (!info) return;
+  pageInfo = info;
+  renderPage(info);
+}
+
+// 通道 A：在面板 iframe 里 —— content.js 的 postMessage。
+window.addEventListener('message', (ev) => {
+  if (ev.data?.source !== 'amz-scraper') return;
+  if (ev.data.type === 'PAGE_CHANGED') onPageInfo(ev.data.info);
+});
+
+// 通道 B：在工具栏弹窗里 —— content.js 经 runtime 广播。
+// （弹窗开着时页面也可能变，比如详情页刚渲染完卖家信息。）
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg?.type === 'PAGE_CHANGED_FROM_CONTENT') onPageInfo(msg.info);
+});
+
+if (IN_PANEL) {
+  // 面板里多一个"收起"入口，并且开局主动要一次最新状态 ——
+  // iframe 可能比 content.js 的第一次广播晚加载完，那一发会打空。
+  document.body.classList.add('in-panel');
+  window.parent.postMessage({ source: 'amz-scraper-panel', type: 'REQUEST_REFRESH' }, '*');
+}
+
 $('openOptions').addEventListener('click', (e) => {
   e.preventDefault();
   chrome.runtime.openOptionsPage();
+});
+
+// 手动刷新：实时检测已经覆盖了绝大多数情况，但留一个显式入口 ——
+// 万一 Amazon 用了某种 MutationObserver 看不见的渲染方式，用户至少
+// 有办法自救，而不是只能关掉重开。
+$('refreshPage').addEventListener('click', async (e) => {
+  e.preventDefault();
+  if (IN_PANEL) {
+    window.parent.postMessage({ source: 'amz-scraper-panel', type: 'REQUEST_REFRESH' }, '*');
+  }
+  const analyzed = await tab('ANALYZE_PAGE');
+  if (analyzed.ok) onPageInfo(analyzed.info);
+  else status(analyzed.error, 'err');
 });
 $('collectList').addEventListener('click', doCollectList);
 $('collectSeller').addEventListener('click', doCollectSeller);

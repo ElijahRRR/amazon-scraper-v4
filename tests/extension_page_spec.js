@@ -187,6 +187,51 @@ const DETAIL = `
 }
 
 // ────────────────────────────────────────────────────────────
+// 详情页判定的时机：骨架还没渲染完时也要认出来
+// ────────────────────────────────────────────────────────────
+//
+// 回归用例：真机上打开一个产品页**立刻**点插件，显示"未识别到页面"，
+// 关掉弹窗重开才好 —— 因为 Amazon 详情页的 `#productTitle` / `#dp`
+// 是异步渲染的，而旧判据要求它们存在。用户看到的是一个时灵时不灵的功能。
+
+{
+  // 骨架一点都没渲染（只有 <body>），但 URL 路径里有 /dp/ASIN。
+  // 这是无歧义的 —— 必须当场认出来。
+  const d = docOf('<html><body></body></html>');
+  const info = P.detectPage('https://www.amazon.com/Some-Slug/dp/B0EARLY001', d);
+  check('骨架未渲染：仍认出详情页', info.type, 'detail');
+  check('骨架未渲染：ASIN 拿得到', info.asin, 'B0EARLY001');
+  check('骨架未渲染：ready=false', info.ready, false);
+  check('骨架未渲染：标题暂时为空', info.title, '');
+}
+
+{
+  // 渲染完之后 ready 变 true，标题/卖家跟着出现。
+  const d = docOf(`<html><body>${DETAIL}</body></html>`);
+  const info = P.detectPage('https://www.amazon.com/dp/B0DETAIL01', d);
+  check('渲染完：ready=true', info.ready, true);
+  check('渲染完：标题有了', info.title, 'A Real Product');
+}
+
+{
+  // 反向：URL 的 **query** 里出现 /dp/ 时**不能**只凭 URL 认。
+  // 搜索结果页的 ref/url 参数里真的会带它 —— 那一档必须要 DOM 佐证，
+  // 否则搜索页会被认成详情页，整个列表采集入口消失。
+  const d = docOf(`<html><body>${GRID}</body></html>`);
+  const info = P.detectPage('https://www.amazon.com/s?k=x&ref=/dp/B0QUERY001', d);
+  check('query 里的 /dp/ 不算详情页', info.type, 'list');
+}
+
+{
+  // 但 query 里有 /dp/ **且**页面确实是详情页骨架时，仍然要认
+  // （有些促销落地页的路径不带 /dp/，ASIN 只在参数里）。
+  const d = docOf(`<html><body>${DETAIL}</body></html>`);
+  const info = P.detectPage('https://www.amazon.com/promo?target=/dp/B0PROMO001', d);
+  check('query + 骨架 = 详情页', info.type, 'detail');
+  check('query + 骨架：ASIN 取 query 的', info.asin, 'B0PROMO001');
+}
+
+// ────────────────────────────────────────────────────────────
 // 抽取范围：只要结果容器里的，不要页面上其它带 ASIN 的东西
 // ────────────────────────────────────────────────────────────
 //
