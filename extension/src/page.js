@@ -184,8 +184,52 @@
   // 抽取：列表 / 卖家页的 ASIN 网格
   // ────────────────────────────────────────────────────────────
 
+  //: 搜索结果的容器。按优先级依次尝试，命中第一个就把抽取限定在它里面。
+  //
+  //  为什么必须限定：整页扫描会把顶部 Sponsored Brands 横幅、底部
+  //  "Products related to this search" / "Best Sellers" / "Customers also
+  //  viewed" 全部算成"本页商品"。实测搜索 "Wall Cabinet"，页面自己写着
+  //  1-24，整页扫描得到 81 —— 三倍的噪音，而且推给服务端之后每个都要烧
+  //  一份代理配额采详情，数据里还分不出哪些是真结果。
+  //
+  //  ⚠ 找不到任何一个容器时**不报错也不返回空**，退回整页扫描：榜单页
+  //  （/gp/bestsellers）、品牌旗舰店（/stores/）没有 s-main-slot，那时整页
+  //  扫描才是对的。代价是那些页面上的噪音仍在，但那些页面本来也没有
+  //  "结果区"这个概念。
+  const RESULTS_ROOT_SELECTORS = [
+    'div.s-main-slot.s-result-list',            // 搜索页主结果列表（最精确）
+    '[data-component-type="s-search-results"]', // 新版包裹层
+    'div.s-main-slot',                          // 经典容器
+    'span.rush-component[data-component-type="s-search-results"]',
+    '.s-search-results',
+  ];
+
+  //: 横向滑动的推荐条。Amazon 会把它们**插进结果区内部**，所以即使限定了
+  //  容器也要再排掉一层。
+  const CAROUSEL_SELECTOR = [
+    '.a-carousel',
+    '.a-carousel-container',
+    '[data-a-carousel-options]',
+    '[cel_widget_id*="carousel" i]',
+    '[data-cel-widget*="carousel" i]',
+  ].join(',');
+
+  /** 结果容器；找不到就返回 doc 本身（调用方据此决定要不要跑兜底扫描）。 */
+  function resultsRoot(doc) {
+    for (const sel of RESULTS_ROOT_SELECTORS) {
+      const el = doc.querySelector(sel);
+      if (el) return el;
+    }
+    return doc;
+  }
+
   /** 判断一个结果卡片是不是广告位。与 worker/parser.py 的三条选择器一一对应。 */
   function isSponsoredCard(node) {
+    // 卡片自身带 AdHolder：顶部 Sponsored Brands 横幅走的是这条 ——
+    // 它**没有**下面那三种 label，只看 label 的话它会被当成自然位，
+    // 于是广告商品混进排名数据，而且默认丢弃广告位时也丢不掉它。
+    if (node.classList && node.classList.contains('AdHolder')) return true;
+    if (node.closest && node.closest('.AdHolder')) return true;
     if (node.querySelector('[data-component-type="sp-sponsored-result"]')) return true;
     if (node.querySelector('.puis-sponsored-label-text, .s-sponsored-label-text')) return true;
     // 兜底：部分布局只有一个纯文本 "Sponsored" 标签，没有专用 class。
@@ -204,19 +248,24 @@
    * 返回 [{ asin, title, price, image, sponsored, rank }]，rank 是**页内**序号
    * （1 起），与服务端 `search_discoveries.rank` 同语义。
    *
-   * 三条来源合并去重，因为 Amazon 在不同布局下只满足其中一条：
-   *   1. `div[data-asin]`          —— 搜索/店铺网格的主力
-   *   2. `[data-csa-c-item-id]`    —— 榜单页（Best Sellers）用这个，没有 data-asin
-   *   3. `a[href*="/dp/"]`         —— 轮播/推荐位的兜底
-   * 少一条就会在对应的页面类型上安静地采到 0 个。
+   * **抽取范围先被限定在结果容器内**（见 RESULTS_ROOT_SELECTORS），
+   * 容器内再排掉轮播（CAROUSEL_SELECTOR）。两条来源合并去重：
+   *   1. `div[data-asin]`       —— 搜索/店铺网格的主力
+   *   2. `[data-csa-c-item-id]` —— 榜单页（Best Sellers）用这个，没有 data-asin
+   * 外加一条**仅在没找到容器时**才跑的兜底：`a[href*="/dp/"]`。
    */
   function collectListItems(doc) {
+    const root = resultsRoot(doc);
+    const scoped = root !== doc;
     const seen = new Set();
     const items = [];
 
     const push = (asin, node) => {
       const a = normalizeAsin(asin);
       if (!a || seen.has(a)) return;
+      // 轮播卡片一律不要：Amazon 会把"相关商品"/"看了又看"这类横向滑动条
+      // **插进结果区内部**，它们不是这一页的搜索结果。
+      if (node && node.closest && node.closest(CAROUSEL_SELECTOR)) return;
       seen.add(a);
       items.push({
         asin: a,
@@ -228,23 +277,33 @@
       });
     };
 
-    doc.querySelectorAll('div[data-asin]').forEach((n) => push(n.getAttribute('data-asin'), n));
+    root.querySelectorAll('div[data-asin]').forEach((n) => push(n.getAttribute('data-asin'), n));
 
-    doc.querySelectorAll('[data-csa-c-item-id]').forEach((n) => {
+    root.querySelectorAll('[data-csa-c-item-id]').forEach((n) => {
       // 形如 amzn1.asin.B0XXXXXXXX
       const m = (n.getAttribute('data-csa-c-item-id') || '').match(/asin\.([A-Z0-9]{10})(?![A-Z0-9])/i);
       if (m) push(m[1], n);
     });
 
-    doc.querySelectorAll('a[href*="/dp/"]').forEach((a) => {
-      const m = (a.getAttribute('href') || '').match(/\/dp\/([A-Z0-9]{10})(?![A-Z0-9])/i);
-      // 卡片容器优先，取不到就用链接本身（标题/价格会空，ASIN 仍然是对的）
-      if (m) push(m[1], a.closest('div[data-asin], .a-carousel-card, li') || a);
-    });
+    // ⚠ 裸链接扫描**只在找不到结果容器时**才跑，而且是**兜底**不是补充。
+    //
+    // 它曾经是无条件跑的，后果实测：搜索 "Wall Cabinet"（页面自己写着
+    // 1-24 of over 40,000）插件报"本页 81 个商品" —— 多出来的 57 个是顶部
+    // Sponsored Brands 横幅、底部"Products related to this search" /
+    // "Best Sellers" / "Customers also viewed" 一堆推荐轮播里的商品。
+    // 它们会被当成这次搜索的结果推给服务端，每个烧一份代理配额采详情，
+    // 而数据里没有任何一列能把它们和真正的搜索结果区分开。
+    //
+    // 有容器时它一条都不该跑：容器内的东西两条 data 来源已经全覆盖了。
+    if (!scoped) {
+      doc.querySelectorAll('a[href*="/dp/"]').forEach((a) => {
+        const m = (a.getAttribute('href') || '').match(/\/dp\/([A-Z0-9]{10})(?![A-Z0-9])/i);
+        // 卡片容器优先，取不到就用链接本身（标题/价格会空，ASIN 仍然是对的）
+        if (m) push(m[1], a.closest('div[data-asin], .a-carousel-card, li') || a);
+      });
+    }
 
-    // rank = 插入顺序。第一条来源 `div[data-asin]` 是 querySelectorAll 的
-    // **DOM 顺序**，也就是真实搜索名次；后两条来源补上的那些（轮播、榜单卡片）
-    // 排在其后，本来也不属于主网格的名次序列。
+    // rank = 插入顺序，也就是结果容器内的 DOM 顺序 —— 真实搜索名次。
     return items;
   }
 
@@ -351,6 +410,9 @@
     ASIN_RE,
     SELLER_ID_RE,
     AMAZON_SELF_MERCHANTS,
+    RESULTS_ROOT_SELECTORS,
+    CAROUSEL_SELECTOR,
+    resultsRoot,
     normalizeAsin,
     normalizeSellerId,
     asinFromUrl,

@@ -187,6 +187,82 @@ const DETAIL = `
 }
 
 // ────────────────────────────────────────────────────────────
+// 抽取范围：只要结果容器里的，不要页面上其它带 ASIN 的东西
+// ────────────────────────────────────────────────────────────
+//
+// 这一组是**回归用例**：真机上搜 "Wall Cabinet"，页面自己写着
+// 1-24 of over 40,000，插件却报"本页 81 个商品"。多出来的是顶部
+// Sponsored Brands 横幅 + 底部三四条推荐轮播。它们会被当成搜索结果推给
+// 服务端，每个烧一份代理配额采详情，而数据里分不出哪些是真结果。
+
+{
+  // 一个贴近真实布局的搜索页骨架：结果容器外有横幅和推荐轮播，
+  // 容器内还夹了一条"相关商品"轮播（Amazon 真的会这么插）。
+  const REALISTIC = `
+    <div id="nav-belt"><a href="/Deal/dp/B0NAVLINK1">导航里的商品链接</a></div>
+
+    <!-- 结果容器**之外**：顶部 Sponsored Brands 横幅 -->
+    <div class="AdHolder s-widget-spacing-large">
+      <div class="s-result-item" data-asin="B0BANNER01"><h2><span>Banner A</span></h2></div>
+      <div class="s-result-item" data-asin="B0BANNER02"><h2><span>Banner B</span></h2></div>
+    </div>
+
+    <!-- 结果容器 -->
+    <div class="s-main-slot s-result-list">
+      <div class="s-result-item" data-asin="B0REAL0001"><h2><span>Real 1</span></h2></div>
+      <div class="s-result-item" data-asin="B0REAL0002"><h2><span>Real 2</span></h2></div>
+      <!-- Amazon 把推荐轮播插进结果区内部 -->
+      <div class="a-carousel-container">
+        <li class="a-carousel-card"><div data-asin="B0CAROU001"><h2><span>Carousel</span></h2></div></li>
+      </div>
+      <div class="s-result-item" data-asin="B0REAL0003"><h2><span>Real 3</span></h2></div>
+      <a class="s-pagination-next" href="/s?k=x&page=2">Next</a>
+    </div>
+
+    <!-- 结果容器**之外**：底部 "Products related to this search" -->
+    <div class="a-carousel-container">
+      <li class="a-carousel-card"><div data-asin="B0RELATE01"></div></li>
+      <li class="a-carousel-card"><div data-asin="B0RELATE02"></div></li>
+    </div>
+    <div><a href="/Other/dp/B0FOOTLNK1">页脚推荐链接</a></div>
+  `;
+
+  const d = docOf(`<html><body>${REALISTIC}</body></html>`);
+  const items = P.collectListItems(d);
+  check('限定容器：只留结果区内的自然位',
+        items.map((i) => i.asin),
+        ['B0REAL0001', 'B0REAL0002', 'B0REAL0003']);
+  check('限定容器：rank 连续（轮播不占位）', items.map((i) => i.rank), [1, 2, 3]);
+  check('限定容器：itemCount 与之一致',
+        P.detectPage('https://www.amazon.com/s?k=wall+cabinet', d).itemCount, 3);
+  check('限定容器：真的选中了 s-main-slot',
+        P.resultsRoot(d).className.includes('s-main-slot'), true);
+}
+
+{
+  // 没有结果容器的页面（榜单页 / 品牌旗舰店）必须退回整页扫描，
+  // 否则那些页面会安静地变成"本页 0 个商品"。
+  const d = docOf(`<html><body>
+    <div data-csa-c-item-id="amzn1.asin.B0BEST0001"></div>
+    <a href="/x/dp/B0BESTLINK">榜单里的链接</a>
+  </body></html>`);
+  check('无容器：退回整页扫描', P.collectListItems(d).map((i) => i.asin),
+        ['B0BEST0001', 'B0BESTLINK']);
+  check('无容器：resultsRoot 返回 doc 本身', P.resultsRoot(d) === d, true);
+}
+
+{
+  // Sponsored Brands 横幅走的是 AdHolder，没有那三种 label。
+  // 只看 label 的话它会被当成自然位 —— 默认丢广告位时也丢不掉。
+  const d = docOf(`<html><body><div class="s-main-slot">
+    <div class="AdHolder"><div class="s-result-item" data-asin="B0ADHOLD01"></div></div>
+    <div class="s-result-item" data-asin="B0NATURL01"></div>
+  </div></body></html>`);
+  const items = P.collectListItems(d);
+  check('AdHolder 算广告位', items.map((i) => i.sponsored), [true, false]);
+}
+
+// ────────────────────────────────────────────────────────────
 // 卖家抽取
 // ────────────────────────────────────────────────────────────
 
@@ -265,6 +341,27 @@ const DETAIL = `
   check('ASIN 归一化: 不以 B 开头', P.normalizeAsin('X012345678'), null);
   check('seller 归一化', P.normalizeSellerId('a2l77ee7u53nwq'), 'A2L77EE7U53NWQ');
   check('seller 归一化: 太短', P.normalizeSellerId('A123'), null);
+}
+
+// ────────────────────────────────────────────────────────────
+// 夹具自检：ASIN 字面量必须正好 10 位
+// ────────────────────────────────────────────────────────────
+//
+// 这个坑踩过两次，两次的症状都是"用例莫名返回空数组"，而根因
+// （夹具里写了 11 位）完全看不出来 —— page.js 正确地拒收了它们，
+// 只是拒得很安静。与其下次再花十分钟查，不如让夹具自己报出来。
+{
+  //: **故意**不是 10 位的字面量，它们本身就是被测的反例。
+  //  加新反例时要同步登记在这儿，否则本自检会把它当成手滑。
+  const DELIBERATE_BAD = new Set([
+    'B0TOOLONG123',   // 12 位 —— normalizeAsin 必须拒
+    'B0ELEVENCH1',    // 11 位 —— 截断防护必须拒（不能截成前 10 位）
+  ]);
+
+  const src = require('fs').readFileSync(__filename, 'utf8');
+  const bad = [...new Set((src.match(/\bB0[A-Z0-9]{5,}/g) || []))]
+    .filter((a) => a.length !== 10 && !DELIBERATE_BAD.has(a));
+  check('夹具里的 ASIN 都是 10 位（反例已登记的除外）', bad, []);
 }
 
 console.log(`${checks - failures}/${checks} 项通过`);
