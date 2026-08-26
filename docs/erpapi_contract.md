@@ -365,6 +365,7 @@ status.status == "completed"
 | `direction` | str | `"next"` | ⚠ **只有 `next` 和 `prev` 两个值有定义**，见下 |
 | `fields` | str | `null`（= 全部列） | 逗号分隔的列名。**非法列名 422 拒绝，不静默丢弃** |
 | `with_total` | bool | `true` | `false` → 不算 `total`（响应里是 `null`） |
+| `exact_total` | bool | `false` | `true` → `total` 强制精确。默认无筛选大库上是**估算值**，见下 |
 
 > ⚠ **`direction` 的非法值不会报错**。实现是
 > `order = "DESC" if direction == "next" else "ASC"`（`common/pgdb/results_read.py:242`），
@@ -376,7 +377,8 @@ status.status == "completed"
 #### 成功响应 `200`
 
 ```json
-{"items": [...], "has_more": true, "next_cursor": 3, "prev_cursor": 4, "total": 4}
+{"items": [...], "has_more": true, "next_cursor": 3, "prev_cursor": 4,
+ "total": 4, "total_is_estimate": false}
 ```
 
 | 字段 | 含义 |
@@ -385,7 +387,8 @@ status.status == "completed"
 | `has_more` | 还有下一页。**翻页的唯一终止条件** |
 | `next_cursor` | 下一页的游标（`direction=next` 用）= 本页最后一行的 `id` |
 | `prev_cursor` | 上一页的游标（`direction=prev` 用）= 本页第一行的 `id` |
-| `total` | **不含游标谓词**的全集计数。翻页途中恒定不变，可以直接拿去算进度条 |
+| `total` | **不含游标谓词**的全集计数。翻页途中恒定不变，可以直接拿去算进度条。**可能是估算值** —— 看下一行 |
+| `total_is_estimate` | `total` 是不是估算值。`true` 时误差通常 < 1%，**不要拿它对账**；要精确值传 `exact_total=true` |
 
 #### 两个减负开关：`fields` 与 `with_total`
 
@@ -414,6 +417,34 @@ status.status == "completed"
 `with_total=false` —— `total` 返回 `null`。它是**全表 COUNT**，随行数线性增长，
 而翻页途中值恒定不变：**首屏要一次就够**，之后一路 `false`。
 翻页的终止条件始终是 `has_more`，**不是** `total`（§5.6 已经说过这一点）。
+
+#### `total` 什么时候是估算值
+
+**一个筛选条件都没有**（无 `batch_id`、`change_filter=all`、无 `search`）
+且库 ≥ 10 万行时，PostgreSQL 后端的 `total` 取自 `pg_class.reltuples`
+统计值，响应里 `total_is_estimate` 为 `true`。
+
+带**任何**筛选时仍然精确（估不了带谓词的行数），小库上也仍然精确，
+SQLite 后端永远精确。
+
+为什么：124 万行实测，同一条 `SELECT COUNT(*) FROM asin_data` ——
+
+| | buffers | 堆读 | 耗时 |
+|---|---|---|---|
+| `VACUUM` 之后 | 3,967（31 MB） | 29 | 78.5 ms |
+| 改动 3% 的行之后 | 194,940（**1.5 GB**） | 337,292 | **683.6 ms** |
+
+同一条语句，I/O 差 49 倍。采集期间 worker 持续 UPSERT 会不断把可见性图
+打脏，autovacuum 追不上，于是 index-only scan 退化成逐行回堆。
+读 `pg_class` 则是一次系统表单行查找：微秒级、常数、不碰用户表。
+
+误差就是上次 `ANALYZE` 至今的增量，默认 autovacuum 设置下通常 < 1%。
+
+⚠ **`exact_total=true` 是有代价的**，就是上表那 683 ms。对账、导出核对这类
+"数字必须对得上"的场景才用；给人看的页面不需要。
+
+⚠ 老客户端不认识 `total_is_estimate`，看到的仍是一个数字，只是可能差 1%
+（契约 §3.2 允许单方面**加**字段）。要精确请显式传 `exact_total=true`。
 
 #### 带 `batch_id` 时**多四个字段**：这一行是不是本批采的
 

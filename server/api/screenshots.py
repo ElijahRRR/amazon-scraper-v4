@@ -36,6 +36,8 @@
 import os
 
 from fastapi import APIRouter, HTTPException, Query, Request
+
+from common.config import PUBLIC_BASE_PATH
 from fastapi.responses import FileResponse
 
 from common import config
@@ -126,7 +128,10 @@ async def api_screenshots(request: Request,
                                      cursor_asin=cursor, limit=limit)
     progress = await db.get_screenshot_progress(bid)
 
-    base = str(request.base_url).rstrip("/")
+    # base_url 只反映 app 自己看到的 scheme+host —— 反代把路径前缀剥掉之后，
+    # 它**不含**那个前缀。所以要显式补上 PUBLIC_BASE_PATH（默认空 = 原行为）。
+    # 不补的症状：ERP 侧拿这个 url 去下载，得到 404 或一坨 HTML，而不是 PNG。
+    base = str(request.base_url).rstrip("/") + PUBLIC_BASE_PATH
     items = []
     for r in rows:
         done = r.get("status") == "done"

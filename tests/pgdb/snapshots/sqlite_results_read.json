@@ -239,7 +239,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 3,
-          "total": 3
+          "total": 3,
+          "total_is_estimate": false
         }
       ],
       "search=GoldenBrand,cursor_id=5,batch_id=1": [
@@ -436,7 +437,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 3,
-          "total": 3
+          "total": 3,
+          "total_is_estimate": false
         }
       ],
       "search=Wireless,GoldenBrand,cursor_id=5": [
@@ -679,7 +681,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 4,
-          "total": 4
+          "total": 4,
+          "total_is_estimate": false
         }
       ]
     },
@@ -940,7 +943,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 4,
-          "total": 4
+          "total": 4,
+          "total_is_estimate": false
         }
       ],
       "batch_id=1,change_filter=new": [
@@ -1075,7 +1079,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 3,
-          "total": 2
+          "total": 2,
+          "total_is_estimate": false
         }
       ],
       "batch_id=1,change_filter=price_stock": [
@@ -1210,7 +1215,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 2,
-          "total": 2
+          "total": 2,
+          "total_is_estimate": false
         }
       ],
       "batch_id=1,change_filter=title_bullets": [
@@ -1283,7 +1289,8 @@
           ],
           "next_cursor": 2,
           "prev_cursor": 2,
-          "total": 1
+          "total": 1,
+          "total_is_estimate": false
         }
       ],
       "batch_id=2,change_filter=all": [
@@ -1356,7 +1363,8 @@
           ],
           "next_cursor": 5,
           "prev_cursor": 5,
-          "total": 1
+          "total": 1,
+          "total_is_estimate": false
         }
       ],
       "batch_id=2,change_filter=new": [
@@ -1429,7 +1437,8 @@
           ],
           "next_cursor": 5,
           "prev_cursor": 5,
-          "total": 1
+          "total": 1,
+          "total_is_estimate": false
         }
       ],
       "batch_id=2,change_filter=price_stock": [
@@ -1439,7 +1448,8 @@
           "items": [],
           "next_cursor": null,
           "prev_cursor": null,
-          "total": 0
+          "total": 0,
+          "total_is_estimate": false
         }
       ],
       "batch_id=2,change_filter=title_bullets": [
@@ -1449,7 +1459,8 @@
           "items": [],
           "next_cursor": null,
           "prev_cursor": null,
-          "total": 0
+          "total": 0,
+          "total_is_estimate": false
         }
       ],
       "batch_id=None,change_filter=all": [
@@ -1924,7 +1935,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 8,
-          "total": 8
+          "total": 8,
+          "total_is_estimate": false
         }
       ],
       "batch_id=None,change_filter=new": [
@@ -2051,7 +2063,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 4,
-          "total": 2
+          "total": 2,
+          "total_is_estimate": false
         }
       ],
       "batch_id=None,change_filter=price_stock": [
@@ -2236,7 +2249,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 3,
-          "total": 3
+          "total": 3,
+          "total_is_estimate": false
         }
       ],
       "batch_id=None,change_filter=title_bullets": [
@@ -2305,7 +2319,8 @@
           ],
           "next_cursor": 2,
           "prev_cursor": 2,
-          "total": 1
+          "total": 1,
+          "total_is_estimate": false
         }
       ],
       "direction=prev": [
@@ -2780,7 +2795,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 8,
-          "total": 8
+          "total": 8,
+          "total_is_estimate": false
         }
       ],
       "direction=prev,limit=2": [
@@ -2907,7 +2923,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 2,
-          "total": 8
+          "total": 8,
+          "total_is_estimate": false
         }
       ],
       "limit=0": [
@@ -2917,7 +2934,8 @@
           "items": [],
           "next_cursor": null,
           "prev_cursor": null,
-          "total": 8
+          "total": 8,
+          "total_is_estimate": false
         }
       ],
       "limit=100": [
@@ -3392,7 +3410,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 8,
-          "total": 8
+          "total": 8,
+          "total_is_estimate": false
         }
       ],
       "limit=3": [
@@ -3577,7 +3596,8 @@
           ],
           "next_cursor": 6,
           "prev_cursor": 8,
-          "total": 8
+          "total": 8,
+          "total_is_estimate": false
         }
       ],
       "limit=3,cursor_id=3,direction=prev": [
@@ -3762,7 +3782,8 @@
           ],
           "next_cursor": 4,
           "prev_cursor": 6,
-          "total": 8
+          "total": 8,
+          "total_is_estimate": false
         }
       ],
       "limit=3,cursor_id=6": [
@@ -3947,7 +3968,8 @@
           ],
           "next_cursor": 3,
           "prev_cursor": 5,
-          "total": 8
+          "total": 8,
+          "total_is_estimate": false
         }
       ],
       "search=": [
@@ -4422,7 +4444,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 8,
-          "total": 8
+          "total": 8,
+          "total_is_estimate": false
         }
       ],
       "search=   ": [
@@ -4897,7 +4920,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 8,
-          "total": 8
+          "total": 8,
+          "total_is_estimate": false
         }
       ],
       "search=%": [
@@ -5372,7 +5396,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 8,
-          "total": 8
+          "total": 8,
+          "total_is_estimate": false
         }
       ],
       "search=%%%": [
@@ -5847,7 +5872,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 8,
-          "total": 8
+          "total": 8,
+          "total_is_estimate": false
         }
       ],
       "search=,,,": [
@@ -6322,7 +6348,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 8,
-          "total": 8
+          "total": 8,
+          "total_is_estimate": false
         }
       ],
       "search=B0": [
@@ -6797,7 +6824,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 8,
-          "total": 8
+          "total": 8,
+          "total_is_estimate": false
         }
       ],
       "search=GOLDENBRAND": [
@@ -6982,7 +7010,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 3,
-          "total": 3
+          "total": 3,
+          "total_is_estimate": false
         }
       ],
       "search=Go": [
@@ -7225,7 +7254,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 8,
-          "total": 4
+          "total": 4,
+          "total_is_estimate": false
         }
       ],
       "search=Go,%%%": [
@@ -7700,7 +7730,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 8,
-          "total": 8
+          "total": 8,
+          "total_is_estimate": false
         }
       ],
       "search=GoLdEnBrAnD": [
@@ -7885,7 +7916,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 3,
-          "total": 3
+          "total": 3,
+          "total_is_estimate": false
         }
       ],
       "search=Gol%rand": [
@@ -8128,7 +8160,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 8,
-          "total": 4
+          "total": 4,
+          "total_is_estimate": false
         }
       ],
       "search=Gol_en": [
@@ -8313,7 +8346,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 3,
-          "total": 3
+          "total": 3,
+          "total_is_estimate": false
         }
       ],
       "search=GoldenBrand": [
@@ -8498,7 +8532,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 3,
-          "total": 3
+          "total": 3,
+          "total_is_estimate": false
         }
       ],
       "search=GoldenBrand,batch_id=1": [
@@ -8695,7 +8730,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 3,
-          "total": 3
+          "total": 3,
+          "total_is_estimate": false
         }
       ],
       "search=GoldenBrand,change_filter=price_stock": [
@@ -8880,7 +8916,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 3,
-          "total": 3
+          "total": 3,
+          "total_is_estimate": false
         }
       ],
       "search=GoldenBrand,zz0,zz1,zz2,zz3,zz4,zz5,zz6,zz7,zz8,zz9,zz10,zz11,zz12,zz13,zz14,zz15,zz16,zz17,zz18,zz19": [
@@ -9065,7 +9102,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 3,
-          "total": 3
+          "total": 3,
+          "total_is_estimate": false
         }
       ],
       "search=GoldenBrandzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz": [
@@ -9075,7 +9113,8 @@
           "items": [],
           "next_cursor": null,
           "prev_cursor": null,
-          "total": 0
+          "total": 0,
+          "total_is_estimate": false
         }
       ],
       "search=Wireless,GoldenBrand": [
@@ -9318,7 +9357,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 4,
-          "total": 4
+          "total": 4,
+          "total_is_estimate": false
         }
       ],
       "search=\\": [
@@ -9387,7 +9427,8 @@
           ],
           "next_cursor": 5,
           "prev_cursor": 5,
-          "total": 1
+          "total": 1,
+          "total_is_estimate": false
         }
       ],
       "search=\\\\": [
@@ -9397,7 +9438,8 @@
           "items": [],
           "next_cursor": null,
           "prev_cursor": null,
-          "total": 0
+          "total": 0,
+          "total_is_estimate": false
         }
       ],
       "search=___": [
@@ -9872,7 +9914,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 8,
-          "total": 8
+          "total": 8,
+          "total_is_estimate": false
         }
       ],
       "search=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,Wireless": [
@@ -9941,7 +9984,8 @@
           ],
           "next_cursor": 4,
           "prev_cursor": 4,
-          "total": 1
+          "total": 1,
+          "total_is_estimate": false
         }
       ],
       "search=b0": [
@@ -10416,7 +10460,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 8,
-          "total": 8
+          "total": 8,
+          "total_is_estimate": false
         }
       ],
       "search=back\\slash": [
@@ -10485,7 +10530,8 @@
           ],
           "next_cursor": 5,
           "prev_cursor": 5,
-          "total": 1
+          "total": 1,
+          "total_is_estimate": false
         }
       ],
       "search=goldenbrand": [
@@ -10670,7 +10716,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 3,
-          "total": 3
+          "total": 3,
+          "total_is_estimate": false
         }
       ],
       "search=t0,t1,t2,t3,t4,t5,t6,t7,t8,t9,t10,t11,t12,t13,t14": [
@@ -10855,7 +10902,8 @@
           ],
           "next_cursor": 6,
           "prev_cursor": 8,
-          "total": 3
+          "total": 3,
+          "total_is_estimate": false
         }
       ],
       "search=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx": [
@@ -10865,7 +10913,8 @@
           "items": [],
           "next_cursor": null,
           "prev_cursor": null,
-          "total": 0
+          "total": 0,
+          "total_is_estimate": false
         }
       ],
       "search=zzz-no-match": [
@@ -10875,7 +10924,8 @@
           "items": [],
           "next_cursor": null,
           "prev_cursor": null,
-          "total": 0
+          "total": 0,
+          "total_is_estimate": false
         }
       ],
       "search=ÉCLAIR": [
@@ -10944,7 +10994,8 @@
           ],
           "next_cursor": 6,
           "prev_cursor": 6,
-          "total": 1
+          "total": 1,
+          "total_is_estimate": false
         }
       ],
       "search=Éclair": [
@@ -11013,7 +11064,8 @@
           ],
           "next_cursor": 6,
           "prev_cursor": 6,
-          "total": 1
+          "total": 1,
+          "total_is_estimate": false
         }
       ],
       "search=éclair": [
@@ -11082,7 +11134,8 @@
           ],
           "next_cursor": 7,
           "prev_cursor": 7,
-          "total": 1
+          "total": 1,
+          "total_is_estimate": false
         }
       ]
     },
@@ -15416,7 +15469,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 3,
-          "total": 4
+          "total": 4,
+          "total_is_estimate": false
         }
       ],
       "search=b0,cursor_id=5": [
@@ -15659,7 +15713,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 4,
-          "total": 8
+          "total": 8,
+          "total_is_estimate": false
         }
       ]
     },

@@ -87,7 +87,7 @@ PUBLIC_API = (
     "iter_results", "find_asins_by_search", "get_batch_asin_set",
     # 截图
     "get_pending_screenshots", "update_screenshot_status", "get_screenshot_progress",
-    "list_screenshots",
+    "list_screenshots", "reconcile_orphan_screenshots",
     # 统计
     "get_total_asins", "get_all_asins", "get_change_stats",
     # 管理（Phase 3.8 收口）

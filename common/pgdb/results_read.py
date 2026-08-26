@@ -124,6 +124,7 @@ from common.pgdb._shared import (  # noqa: F401
     _normalize_screenshot_path,
     search_like_pattern,
 )
+from common.core.dbtables import TOTAL_ESTIMATE_MIN_ROWS
 from common.core.results_sort import (
     DEFAULT_SORT,
     CursorExpired,
@@ -170,6 +171,7 @@ class ResultsReadMixin:
                           direction: str = "next",
                           columns: List[str] = None,
                           with_total: bool = True,
+                          exact_total: bool = False,
                           sort: str = DEFAULT_SORT) -> Dict:
         """
         获取结果列表（keyset 分页）
@@ -177,10 +179,13 @@ class ResultsReadMixin:
         direction: next (向后翻页) / prev (向前翻页)
         columns: 只取这些列（None = 全部 56 列，**默认行为不变**）
         with_total: 算不算 total（False -> total 为 None，**默认行为不变**）
+        exact_total: 无筛选的首屏是否强制精确 COUNT（默认 False = 允许估算，
+              见下方 total_is_estimate 那段）
         sort: "id"（默认，按首次入库倒序）/ "recent"（按 updated_at 倒序，
               即"最近采的排前面"）。规则的唯一真源在 common/core/results_sort.py，
               两个后端共用；``recent`` 且游标行已被删除时抛 CursorExpired。
-        返回: {"items": [...], "has_more": bool, "next_cursor": int, "prev_cursor": int, "total": int|None}
+        返回: {"items": [...], "has_more": bool, "next_cursor": int,
+              "prev_cursor": int, "total": int|None, "total_is_estimate": bool}
 
         ------------------------------------------------------------------
         columns / with_total 是干什么的
@@ -536,11 +541,25 @@ class ResultsReadMixin:
 
         # with_total=False -> 整条 count 都不发。它随行数线性增长、且翻页途中
         # 值恒定不变，前端只在首屏要它。
+        #
+        # with_total=True 且**一个筛选条件都没有**时走估算，见 _estimate_total。
+        # 判据是 `count_join_clause == "" and count_where == "1=1"` —— 直接读
+        # 最终拼出来的 SQL 片段，而不是重新判一遍
+        # `batch_id is None and change_filter == "all" and not search`。
+        # 后者是把筛选条件抄第二遍，将来加第四种筛选时漏抄一处，就会拿全表的
+        # 估算去回答一个带筛选的问题，而且**不会报错**，只是数字悄悄错了。
+        # 前者从结构上不可能漏：任何新筛选只要落进 join/where，判据自动为假。
         total = None
+        total_is_estimate = False
         if with_total:
-            count_sql = f"SELECT COUNT(*) FROM asin_data d {count_join_clause} WHERE {count_where}"
-            async with self.read() as rc, rc.execute(count_sql, count_params) as c:
-                total = (await c.fetchone())[0]
+            unfiltered = (not count_join_clause) and count_where == "1=1"
+            if unfiltered and not exact_total:
+                total = await self._estimate_total()
+                total_is_estimate = total is not None
+            if total is None:
+                count_sql = f"SELECT COUNT(*) FROM asin_data d {count_join_clause} WHERE {count_where}"
+                async with self.read() as rc, rc.execute(count_sql, count_params) as c:
+                    total = (await c.fetchone())[0]
 
         next_cursor = items[-1]["id"] if items else None
         prev_cursor = items[0]["id"] if items else None
@@ -551,7 +570,58 @@ class ResultsReadMixin:
             "next_cursor": next_cursor,
             "prev_cursor": prev_cursor,
             "total": total,
+            "total_is_estimate": total_is_estimate,
         }
+
+    async def _estimate_total(self) -> Optional[int]:
+        """``asin_data`` 的**估算**行数；不该用估算时返回 None（调用方退回精确 COUNT）。
+
+        为什么需要它
+        ------------
+        「共 N 条结果」这一个数，在百万行的生产库上是整个首屏最贵的一步，而且
+        贵得**不稳定**。它本来走主键的 index-only scan，只有可见性图（VM）全绿
+        时才不用碰堆。6 个 worker 持续 UPSERT 会不断把 VM 打脏，autovacuum
+        在采集期间追不上，于是索引扫退化成"索引 + 逐行回堆"，扫过 2.1 GB 的堆。
+
+        124 万行实测（同一条 `SELECT COUNT(*) FROM asin_data`）：
+
+            VACUUM 之后          3,967 buffers（31 MB）      29 次堆读     78.5 ms
+            改动 3% 的行之后   194,940 buffers（**1.5 GB**） 337,292 次堆读 683.6 ms
+
+        —— 同一条语句，I/O 差 49 倍。这正是"有时候快有时候慢"的来源。
+
+        pg_class.reltuples 是 ANALYZE / autovacuum 顺手留下的统计值，读它是一次
+        系统表的单行查找（**微秒级、常数、不碰用户表的堆**）。它的误差就是上次
+        ANALYZE 到现在的增量，默认 autovacuum 设置下通常在 1% 以内 —— 而这个数
+        是给人看的"共 N 条"，1% 没有任何实际影响。
+
+        什么时候**不能**用它（返回 None）
+        --------------------------------
+        * ``reltuples < TOTAL_ESTIMATE_MIN_ROWS`` —— **一个比较就够**，它同时
+          管住三件事：
+            - 小库上精确 COUNT 本来就不要钱（10 万行以内个位数毫秒），而估算的
+              绝对误差在小库上刺眼（空表刚建完 reltuples 是 0，页面会显示
+              "共 0 条"而表格里有 12 行）；
+            - PG 14+ 用 **-1** 表示"这张表从没被 analyze 过"，-1 自然低于门槛，
+              不需要单独一条 ``est < 0``（写成两条反而给了它们分叉的机会）；
+            - golden 基线跑在几十行的夹具上，门槛把它整个排除在估算之外，
+              两个后端的 total 因此逐字相同。
+        * 查不到那一行 —— ``to_regclass('asin_data')`` 为 NULL，即这张表根本
+          不存在。这时下面的精确 COUNT 一样会炸，退回去让它报**真正的**错，
+          而不是在这里编一个数字。
+
+        ⚠ 这里**故意不吞异常**。读 pg_class 失败意味着连接或权限出了问题，
+          那种时候下面的精确 COUNT 一样会失败，静默兜底只会把故障藏起来。
+        """
+        async with self.read() as rc, rc.execute(
+                "SELECT reltuples FROM pg_class WHERE oid = to_regclass('asin_data')") as c:
+            row = await c.fetchone()
+        if row is None or row[0] is None:
+            return None
+        est = int(row[0])
+        if est < TOTAL_ESTIMATE_MIN_ROWS:
+            return None
+        return est
 
     #: `/api/results?batch_id=` 追加的三列。**名字必须与 `iter_results`
     #: （CSV/xlsx 批次导出走的那条）逐字相同** —— 它们是同一条信息的两个出口，

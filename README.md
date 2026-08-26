@@ -371,6 +371,7 @@ Server 采集，自动识别当前是商品列表页 / 卖家店铺页 / 商品�
   实测 100 万行、单页 50 行：默认 `60.9ms / 274.2KB` → 窄投影 `52.1ms / 20.0KB`
   → 再关掉 total `2.7ms / 20.0KB`。采集结果页已经默认用上（首屏要 total，翻页不要）。
   ⚠️ 服务端会强制补 `id`/`asin`/`screenshot_path`/`updated_at`；非法列名 **422 拒绝**。
+  ⚠️ `total` 在大库上默认是**估算值**，见下面「共 N 条结果」那条。
 - **带 `batch_id` 时多四个字段**：`batch_task_status` / `batch_task_updated_at` /
   `batch_asin_data_updated_at` / `batch_has_asin_data`。
   这个端点底层是 `SELECT d.* FROM asin_data d JOIN batch_asins ...`，
@@ -386,6 +387,69 @@ Server 采集，自动识别当前是商品列表页 / 卖家店铺页 / 商品�
   与行数成正比、且会随时间线性变慢的扫描。
   总数仍显示在列表卡片头部的「共 N 条结果」，它来自 `/api/results` 的 `total`。
   ⚠ `GET /api/changes/stats` 端点**保留**（可能有外部调用方），只是控制台不再用它。
+- **「共 N 条结果」在大库上是估算值**（2026-08）：无筛选（无 `batch_id`、
+  `change_filter=all`、无 `search`）且库 ≥ 10 万行时，`total` 取自 PG 的
+  `pg_class.reltuples` 统计值，响应里 `total_is_estimate: true`，页面显示
+  「共 **约** N 条结果」。带任何筛选时仍然精确，小库上仍然精确。
+  要精确值传 `exact_total=true`。
+
+  为什么：`COUNT(*)` 本来走主键 index-only scan，但**只有可见性图全绿时**
+  才不用碰堆。采集期间 worker 持续 UPSERT 会不断把它打脏，autovacuum 追不上，
+  于是退化成"索引 + 逐行回堆"，扫过整个 2.1 GB 的堆。124 万行实测同一条语句：
+
+  | | buffers | 堆读 | 耗时 |
+  |---|---|---|---|
+  | `VACUUM` 之后 | 3,967（31 MB） | 29 | 78.5 ms |
+  | 改动 3% 的行之后 | 194,940（**1.5 GB**） | 337,292 | **683.6 ms** |
+  | 冷缓存实测（psql 直连） | — | — | **6,971 ms** |
+
+  这就是"有时候快有时候慢"的来源。读 `pg_class` 则是系统表单行查找
+  （实测 0.19 ms，且不随行数增长）。端到端实测 124 万行首屏：
+  `exact_total=true` **159.9 ms** → 默认（估算）**5.3 ms**，
+  估算误差 1,241,101 vs 1,239,999 = **0.089%**。
+- **截图在子路径部署下能正常显示**（2026-08 修）：本服务被挂在 `/amazon-v4/`
+  这类子路径下时，页面上的截图曾经一律打不开，看起来像"worker 没保存截图"。
+
+  根因不在采集侧 —— 图都好好地存在服务器上。反代靠 nginx 的 `sub_filter` 改写
+  路径，而 **`sub_filter_types` 默认只作用于 `text/html`**：HTML 里写死的
+  `/api/...`、`/static/...` 会被改写，从 **JSON** 里拿到的路径不会。
+  `screenshot_path` 正是后者（来自 `/api/results` 的响应体），直接塞进
+  `<img src>` 就会请求到 `/static/screenshots/...`。
+
+  ⚠️ 那个地址在反代上**返回 200 + `text/html`，不是 404** —— `<img>` 静默渲染
+  失败，控制台一个红字都没有。线上实测：`/static/...` → 200 text/html 784B，
+  `/amazon-v4/static/...` → 200 image/png 313,619B。
+
+  现在前端统一走 `window.staticUrl()`（定义在 `base.html`）：它读 `<head>` 里
+  那个 `data-static-probe` 的 `href` —— 那一行写在 HTML 里，**必然**被反代按
+  同一条规则改写 —— 从而反推出本部署的 `/static` 前缀。**零配置**，带前缀和
+  不带前缀的部署都自洽。⚠️ 别删 `data-static-probe` 这个属性。
+
+- **`PUBLIC_BASE_PATH`（可选，默认空）**：`GET /api/screenshots` 回显的 `url`
+  是绝对地址，而反代 `proxy_pass http://127.0.0.1:8899/api/;` 会把前缀剥掉，
+  服务端**无从得知**外面还有个 `/amazon-v4`。配上它那个 url 才是对的。
+  不配不报错，只是外部调用方拿去下载会得到一坨 HTML（同样是 200）。
+  页面上的截图**不**依赖它（走上面的 `staticUrl()`，零配置）。
+  ⚠️ `tools/consume_batch.py` 已改成自己拼路径（`--server` 本来就带全前缀），
+  不再依赖服务端回显 —— 那里原本那句"服务端回显的那个是对的"是错的。
+
+- **任务终态失败时截图不再把批次卡死**（2026-08 修）：批次完成判定要求
+  **task 和 screenshot 都全部终态**。任务终态失败后那张截图永远不会被上传，
+  于是 `all_terminal` 恒为假 → 批次永远停在 `running` → `completed_at` 永不写入
+  → **回调永不发出**。而兜底扫描每轮都把 `running` 批次塞回检测集合，所以是
+  每轮都查、每轮都判未完成，空转到天荒地老。
+
+  线上实测：一个批次卡了 5.4 小时仍在涨，同类批次抽查 12 个 12 个全中，最早的
+  卡了 5 天。二次伤害是兜底扫描只取 `updated_at DESC LIMIT 30`，卡死批次的
+  `updated_at` 不再前进，迟早掉出前 30 名被彻底遗忘。
+
+  修法是在完成检测协程里做一次对账（`reconcile_orphan_screenshots`），把
+  "任务已终态失败、截图仍 open"的记录收敛为 `failed`。**不是**在三条终态失败
+  路径上各写一遍：那要改六处、全在写锁内（写锁持有时间是这个项目付过学费的
+  地方，见 `BATCH_DELETE_CHUNK`），而且救不了已经卡住的存量批次。
+  放在对账里则一处代码、不在写热路径、覆盖全部终态路径，**部署后存量卡死批次
+  会自己解开并补发回调**。
+
 - **选中删除**：勾选行 checkbox，点击"删除选中"（同时删除关联截图文件）
   - 删除类操作失败时，前端弹的是**服务端给的原因**（`window.apiErrText`，定义在
     `base.html`，四个删除入口共用）。最常见的一条是配了 `ADMIN_TOKEN` 却没在

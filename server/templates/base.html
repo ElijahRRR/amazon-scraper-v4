@@ -11,7 +11,9 @@
     <!-- Google Fonts -->
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <!-- 自定义样式 -->
-    <link href="/static/css/style.css?v=20260226" rel="stylesheet">
+    <!-- ⚠ data-static-probe：这个属性是 window.staticUrl() 的锚点，别删。
+         它靠"这一行的 href 会和别的 /static 引用被反代**同样**改写"来反推前缀。 -->
+    <link href="/static/css/style.css?v=20260226" rel="stylesheet" data-static-probe>
     {% block extra_css %}{% endblock %}
 </head>
 <body>
@@ -114,6 +116,55 @@
         try { data = await resp.json(); } catch (e) { /* 非 JSON，往下走 */ }
         var msg = data && (data.message || data.detail || data.error);
         return msg ? msg + '（HTTP ' + resp.status + '）' : 'HTTP ' + resp.status;
+      };
+    })();
+    </script>
+    <!-- 把库里存的 `/static/...` 相对路径变成**这个部署真正可用**的地址。
+         =====================================================================
+         为什么需要它（2026-08 线上事故）：本服务可以被部署在子路径下
+         （线上是 `/amazon-v4/`），而反代是靠 nginx 的 `sub_filter` 改写路径的。
+         `sub_filter_types` 默认**只作用于 text/html** —— 于是：
+
+           * HTML 里写死的 `/api/...`、`/static/...` 会被改写  ✅
+           * 从 **JSON** 里拿到的路径不会被改写                ❌
+
+         `screenshot_path` 正是后者（来自 `/api/results` 的响应体）。直接塞进
+         `<img src>` 就会请求到 `/static/screenshots/...`，而那个地址在反代上
+         **返回 200 + text/html**（不是 404），于是 `<img>` 静默渲染失败、
+         控制台一个红字都没有 —— 表现就是"截图没保存下来"。
+         实测：`/static/...` → 200 text/html 784B；`/amazon-v4/static/...` →
+         200 image/png 313,619B。
+
+         做法：读 <head> 里那个 `data-static-probe` 的 href。它写在 HTML 里，
+         所以**必然**被反代按同一条规则改写。用它反推出本部署的 /static 前缀：
+
+           无反代：      /static/css/style.css           -> /static
+           线上子路径：  /amazon-v4/static/css/style.css -> /amazon-v4/static
+
+         这样不需要任何新配置，带前缀和不带前缀的部署都自洽；将来前缀改了也
+         自动跟着变（因为它和 CSS 走的是同一条改写规则，改写不到 CSS 的话
+         页面本身早就崩了，不可能悄悄错）。 -->
+    <script>
+    (function () {
+      var STATIC = '/static';   // 兜底：探针缺失时退回原样，行为与改动前一致
+      try {
+        var probe = document.querySelector('link[data-static-probe]');
+        if (probe) {
+          // 用 getAttribute 而不是 .href：后者会被浏览器补成绝对 URL，
+          // 反推前缀时还得再剥一层 origin，平白多一处能出错的地方。
+          var raw = probe.getAttribute('href') || '';
+          var i = raw.indexOf('/css/style.css');
+          if (i > 0) STATIC = raw.slice(0, i);
+        }
+      } catch (e) { /* 保持兜底值 */ }
+
+      // 库里存的路径形如 `/static/screenshots/<batch>/<asin>.png`。
+      // 只换 `/static` 这个前缀，后面的部分原样保留。
+      window.staticUrl = function (path) {
+        if (!path) return '';
+        var p = String(path);
+        if (!p.startsWith('/static/')) return p;   // 不是这个形状就别碰
+        return STATIC + p.slice('/static'.length);
       };
     })();
     </script>

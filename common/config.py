@@ -37,6 +37,20 @@ DB_BACKEND = os.environ.get("DB_BACKEND", "postgres").strip().lower()
 
 # PostgreSQL 连接串。仅在 DB_BACKEND=postgres 时使用。
 PG_DSN = os.environ.get("PG_DSN", "postgresql://scraper:scraper@127.0.0.1/scraper_dev")
+# 本服务对外的路径前缀，形如 "/amazon-v4"。**默认空 = 与改动前逐字相同**。
+#
+# 只在"反代把本服务挂在子路径下、且 proxy_pass 把该前缀剥掉"时才需要配。
+# 线上就是这种：`location ^~ /amazon-v4/api/ { proxy_pass http://127.0.0.1:8899/api/; }`
+# —— app 收到的 path 是 `/api/...`，它**无从得知**外面还有个 `/amazon-v4`。
+#
+# 谁在用它：`GET /api/screenshots` 回显的 `url` 字段（对外契约里写的是绝对地址）。
+# 不配的后果不是报错，是那个 url 少一段前缀、调用方拿去下载得到 404 或一坨 HTML。
+#
+# ⚠ 页面上的截图**不**依赖它 —— 前端走 base.html 里的 window.staticUrl()，
+#   从已被反代改写过的 CSS 链接自推前缀，零配置。这里管的只是 JSON 里那个
+#   给外部调用方（ERP）用的绝对地址。
+PUBLIC_BASE_PATH = os.environ.get("PUBLIC_BASE_PATH", "").strip().rstrip("/")
+
 # 读侧连接池大小（写侧是**一条专用连接**，见 common/pgdb/pool.py 的决策 D-2）。
 PG_POOL_MIN = int(os.environ.get("PG_POOL_MIN", "2"))
 PG_POOL_MAX = int(os.environ.get("PG_POOL_MAX", "10"))
