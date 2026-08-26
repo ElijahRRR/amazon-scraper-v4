@@ -6066,7 +6066,7 @@
           "__html__": {
             "has_jinja_error": false,
             "has_traceback": false,
-            "size_bucket": 14
+            "size_bucket": 16
           }
         },
         "content_type": "text/html",
@@ -6088,7 +6088,7 @@
           "__html__": {
             "has_jinja_error": false,
             "has_traceback": false,
-            "size_bucket": 33
+            "size_bucket": 35
           }
         },
         "content_type": "text/html",
@@ -6110,7 +6110,7 @@
           "__html__": {
             "has_jinja_error": false,
             "has_traceback": false,
-            "size_bucket": 31
+            "size_bucket": 33
           }
         },
         "content_type": "text/html",
@@ -6132,7 +6132,7 @@
           "__html__": {
             "has_jinja_error": false,
             "has_traceback": false,
-            "size_bucket": 19
+            "size_bucket": 21
           }
         },
         "content_type": "text/html",
@@ -6154,7 +6154,7 @@
           "__html__": {
             "has_jinja_error": false,
             "has_traceback": false,
-            "size_bucket": 42
+            "size_bucket": 44
           }
         },
         "content_type": "text/html",

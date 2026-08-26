@@ -521,7 +521,12 @@ async function deleteSelected() {
 }
 
 function showScreenshot(path) {
-    document.getElementById('screenshotImg').src = path;
+    // path 是 /api/results 的 JSON 里给的 `/static/screenshots/...`。
+    // **必须过 window.staticUrl()**（定义在 base.html）：本服务部署在子路径下
+    // 时，JSON 里的路径不会被反代的 sub_filter 改写，直接用会请求到
+    // `/static/...` —— 那个地址返回 200 + text/html 而不是 404，<img> 静默
+    // 失败、控制台无报错，看起来就像"截图根本没保存"。
+    document.getElementById('screenshotImg').src = window.staticUrl(path);
     new bootstrap.Modal(document.getElementById('screenshotModal')).show();
 }
 

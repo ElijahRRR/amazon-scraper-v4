@@ -220,9 +220,19 @@ def fetch_screenshots(server, token, batch_name, out_dir):
 
     saved = []
     for item in done:
-        # 用列表给的 url（绝对地址），而不是自己拼路径 —— 反代加了路径前缀时
-        # 自己拼会拼错，服务端回显的那个是对的。
-        path = urllib.parse.urlsplit(item["url"]).path
+        # 自己拼路径，**不要**用 item["url"] 里那个绝对地址。
+        #
+        # 这里原本写的是"服务端回显的那个是对的"，那句话是错的，2026-08 线上打脸：
+        # 反代把本服务挂在 `/amazon-v4/` 下、并且 proxy_pass 把前缀剥掉之后，
+        # 服务端**看不到**那段前缀，回显的 url 因此是
+        # `http://host/api/screenshots/...`（少了 `/amazon-v4`），拿去下载得到的
+        # 是一坨 text/html 而不是 PNG —— 而且是 **200**，不是 404，静默存成坏文件。
+        # （服务端那侧另有 PUBLIC_BASE_PATH 可以配上，但那是可选的，不能指望。）
+        #
+        # `--server` 是调用方自己给的、必然带全前缀（用法示例就写着
+        # `--server http://47.108.92.213/amazon-v4`），`_get` 会把它和 path 拼起来。
+        # 所以自己拼才是对的那一边。
+        path = f"/api/screenshots/{urllib.parse.quote(batch_name)}/{urllib.parse.quote(item['asin'])}"
         st, blob = _get(server, path, token, raw=True)
         if st == 200:
             dest = os.path.join(shots_dir, f"{item['asin']}.png")
