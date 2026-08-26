@@ -6,34 +6,6 @@
 <h2 class="page-title">采集结果</h2>
 <p class="page-subtitle">浏览和搜索采集数据</p>
 
-<!-- 统计卡片 -->
-<div class="row g-3 mb-4">
-    <div class="col-6 col-lg-3">
-        <div class="stat-card accent">
-            <div class="stat-label">ASIN 总数</div>
-            <div class="stat-number" id="stat-total">-</div>
-        </div>
-    </div>
-    <div class="col-6 col-lg-3">
-        <div class="stat-card success">
-            <div class="stat-label">价格/库存变动</div>
-            <div class="stat-number" id="stat-price-stock">-</div>
-        </div>
-    </div>
-    <div class="col-6 col-lg-3">
-        <div class="stat-card warning">
-            <div class="stat-label">标题/描述变动</div>
-            <div class="stat-number" id="stat-title-bullets">-</div>
-        </div>
-    </div>
-    <div class="col-6 col-lg-3">
-        <div class="stat-card danger">
-            <div class="stat-label">新增 ASIN</div>
-            <div class="stat-number" id="stat-new">-</div>
-        </div>
-    </div>
-</div>
-
 <!-- 筛选栏 -->
 <div class="card mb-4">
     <div class="card-body">
@@ -272,7 +244,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     syncUrl();
 
     loadResults();
-    loadChangeStats();
 
     document.getElementById('batchFilter').addEventListener('change', () => {
         state.batchId = document.getElementById('batchFilter').value || null;
@@ -280,7 +251,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         clearFilterNotice();
         syncUrl();
         loadResults();
-        loadChangeStats();
     });
 
     document.getElementById('changeFilter').addEventListener('change', () => {
@@ -346,18 +316,6 @@ async function loadBatches() {
     } catch(e) {}
 }
 
-async function loadChangeStats() {
-    try {
-        let url = '/api/changes/stats';
-        if (state.batchId) url += `?batch_id=${state.batchId}`;
-        const resp = await fetch(url);
-        const stats = await resp.json();
-        document.getElementById('stat-price-stock').textContent = stats.price_stock || 0;
-        document.getElementById('stat-title-bullets').textContent = stats.title_bullets || 0;
-        document.getElementById('stat-new').textContent = stats.new || 0;
-    } catch(e) {}
-}
-
 async function loadResults(cursor = null, direction = 'next') {
     // 批量搜索：换行/逗号分隔 → 逗号连接
     const rawSearch = document.getElementById('searchInput').value.trim();
@@ -411,7 +369,6 @@ async function loadResults(cursor = null, direction = 'next') {
             state.total = data.total;
         }
         document.getElementById('resultTotal').textContent = state.total ?? '-';
-        document.getElementById('stat-total').textContent = state.total ?? '-';
 
         state.nextCursor = data.next_cursor;
         state.prevCursor = data.prev_cursor;
@@ -546,7 +503,6 @@ async function deleteSelected() {
             return;
         }
         loadResults();
-        loadChangeStats();
     } catch(e) {
         alert('网络错误: ' + e.message);
     }
@@ -682,7 +638,6 @@ async function clearData() {
             const deleted = data.deleted != null ? `已删除 ${data.deleted} 条` : '数据已清空';
             alert(deleted);
             loadResults();
-            loadChangeStats();
             loadBatches();
         }
     } catch(e) {
@@ -704,7 +659,6 @@ async function deleteByFile(input) {
         const data = await resp.json();
         alert(`已删除 ${data.deleted} 条数据（文件中识别到 ${data.asin_count} 个 ASIN）`);
         loadResults();
-        loadChangeStats();
         loadBatches();
     } catch(e) {
         alert('网络错误: ' + e.message);

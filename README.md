@@ -326,6 +326,7 @@ Server 采集，自动识别当前是商品列表页 / 卖家店铺页 / 商品�
 
 - **批次筛选**：下拉选择特定批次
 - **变动筛选**：全部 / 价格库存变动 / 标题描述变动 / 新增 ASIN
+  （筛选**保留**；2026-08 移除的是顶部那四张统计卡片，不是这个下拉框）
 - **搜索**：支持 ASIN、标题、品牌模糊搜索，多个关键词用换行或逗号分隔
   - 走 `pg_trgm` GIN 表达式索引，百万级数据下 5-50ms 量级（比 LIKE 全表扫快 ~1000 倍）
   - 短查询（<3 字符）自动 fallback 到 LIKE 路径保证正确性
@@ -378,6 +379,13 @@ Server 采集，自动识别当前是商品列表页 / 卖家店铺页 / 商品�
   `batch_task_status != "done"` 就是"这行不是本批采的"。不带 `batch_id` 时这四个键
   **不出现**。⚠️ 从没采过的 ASIN 在这个端点**整行不返回**（INNER JOIN），
   要查覆盖率用 `GET /api/export/batch/{name}/records` 的 `coverage`。
+- **顶部统计卡片已移除**（2026-08）：ASIN 总数 / 价格库存变动 / 标题描述变动 /
+  新增 ASIN 四张卡片按需求下线，页面不再调用 `/api/changes/stats`。
+  少掉的那次请求是**全量聚合**（`COUNT(DISTINCT asin) GROUP BY change_type`，
+  扫完整张 `asin_changes`，线上 140 万行约 240ms），所以首屏顺带少了一次
+  与行数成正比、且会随时间线性变慢的扫描。
+  总数仍显示在列表卡片头部的「共 N 条结果」，它来自 `/api/results` 的 `total`。
+  ⚠ `GET /api/changes/stats` 端点**保留**（可能有外部调用方），只是控制台不再用它。
 - **选中删除**：勾选行 checkbox，点击"删除选中"（同时删除关联截图文件）
   - 删除类操作失败时，前端弹的是**服务端给的原因**（`window.apiErrText`，定义在
     `base.html`，四个删除入口共用）。最常见的一条是配了 `ADMIN_TOKEN` 却没在
@@ -1072,9 +1080,10 @@ curl http://<SERVER>:8899/api/_debug/lock-stats | python3 -m json.tool
 
 ### 页面慢：先分清是排队、是锁、还是磁盘
 
-一次「采集结果」页首屏会并发发三个请求：`/api/batches`、`/api/results`、
-`/api/changes/stats`。三者同时变慢、而纯内存端点（`/api/coordinator`）仍然
-毫秒级返回，说明**不是** event loop 被堵住，而是都在等同一份资源：
+一次「采集结果」页首屏会并发发两个请求：`/api/batches`、`/api/results`
+（2026-08 移除顶部统计卡片后，`/api/changes/stats` 不再出现在首屏）。
+它们同时变慢、而纯内存端点（`/api/coordinator`）仍然毫秒级返回，
+说明**不是** event loop 被堵住，而是都在等同一份资源：
 
 | 现象 | 指向 | 怎么确认 |
 |---|---|---|
