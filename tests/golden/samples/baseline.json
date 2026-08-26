@@ -5946,7 +5946,7 @@
           "__html__": {
             "has_jinja_error": false,
             "has_traceback": false,
-            "size_bucket": 32
+            "size_bucket": 30
           }
         },
         "content_type": "text/html",
