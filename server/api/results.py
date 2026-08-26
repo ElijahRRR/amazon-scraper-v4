@@ -167,6 +167,7 @@ async def api_results(batch_id: int = None,
                       direction: str = "next",
                       fields: str = None,
                       with_total: bool = True,
+                      exact_total: bool = False,
                       sort: str = DEFAULT_SORT):
     """
     `fields` / `with_total` 是**可选的减负开关**，两个都默认关闭（= 保持原行为）。
@@ -190,6 +191,29 @@ async def api_results(batch_id: int = None,
     `with_total=false` —— 不算 `total`，响应里 `total` 是 `null`。
     它是**全表 COUNT**，随行数线性增长，而翻页途中值恒定不变：只在首屏要一次
     就够了。
+
+    ------------------------------------------------------------------
+    `total` 可能是**估算值** —— 看 `total_is_estimate`
+    ------------------------------------------------------------------
+    一个筛选条件都没有（无 `batch_id`、`change_filter=all`、无 `search`）
+    且库足够大（PG 后端 ≥ 10 万行）时，`total` 取自 PostgreSQL 的
+    `pg_class.reltuples` 统计值，而不是数一遍。响应里的
+    **`total_is_estimate: true`** 就是这件事的声明。
+
+    为什么：124 万行实测，同一条 `SELECT COUNT(*) FROM asin_data`，VACUUM 之后
+    78.5 ms，改动 3% 的行之后 683.6 ms（I/O 从 31 MB 涨到 1.5 GB）——
+    采集期间 worker 持续写入把可见性图打脏，index-only scan 退化成逐行回堆。
+    读 `pg_class` 是一次系统表单行查找，微秒级、常数、不碰用户表。
+
+    误差就是上次 ANALYZE 至今的增量，默认 autovacuum 下通常 < 1%。带任何筛选
+    时**仍然精确**（估不了带谓词的行数），小库上也仍然精确。
+
+    `exact_total=true` —— 强制精确，代价就是上面那 683 ms。对账、导出核对这类
+    "数字必须对得上"的场景用它；给人看的页面不需要。
+
+    ⚠ 别把 `total_is_estimate` 的**缺失**读成 false 之外的东西：这个字段是本轮
+      新加的（契约 §3.2 允许加字段），老客户端不认识它，看到的仍是一个数字，
+      只是这个数字可能差 1%。真要精确就显式传 `exact_total=true`。
 
     非法列名 -> **422 拒绝，不静默丢弃**。与 `limit` 超限那条同一个纪律
     （见上面 MAX_PAGE_LIMIT 的注释）：静默丢弃会让调用方把「这个字段没返回」
@@ -248,6 +272,7 @@ async def api_results(batch_id: int = None,
             direction=direction,
             columns=cols,
             with_total=with_total,
+            exact_total=exact_total,
             sort=sort,
         )
     except CursorExpired as e:

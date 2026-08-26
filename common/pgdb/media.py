@@ -552,6 +552,73 @@ class MediaMixin:
                 raise
         return updated
 
+    async def reconcile_orphan_screenshots(self, batch_id: int) -> int:
+        """把「任务已终态失败、截图却永远等不到」的记录收敛为 failed；返回改了几行。
+
+        为什么需要它（2026-08 线上事故）
+        --------------------------------
+        批次完成判定要求 **task 和 screenshot 都全部终态**
+        （``get_batch_completion_status``）。任务终态失败时，那张截图**永远不会**
+        被上传 —— 它的 screenshots 行就一直挂在 pending 上。后果不是"页面上多个
+        pending"，而是：
+
+            all_terminal 恒为假 -> 批次永远停在 running -> completed_at 永不写入
+            -> **回调永不发出**
+
+        而 ``_timeout_loop`` 的兜底扫描每轮都把 running 批次重新塞回检测集合，
+        所以它是**每轮都查、每轮都判未完成**，空转到天荒地老。
+        线上实测：batch 556 卡了 5.4 小时仍在涨；抽查 12 个同类批次 12 个全中，
+        最早的能追到 5 天前。更糟的是兜底扫描只取 ``updated_at DESC LIMIT 30``，
+        卡死批次的 updated_at 不再前进，迟早掉出前 30 名被彻底遗忘。
+
+        为什么修在这里，而不是「任务终态失败时顺手更新」
+        ------------------------------------------------
+        后者要改**三条**终态路径（fail_task / server_reject /
+        accept_results_batch 的失败分支）× 两个后端 = 六处，且全在写锁内 ——
+        而写锁持有时间是这个项目付过学费的地方（见 BATCH_DELETE_CHUNK 的注释）。
+        更要紧的是：**它救不了已经卡住的那些批次**，得另外写一次性脚本。
+
+        放在对账里则是一处代码、不在写热路径、覆盖全部终态路径（包括将来新增
+        的），而且部署后存量卡死批次会自己解开并补发回调。
+
+        谓词为什么只有一条 EXISTS 就够
+        ------------------------------
+        直觉上应该再加一条"且没有任何一条任务不是 failed" —— 怕同一个 ASIN 有
+        多条任务行（不同 zip_code），其中一条还在跑，把还能拿到的截图提前判死。
+
+        但 **tasks 上有 UNIQUE(batch_id, asin)**（两个后端都有：
+        pgdb/schema.py:230、database.py:375），一个 (批次, ASIN) 只可能有一行。
+        所以"存在一条 failed"与"全部 failed"在这张表上是同一件事，第二条谓词
+        恒真，写出来只是一段永远测不到的死代码。
+
+        ⚠ 那条 UNIQUE 因此是本方法的**承重假设**。
+          ``test_predicate_rests_on_the_unique_constraint`` 专门把它钉住：
+          哪天它被放开（真要支持一 ASIN 多 zip），那条用例会红，提醒回来把
+          "全部失败"的谓词补上。
+
+        ⚠ 只动 ``status NOT IN ('done','failed')`` 的行：已 done 的绝不能被覆盖
+          （它有 file_path，覆盖掉等于凭空丢一张已经存在的图）。
+        """
+        now = now_ts()
+        bid = self.as_int(batch_id)
+        async with self._write_lock:
+            async with self._tx():
+                cursor = await self._db.execute(
+                    """UPDATE screenshots
+                          SET status='failed',
+                              error_detail='任务终态失败，截图无法生成（自动对账）',
+                              updated_at=?
+                        WHERE batch_id=?
+                          AND status NOT IN ('done','failed')
+                          AND EXISTS (SELECT 1 FROM tasks t
+                                       WHERE t.batch_id = screenshots.batch_id
+                                         AND t.asin     = screenshots.asin
+                                         AND t.status   = 'failed')""",
+                    (now, bid)
+                )
+                changed = cursor.rowcount
+        return changed
+
     async def get_screenshot_progress(self, batch_id: int) -> Dict:
         """{pending, processing, done, failed, total}；total 是四者之和
         （在 total 自身被塞进 dict **之前**用 sum(stats.values()) 算的）。"""

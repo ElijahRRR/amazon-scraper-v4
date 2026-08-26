@@ -632,7 +632,28 @@ async def _completion_watcher():
                     # 快速 SQL：判断 task + screenshot 是否全部终态
                     snap = await db.get_batch_completion_status(bid)
                     if not snap["all_terminal"]:
-                        continue
+                        # 「任务已全部终态、只剩截图挂着」是一个**死局**：任务终态
+                        # 失败后那张截图永远不会被上传，all_terminal 于是恒为假，
+                        # 批次永远停在 running、completed_at 永不写入、**回调永不
+                        # 发出**。而上面的兜底扫描每轮都把 running 批次塞回来，
+                        # 所以是每轮都查、每轮都判未完成，空转到天荒地老。
+                        # 2026-08 线上：batch 556 卡了 5.4 小时，同类批次抽查
+                        # 12 个全中，最早的追到 5 天前。
+                        #
+                        # 这里做一次对账把它收敛掉。判据刻意收得很紧（只在任务侧
+                        # 已经没有 open 的时候才动手），所以正常在途的批次
+                        # **一次都不会**进这个分支 —— 它不在写热路径上。
+                        if (snap["tasks"]["open"] == 0
+                                and snap["screenshots"]["open"] > 0):
+                            fixed = await db.reconcile_orphan_screenshots(bid)
+                            if fixed:
+                                logger.warning(
+                                    f"🩹 批次 {bid} 对账：{fixed} 条截图因任务终态失败"
+                                    f"而永远等不到，已标记 failed")
+                                # 重新取一次快照，本轮就把它推进完成，不用再等一轮
+                                snap = await db.get_batch_completion_status(bid)
+                        if not snap["all_terminal"]:
+                            continue
                     # 变体自动展开（仅 expand_variants 批次）：本轮全部终态后，把已采 ASIN
                     # 的同族变体入队【同一批次】继续采。新增 >0 则本批未真正完成，下轮再查。
                     added = await db.expand_batch_variants(bid)
