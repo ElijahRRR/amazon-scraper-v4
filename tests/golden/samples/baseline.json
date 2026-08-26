@@ -212,7 +212,8 @@
           "items": [],
           "next_cursor": null,
           "prev_cursor": null,
-          "total": 0
+          "total": 0,
+          "total_is_estimate": false
         },
         "content_type": "application/json",
         "status": 200
@@ -1264,7 +1265,7 @@
                 "summary": "Api Delete Results"
               },
               "get": {
-                "description": "`fields` / `with_total` 是**可选的减负开关**，两个都默认关闭（= 保持原行为）。\n\n上面 MAX_PAGE_LIMIT 那段实测记着「82% 的账在 Python 序列化上」。这两个参数\n冲的就是那 82%，它们**不优化 SQL**：\n\n    实测 100 万行、单页 50 行、宽列有真实内容：\n      SELECT d.*（56 列）+ count      54.4 ms    274.2 KB\n      只取 UI 渲染的 15 列              1.2 ms     17.8 KB\n      其中 COUNT(*) 那一条             48.4 ms\n\n`fields=a,b,c` —— 只返回这些列。**必须默认全给**：`items[]` 的列集是对外\n契约（docs/erpapi_contract.md §3.2 允许单方面**加**字段、不许删），\n窄投影只能是调用方显式要的。\n\n⚠ 服务端会**强制补上** `id` / `asin` / `screenshot_path` / `updated_at`，\n即使你没点名 —— 翻页游标与截图路径归一化都要它们。所以返回的键**可能比你\n要的多**，别按\"键集恰好等于我要的\"来写解析。\n\n`with_total=false` —— 不算 `total`，响应里 `total` 是 `null`。\n它是**全表 COUNT**，随行数线性增长，而翻页途中值恒定不变：只在首屏要一次\n就够了。\n\n非法列名 -> **422 拒绝，不静默丢弃**。与 `limit` 超限那条同一个纪律\n（见上面 MAX_PAGE_LIMIT 的注释）：静默丢弃会让调用方把「这个字段没返回」\n读成「这个字段是空的」。\n\n------------------------------------------------------------------\n`sort` —— 排序键，默认 `id`（**默认行为不变**）\n------------------------------------------------------------------\n* `id`（默认）：`ORDER BY d.id DESC`。`asin_data` 一 ASIN 一行、按 asin\n  UPSERT，`id` 在**首次入库**时分配后永不改变 —— 所以这是\"第一次见到这个\n  ASIN\"的倒序，**不是**\"最近采集\"。重采的老 ASIN 仍然沉在最底下。\n* `recent`：`ORDER BY d.updated_at DESC, d.id DESC`，即\"最近采的排前面\"。\n\n默认留在 `id` 是因为**游标语义是对外契约**：调用方拿着上一页的 `next_cursor`\n继续翻，如果服务端某天改了默认排序，同一个游标会翻出语义完全不同的一页，\n而调用方看不出来。控制台前端显式传 `sort=recent`。\n\n⚠ `sort=recent` 且游标那一行已被删除（多半是刚刚在这个页面上删的）\n-> **422 `cursor_expired`**，调用方应从第一页重来。这里不降级成按 id 比较：\n那会给出一页语义错误的数据，而且没人看得出来。",
+                "description": "`fields` / `with_total` 是**可选的减负开关**，两个都默认关闭（= 保持原行为）。\n\n上面 MAX_PAGE_LIMIT 那段实测记着「82% 的账在 Python 序列化上」。这两个参数\n冲的就是那 82%，它们**不优化 SQL**：\n\n    实测 100 万行、单页 50 行、宽列有真实内容：\n      SELECT d.*（56 列）+ count      54.4 ms    274.2 KB\n      只取 UI 渲染的 15 列              1.2 ms     17.8 KB\n      其中 COUNT(*) 那一条             48.4 ms\n\n`fields=a,b,c` —— 只返回这些列。**必须默认全给**：`items[]` 的列集是对外\n契约（docs/erpapi_contract.md §3.2 允许单方面**加**字段、不许删），\n窄投影只能是调用方显式要的。\n\n⚠ 服务端会**强制补上** `id` / `asin` / `screenshot_path` / `updated_at`，\n即使你没点名 —— 翻页游标与截图路径归一化都要它们。所以返回的键**可能比你\n要的多**，别按\"键集恰好等于我要的\"来写解析。\n\n`with_total=false` —— 不算 `total`，响应里 `total` 是 `null`。\n它是**全表 COUNT**，随行数线性增长，而翻页途中值恒定不变：只在首屏要一次\n就够了。\n\n------------------------------------------------------------------\n`total` 可能是**估算值** —— 看 `total_is_estimate`\n------------------------------------------------------------------\n一个筛选条件都没有（无 `batch_id`、`change_filter=all`、无 `search`）\n且库足够大（PG 后端 ≥ 10 万行）时，`total` 取自 PostgreSQL 的\n`pg_class.reltuples` 统计值，而不是数一遍。响应里的\n**`total_is_estimate: true`** 就是这件事的声明。\n\n为什么：124 万行实测，同一条 `SELECT COUNT(*) FROM asin_data`，VACUUM 之后\n78.5 ms，改动 3% 的行之后 683.6 ms（I/O 从 31 MB 涨到 1.5 GB）——\n采集期间 worker 持续写入把可见性图打脏，index-only scan 退化成逐行回堆。\n读 `pg_class` 是一次系统表单行查找，微秒级、常数、不碰用户表。\n\n误差就是上次 ANALYZE 至今的增量，默认 autovacuum 下通常 < 1%。带任何筛选\n时**仍然精确**（估不了带谓词的行数），小库上也仍然精确。\n\n`exact_total=true` —— 强制精确，代价就是上面那 683 ms。对账、导出核对这类\n\"数字必须对得上\"的场景用它；给人看的页面不需要。\n\n⚠ 别把 `total_is_estimate` 的**缺失**读成 false 之外的东西：这个字段是本轮\n  新加的（契约 §3.2 允许加字段），老客户端不认识它，看到的仍是一个数字，\n  只是这个数字可能差 1%。真要精确就显式传 `exact_total=true`。\n\n非法列名 -> **422 拒绝，不静默丢弃**。与 `limit` 超限那条同一个纪律\n（见上面 MAX_PAGE_LIMIT 的注释）：静默丢弃会让调用方把「这个字段没返回」\n读成「这个字段是空的」。\n\n------------------------------------------------------------------\n`sort` —— 排序键，默认 `id`（**默认行为不变**）\n------------------------------------------------------------------\n* `id`（默认）：`ORDER BY d.id DESC`。`asin_data` 一 ASIN 一行、按 asin\n  UPSERT，`id` 在**首次入库**时分配后永不改变 —— 所以这是\"第一次见到这个\n  ASIN\"的倒序，**不是**\"最近采集\"。重采的老 ASIN 仍然沉在最底下。\n* `recent`：`ORDER BY d.updated_at DESC, d.id DESC`，即\"最近采的排前面\"。\n\n默认留在 `id` 是因为**游标语义是对外契约**：调用方拿着上一页的 `next_cursor`\n继续翻，如果服务端某天改了默认排序，同一个游标会翻出语义完全不同的一页，\n而调用方看不出来。控制台前端显式传 `sort=recent`。\n\n⚠ `sort=recent` 且游标那一行已被删除（多半是刚刚在这个页面上删的）\n-> **422 `cursor_expired`**，调用方应从第一页重来。这里不降级成按 id 比较：\n那会给出一页语义错误的数据，而且没人看得出来。",
                 "operationId": "api_results_api_results_get",
                 "parameters": [
                   {
@@ -1341,6 +1342,16 @@
                     "schema": {
                       "default": true,
                       "title": "With Total",
+                      "type": "boolean"
+                    }
+                  },
+                  {
+                    "in": "query",
+                    "name": "exact_total",
+                    "required": false,
+                    "schema": {
+                      "default": false,
+                      "title": "Exact Total",
                       "type": "boolean"
                     }
                   },
@@ -3441,7 +3452,8 @@
           ],
           "next_cursor": 2,
           "prev_cursor": 3,
-          "total": 3
+          "total": 3,
+          "total_is_estimate": false
         },
         "content_type": "application/json",
         "status": 200
@@ -3582,7 +3594,8 @@
           ],
           "next_cursor": 2,
           "prev_cursor": 3,
-          "total": 3
+          "total": 3,
+          "total_is_estimate": false
         },
         "content_type": "application/json",
         "status": 200
@@ -3666,7 +3679,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 1,
-          "total": 3
+          "total": 3,
+          "total_is_estimate": false
         },
         "content_type": "application/json",
         "status": 200
@@ -3751,7 +3765,8 @@
           ],
           "next_cursor": 3,
           "prev_cursor": 3,
-          "total": 3
+          "total": 3,
+          "total_is_estimate": false
         },
         "content_type": "application/json",
         "status": 200
@@ -3950,7 +3965,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 3,
-          "total": 3
+          "total": 3,
+          "total_is_estimate": false
         },
         "content_type": "application/json",
         "status": 200
@@ -4149,7 +4165,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 3,
-          "total": 3
+          "total": 3,
+          "total_is_estimate": false
         },
         "content_type": "application/json",
         "status": 200
@@ -4348,7 +4365,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 3,
-          "total": 3
+          "total": 3,
+          "total_is_estimate": false
         },
         "content_type": "application/json",
         "status": 200
@@ -4559,7 +4577,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 3,
-          "total": 3
+          "total": 3,
+          "total_is_estimate": false
         },
         "content_type": "application/json",
         "status": 200
@@ -4601,7 +4620,8 @@
           ],
           "next_cursor": 2,
           "prev_cursor": 3,
-          "total": 3
+          "total": 3,
+          "total_is_estimate": false
         },
         "content_type": "application/json",
         "status": 200
@@ -4743,7 +4763,151 @@
           ],
           "next_cursor": 2,
           "prev_cursor": 3,
-          "total": null
+          "total": null,
+          "total_is_estimate": false
+        },
+        "content_type": "application/json",
+        "status": 200
+      }
+    },
+    {
+      "name": "results_exact_total",
+      "request": {
+        "data": null,
+        "files": null,
+        "json": null,
+        "method": "GET",
+        "params": {
+          "exact_total": "true",
+          "limit": 2
+        },
+        "path": "/api/results"
+      },
+      "response": {
+        "body": {
+          "has_more": true,
+          "items": [
+            {
+              "asin": "B0GOLDEN02",
+              "baseline_buybox_price": "33.50",
+              "baseline_price": "33.50",
+              "baseline_stock_count": "9",
+              "baseline_stock_status": "In Stock",
+              "baseline_title_bullets_hash": "6d39ef571dc7bf88cb62e5ff8f857d8d",
+              "baseline_updated_at": "<VOLATILE>",
+              "best_sellers_rank": "#123 in Test",
+              "brand": "GoldenBrand",
+              "bullet_points": "point one|point two",
+              "buybox_price": "33.50",
+              "buybox_shipping": "0.00",
+              "category_ids": "c1,c2",
+              "category_tree": "Home > Test > Sub",
+              "content_hash": "d608fc205fbfe478665c624edc858f1d",
+              "country_of_origin": "China",
+              "crawl_time": "<VOLATILE>",
+              "created_at": "<VOLATILE>",
+              "current_price": "33.50",
+              "delivery_date": "2026-08-10",
+              "delivery_time": "3 days",
+              "ean_list": "",
+              "first_available_date": "2025-01-01",
+              "id": 3,
+              "image_urls": "https://m.media-amazon.com/images/I/71GOLDEN01._AC_SL1500_.jpg",
+              "is_customized": "No",
+              "is_fba": "Yes",
+              "item_dimensions": "9 x 4 x 1 inches",
+              "item_weight": "1.2 pounds",
+              "long_description": "a long description",
+              "manufacturer": "GoldenMfg",
+              "model_number": "MDL-02",
+              "original_price": "29.99",
+              "package_dimensions": "10 x 5 x 2 inches",
+              "package_weight": "1.5 pounds",
+              "parent_asin": "B0GOLDEN02",
+              "part_number": "PN-02",
+              "product_type": "TestType",
+              "product_url": "https://www.amazon.com/dp/B0GOLDEN02",
+              "rating": "4.5",
+              "review_count": "128",
+              "root_category_id": "root123",
+              "screenshot_path": null,
+              "seller_id": "AGOLDENSELLER",
+              "seller_name": "Golden Seller",
+              "site": "US",
+              "stock_count": "9",
+              "stock_status": "In Stock",
+              "subtitle": "Snap-in Liner,Heavy Duty,Hotel Grade",
+              "title": "Golden Test Product B0GOLDEN02",
+              "title_bullets_hash": "6d39ef571dc7bf88cb62e5ff8f857d8d",
+              "upc_list": "012345678905",
+              "updated_at": "<VOLATILE>",
+              "variant_attributes": "color_name=Red; size_name=L",
+              "variation_asins": "",
+              "zip_code": "10001"
+            },
+            {
+              "asin": "B0GOLDEN03",
+              "baseline_buybox_price": "19.99",
+              "baseline_price": "19.99",
+              "baseline_stock_count": "42",
+              "baseline_stock_status": "In Stock",
+              "baseline_title_bullets_hash": "8a1d46aa03468120efb7aced9432780f",
+              "baseline_updated_at": "<VOLATILE>",
+              "best_sellers_rank": "#123 in Test",
+              "brand": "GoldenBrand",
+              "bullet_points": "point one|point two",
+              "buybox_price": "19.99",
+              "buybox_shipping": "0.00",
+              "category_ids": "c1,c2",
+              "category_tree": "Home > Test > Sub",
+              "content_hash": "6dcb11422913c415fd1de87e070f36ea",
+              "country_of_origin": "China",
+              "crawl_time": "<VOLATILE>",
+              "created_at": "<VOLATILE>",
+              "current_price": "19.99",
+              "delivery_date": "2026-08-10",
+              "delivery_time": "3 days",
+              "ean_list": "",
+              "first_available_date": "2025-01-01",
+              "id": 2,
+              "image_urls": "https://m.media-amazon.com/images/I/71GOLDEN01._AC_SL1500_.jpg",
+              "is_customized": "No",
+              "is_fba": "Yes",
+              "item_dimensions": "9 x 4 x 1 inches",
+              "item_weight": "1.2 pounds",
+              "long_description": "a long description",
+              "manufacturer": "GoldenMfg",
+              "model_number": "MDL-03",
+              "original_price": "29.99",
+              "package_dimensions": "10 x 5 x 2 inches",
+              "package_weight": "1.5 pounds",
+              "parent_asin": "B0GOLDEN03",
+              "part_number": "PN-03",
+              "product_type": "TestType",
+              "product_url": "https://www.amazon.com/dp/B0GOLDEN03",
+              "rating": "4.5",
+              "review_count": "128",
+              "root_category_id": "root123",
+              "screenshot_path": null,
+              "seller_id": "AGOLDENSELLER",
+              "seller_name": "Golden Seller",
+              "site": "US",
+              "stock_count": "42",
+              "stock_status": "In Stock",
+              "subtitle": "Snap-in Liner,Heavy Duty,Hotel Grade",
+              "title": "Golden Test Product B0GOLDEN03",
+              "title_bullets_hash": "8a1d46aa03468120efb7aced9432780f",
+              "upc_list": "012345678905",
+              "updated_at": "<VOLATILE>",
+              "variant_attributes": "color_name=Red; size_name=L",
+              "variation_asins": "",
+              "zip_code": "10001"
+            }
+          ],
+          "next_cursor": 2,
+          "prev_cursor": 3,
+          "total": 3,
+          "total_is_estimate": false
         },
         "content_type": "application/json",
         "status": 200
@@ -5946,7 +6110,7 @@
           "__html__": {
             "has_jinja_error": false,
             "has_traceback": false,
-            "size_bucket": 30
+            "size_bucket": 31
           }
         },
         "content_type": "text/html",
@@ -6294,7 +6458,8 @@
           ],
           "next_cursor": 1,
           "prev_cursor": 4,
-          "total": 4
+          "total": 4,
+          "total_is_estimate": false
         },
         "content_type": "application/json",
         "status": 200

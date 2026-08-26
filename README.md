@@ -280,6 +280,7 @@ ASIN 只有一行，后采的覆盖先采的；而 `/api/results?batch_id=` 的 
   实测 100 万行、单页 50 行：默认 `60.9ms / 274.2KB` → 窄投影 `52.1ms / 20.0KB`
   → 再关掉 total `2.7ms / 20.0KB`。采集结果页已经默认用上（首屏要 total，翻页不要）。
   ⚠️ 服务端会强制补 `id`/`asin`/`screenshot_path`/`updated_at`；非法列名 **422 拒绝**。
+  ⚠️ `total` 在大库上默认是**估算值**，见下面「共 N 条结果」那条。
 - **带 `batch_id` 时多四个字段**：`batch_task_status` / `batch_task_updated_at` /
   `batch_asin_data_updated_at` / `batch_has_asin_data`。
   这个端点底层是 `SELECT d.* FROM asin_data d JOIN batch_asins ...`，
@@ -295,6 +296,26 @@ ASIN 只有一行，后采的覆盖先采的；而 `/api/results?batch_id=` 的 
   与行数成正比、且会随时间线性变慢的扫描。
   总数仍显示在列表卡片头部的「共 N 条结果」，它来自 `/api/results` 的 `total`。
   ⚠ `GET /api/changes/stats` 端点**保留**（可能有外部调用方），只是控制台不再用它。
+- **「共 N 条结果」在大库上是估算值**（2026-08）：无筛选（无 `batch_id`、
+  `change_filter=all`、无 `search`）且库 ≥ 10 万行时，`total` 取自 PG 的
+  `pg_class.reltuples` 统计值，响应里 `total_is_estimate: true`，页面显示
+  「共 **约** N 条结果」。带任何筛选时仍然精确，小库上仍然精确。
+  要精确值传 `exact_total=true`。
+
+  为什么：`COUNT(*)` 本来走主键 index-only scan，但**只有可见性图全绿时**
+  才不用碰堆。采集期间 worker 持续 UPSERT 会不断把它打脏，autovacuum 追不上，
+  于是退化成"索引 + 逐行回堆"，扫过整个 2.1 GB 的堆。124 万行实测同一条语句：
+
+  | | buffers | 堆读 | 耗时 |
+  |---|---|---|---|
+  | `VACUUM` 之后 | 3,967（31 MB） | 29 | 78.5 ms |
+  | 改动 3% 的行之后 | 194,940（**1.5 GB**） | 337,292 | **683.6 ms** |
+  | 冷缓存实测（psql 直连） | — | — | **6,971 ms** |
+
+  这就是"有时候快有时候慢"的来源。读 `pg_class` 则是系统表单行查找
+  （实测 0.19 ms，且不随行数增长）。端到端实测 124 万行首屏：
+  `exact_total=true` **159.9 ms** → 默认（估算）**5.3 ms**，
+  估算误差 1,241,101 vs 1,239,999 = **0.089%**。
 - **选中删除**：勾选行 checkbox，点击"删除选中"（同时删除关联截图文件）
   - 删除类操作失败时，前端弹的是**服务端给的原因**（`window.apiErrText`，定义在
     `base.html`，四个删除入口共用）。最常见的一条是配了 `ADMIN_TOKEN` 却没在

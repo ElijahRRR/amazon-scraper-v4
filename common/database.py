@@ -2265,6 +2265,7 @@ class Database:
                           direction: str = "next",
                           columns: List[str] = None,
                           with_total: bool = True,
+                          exact_total: bool = False,
                           sort: str = DEFAULT_SORT) -> Dict:
         """
         获取结果列表（keyset 分页）
@@ -2272,10 +2273,13 @@ class Database:
         direction: next (向后翻页) / prev (向前翻页)
         columns: 只取这些列（None = 全部 56 列，**默认行为不变**）
         with_total: 算不算 total（False -> total 为 None，**默认行为不变**）
+        exact_total: 对等面参数，SQLite 侧**收下但不影响结果** —— 这边的 total
+              永远是精确值（见下方 total_is_estimate）
         sort: "id"（默认，按首次入库倒序）/ "recent"（按 updated_at 倒序）。
               规则的唯一真源在 common/core/results_sort.py，与 PG 侧共用同一份
               ORDER BY 与 keyset 谓词文本；游标行已删除时抛 CursorExpired。
-        返回: {"items": [...], "has_more": bool, "next_cursor": int, "prev_cursor": int, "total": int|None}
+        返回: {"items": [...], "has_more": bool, "next_cursor": int,
+              "prev_cursor": int, "total": int|None, "total_is_estimate": bool}
 
         ------------------------------------------------------------------
         columns / with_total 是干什么的
@@ -2482,7 +2486,16 @@ class Database:
 
         # with_total=False -> 整条 count 都不发。它随行数线性增长、且翻页途中
         # 值恒定不变，前端只在首屏要它。
+        # SQLite 侧**永远精确**，所以 total_is_estimate 恒为 False。
+        #
+        # 这不是"漏实现了 PG 有的功能"，是这边没有可估的东西：SQLite 不维护
+        # 表级行数统计（sqlite_stat1 只有索引列的平均重复度，没有总行数），
+        # 唯一的行数来源就是数一遍。而 PG 侧的估算有 TOTAL_ESTIMATE_MIN_ROWS
+        # 门槛（10 万行），SQLite 只做小库对照 —— 小库在 PG 上同样走精确，
+        # 所以两个后端在**同一份夹具**上给出的 total 逐字相同，golden 基线
+        # 不因此分叉。
         total = None
+        total_is_estimate = False
         if with_total:
             count_sql = f"SELECT COUNT(*) FROM asin_data d {count_join_clause} WHERE {count_where}"
             async with self.read() as rc, rc.execute(count_sql, count_params) as c:
@@ -2497,6 +2510,7 @@ class Database:
             "next_cursor": next_cursor,
             "prev_cursor": prev_cursor,
             "total": total,
+            "total_is_estimate": total_is_estimate,
         }
 
     async def get_batch_asin_set(self, batch_id) -> set:

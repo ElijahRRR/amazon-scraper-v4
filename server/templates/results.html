@@ -176,6 +176,10 @@ let state = {
     // 首屏那次拿到的 total。翻页时服务端不再回 total（with_total=false），
     // 沿用这个值 —— 它在整个翻页过程中本来就恒定不变。
     total: null,
+    // total 是不是估算值（决定显示"约 N"还是"N"）。与 total 同一时刻更新，
+    // 因为它描述的就是 total 那一个数 —— 分开更新迟早会出现"数换了、前缀还是
+    // 上一次那个"。
+    totalIsEstimate: false,
 };
 
 const CHANGE_FILTERS = ['all', 'price_stock', 'title_bullets', 'new'];
@@ -367,8 +371,16 @@ async function loadResults(cursor = null, direction = 'next') {
         // 翻页时服务端不再回 total（null）——沿用首屏那次的值，别把计数刷成空
         if (data.total !== null && data.total !== undefined) {
             state.total = data.total;
+            // 无筛选的大库上服务端给的是 pg_class.reltuples 估算值（省掉一次
+            // 全表 COUNT，百万行上是 683ms -> 0）。误差通常 < 1%，但**必须
+            // 让人看出来**：不标记的话，用户会拿这个数去跟导出的行数对账，
+            // 差几十条时以为是丢数据了。带筛选时服务端仍然精确，标记为 false。
+            state.totalIsEstimate = data.total_is_estimate === true;
         }
-        document.getElementById('resultTotal').textContent = state.total ?? '-';
+        document.getElementById('resultTotal').textContent =
+            state.total === null || state.total === undefined
+                ? '-'
+                : (state.totalIsEstimate ? '约 ' : '') + state.total;
 
         state.nextCursor = data.next_cursor;
         state.prevCursor = data.prev_cursor;

@@ -46,6 +46,26 @@ ASIN_DELETE_CHUNK = 500
 # 50 个占位符也远低于 SQLite 的 SQLITE_MAX_VARIABLE_NUMBER（默认 999）。
 BATCH_DELETE_CHUNK = 50
 
+# 「共 N 条结果」允许走估算（PG 的 pg_class.reltuples）的最小行数门槛。
+#
+# 为什么要门槛，而不是"永远估算"：
+#   * reltuples 是 ANALYZE / autovacuum 留下的**统计快照**，新建库或从没被
+#     analyze 过的表上是 -1（PG 14+ 的"未知"哨兵），空表刚 ANALYZE 完是 0。
+#     小库上直接把这个数吐出去 = 前端显示"共 0 条"而表格里有 12 行。
+#   * 小表的精确 COUNT(*) 本来就不要钱（10 万行以内一次索引扫，个位数毫秒）。
+#     花钱的是百万行 + 可见性图被持续写入打脏那个组合。
+#   * golden 基线跑在几十行的夹具上，两个后端**必须给出同一个 total**。
+#     门槛把小库整个排除在估算之外，基线因此逐字不变。
+#
+# 10 万这个值：低于它精确 COUNT 稳定在几十毫秒（实测 12.4 万行 / 冷可见性图
+# 68 ms），高于它才开始出现"写入把可见性图打脏 -> 索引扫退化成堆读"的悬崖
+# （124 万行实测：VACUUM 后 78.5 ms，改动 3% 的行之后 683.6 ms，I/O 49 倍）。
+#
+# ⚠ 两个后端共用这个常量，但**只有 PG 会用它**：SQLite 没有等价的行数统计
+#   （sqlite_stat1 只有索引的平均重复度，没有总行数），那边永远精确。
+#   这不是分叉：生产跑 PG，SQLite 只做小库对照，小库在 PG 上也精确。
+TOTAL_ESTIMATE_MIN_ROWS = 100_000
+
 # 按 ASIN 删除要清的四张表（顺序：子表在前）。asin_data 最后 —— PG 侧
 # asin_changes / screenshots / batch_asins 都可能引用它。
 ASIN_DELETE_TABLES = ("asin_changes", "screenshots", "batch_asins", "asin_data")
@@ -65,6 +85,7 @@ def search_like_pattern(t: str) -> str:
 __all__ = [
     "CLEAR_TABLES",
     "ASIN_DELETE_CHUNK",
+    "TOTAL_ESTIMATE_MIN_ROWS",
     "ASIN_DELETE_TABLES",
     "search_like_pattern",
 ]

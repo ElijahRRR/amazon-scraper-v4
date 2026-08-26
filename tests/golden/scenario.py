@@ -276,6 +276,13 @@ def run(rec: Recorder) -> None:
              params={"fields": "asin,title,current_price", "limit": 2})
     rec.call("results_without_total", "GET", "/api/results", expect=200,
              params={"with_total": "false", "limit": 2})
+    # 第三种 total 形状：强制精确。夹具只有几十行，**两个后端都低于
+    # TOTAL_ESTIMATE_MIN_ROWS 门槛**，所以它与默认那步的 total 相等 ——
+    # 钉的不是"数字不同"，而是这个参数存在、被收下、且不改变小库上的答案。
+    # （估算路径本身由 tests/pgdb/test_total_estimate.py 用人造统计偏差覆盖，
+    #   黄金场景造不出百万行。）
+    rec.call("results_exact_total", "GET", "/api/results", expect=200,
+             params={"exact_total": "true", "limit": 2})
     rec.call("results_bad_field", "GET", "/api/results", expect=422,
              params={"fields": "title,no_such_column"})
     rec.call("result_detail", "GET", f"/api/results/{ok_tasks[0]['asin']}", expect=200)
