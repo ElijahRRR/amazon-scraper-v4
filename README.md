@@ -16,7 +16,8 @@ Server (FastAPI)                          Worker (可部署多台)
   - 全局并发配额协调                           - lease_epoch 防重复提交
   - Webhook 完成回调（SSRF 防御）              - variant_offset 检测
   - 卖家店铺采集（发现 ASIN → 详情采集）        - 多属性变体提取（twister）
-                                              - 邮编校验 + 配送降级页重试
+  - 关键词采集（搜索翻页 → 详情采集）           - 邮编校验 + 配送降级页重试
+  - 浏览器插件对接（extension/，Chrome MV3）
 
 下游数据出口（PostgreSQL 后端提供）：
   - catalog_sync 事件流：写入 outbox → 单例 relay → 按 seq 分区的事件表
@@ -228,6 +229,96 @@ ASIN 只有一行，后采的覆盖先采的；而 `/api/results?batch_id=` 的 
   - `discover_only`：只枚举该店铺在售的 ASIN，写入 `seller_discoveries` 表
   - `with_detail`：枚举后自动为这些 ASIN 派生完整详情采集任务，追加进主任务队列
 - API：`POST /api/upload-sellers`、`GET /api/seller-batches/{id}/progress`（发现+详情两阶段进度）、`GET /api/seller-batches/{id}/discoveries`（按 `seller_id` 过滤查看已发现的 ASIN）
+
+### 按关键词采集（F-010）
+
+同样在 **任务管理** 页面。填关键词（每行一个）+ 筛选条件，Server 会为每个
+关键词建一个 `discover_search` 任务，由 worker 翻搜索结果页把 ASIN 抓全，
+再按 `discover_mode` 决定要不要顺带派发详情采集。
+
+和卖家店铺采集（F-009）是同一套骨架：同一张 `tasks` 表、同一批 worker、
+同一条租约/重试/回收通道。差异只有「种子是关键词而不是卖家 ID」和
+「翻页 URL 要带筛选条件」。
+
+| 筛选项 | 说明 |
+|---|---|
+| 价格区间 | `min_price` / `max_price`，支持只给一端 |
+| 配送方式 | `prime` / `free_shipping` / `sold_by_amazon` / `get_it_today` |
+| 排序 | `relevance` / `price_asc` / `price_desc` / `newest` / `review_rank` / `featured` |
+| 翻页上限 | 每个关键词翻几页，默认 7，上限 20 |
+| 广告位 | 默认丢弃（`include_sponsored=false`） |
+| 站点 | 18 个 Amazon 站点 |
+| `rh_extra` | 逃生口：原样拼进 `rh=` 的 refinement 串，用于本项目没预置的筛选 |
+
+```bash
+curl -X POST http://<server>:8899/api/search-batches \
+  -H 'Content-Type: application/json' -d '{
+    "keywords": ["wireless mouse", "usb c hub"],
+    "min_price": 10, "max_price": 50,
+    "delivery": "prime",
+    "max_pages": 5,
+    "discover_mode": "with_detail"
+  }'
+```
+
+端点：`POST /api/search-batches`、`GET /api/search-options`、
+`GET /api/search-batches/{id}/progress`、`GET /api/search-batches/{id}/discoveries`。
+
+发现结果存进 `search_discoveries`，比 `seller_discoveries` 多三列
+`page_no` / `rank` / `is_sponsored` —— **排名**是关键词采集独有的产出，
+而不记广告位标记的话 `rank` 这个数字就是混了广告的，没有意义。
+`discoveries` 端点默认按 `(page_no, rank)` 升序，也就是搜索结果的原始顺序。
+
+`rank` 是**页内绝对位置（1 起，含广告位）**。丢弃广告位时（默认）那几行不入库，
+于是 rank 序列会有空档（1, 3, 4…）—— 空档是有意义的信息（"这个位置被广告占了"），
+不是 bug。要自然排名就按 rank 排序后重新编号。跨页的绝对名次推不出来：
+Amazon 每页条数随布局变（16/24/48/60 都见过），所以只存 `(page_no, rank)` 这一对。
+
+#### ⚠ `delivery` 背后的节点 ID 是 Amazon 侧的，会变
+
+`rh=` 里那些 `p_85:2470955011` 不是本项目能控制的东西：**按站点不同**，
+而且 Amazon 改版时会变。所以这里的处理是：
+
+1. 只硬编码有把握的 `www.amazon.com` 一套（`common/core/searchurl.py` 里逐条注明含义）；
+2. 站点没有对照表时**拒绝** `delivery=`（400），不猜、也不静默忽略 ——
+   后两种都会得到一批看着正常、实则没筛过的数据；
+3. 用环境变量 `SEARCH_DELIVERY_FILTERS`（JSON）覆盖/扩充这张表，改配置即生效，不必发版：
+
+```bash
+SEARCH_DELIVERY_FILTERS='{"www.amazon.de": {"prime": "p_85:xxxxxxxxx"}}'
+```
+
+`GET /api/search-options?domain=<站点>` 回的就是该站点**当前**可用的取值，
+控制台的下拉框读的也是它。
+
+### 浏览器插件采集（F-011）
+
+`extension/` 目录是一个 Chrome/Edge MV3 插件：在亚马逊页面上一键把商品推给
+Server 采集，自动识别当前是商品列表页 / 卖家店铺页 / 商品详情页三种之一。
+
+- **列表页**：采本页 ASIN 并推送；可开启自动翻页（一页一推，全部落进同一批次）
+- **卖家店铺页**：同上，另加「采集该卖家全部商品」——交给服务端翻页发现整店 ASIN
+- **商品详情页**：加入待采队列，攒一批一次性提交；可勾选「同时采集该卖家的全部商品」
+
+安装与使用见 [`extension/README.md`](extension/README.md)。服务端这边是三个端点：
+
+| 端点 | 用途 |
+|---|---|
+| `GET /api/extension/ping` | 测试连接（版本 / 默认邮编 / 在线 worker 数） |
+| `POST /api/extension/collect` | 推 ASIN 与卖家 ID |
+| `POST /api/extension/resolve-sellers` | 按 ASIN 反查**已采到的**卖家 |
+
+**`/api/extension/collect` 的同名批次是「追加」，不是 409** —— 与
+`/api/upload` / `/api/batches` 的撞名语义相反。这是插件翻页采集的前提：
+一次「翻 10 页」是 10 次推送，必须落进同一个批次，否则控制台里会多出 10 个批次，
+导出/进度/回调全部没法看。两条语义共存是有意的，理由见
+`server/api/extension.py` 的模块文档。
+
+插件没有、也不需要服务端放 CORS 头：它的请求全部从 service worker 发出，
+凭 `host_permissions` 就不受 CORS 约束。**别"顺手"给这些端点加 CORS** ——
+采集端点默认无鉴权，今天没有 CORS 头这件事本身就是一道屏障
+（浏览器对带 `Content-Type: application/json` 的跨源 POST 会先发 preflight，
+拿不到放行头就根本不发出真正的请求）。
 
 ### 采集结果
 
@@ -710,6 +801,8 @@ amazon-scraper-v4/
       timeutil.py           # 时间戳格式（DB 用/HTTP 用分开）
       lockmeter.py          # 锁等待/持有耗时统计（供 /api/_debug/lock-stats）
       coerce.py             # HTTP 边界整数强转
+      searchurl.py          # 关键词搜索的参数校验 + URL 构造
+                            #（server 校验、worker 拼 URL，同一份规则）
     pgdb/                # PostgreSQL 存储实现（可选后端）
       schema.py             # DDL：public 库表 + scraper 库事件流表
       pool.py               # 连接池 / 写连接
@@ -732,6 +825,8 @@ amazon-scraper-v4/
       worker_package.py     # Worker 安装包下载（完整包 / 代码更新包）
       fleet.py              # Worker 注册、心跳、软重启、并发配额
       sellers.py            # 卖家店铺采集（发现 + 详情派生）
+      searches.py           # 关键词采集（搜索翻页发现 + 详情派生）
+      extension.py          # 浏览器插件对接（同名批次是**追加**，与 upload 相反）
       results.py            # 结果查询/搜索/删除
       export.py             # UI 导出（xlsx/csv/截图打包）
       export_incremental.py # 增量导出契约（PG-only，面向下游 catalog_sync）
@@ -748,6 +843,13 @@ amazon-scraper-v4/
     metrics.py            # 性能指标收集（滑窗 + 双 EWMA）
     screenshot.py         # Playwright 截图子进程
     ziputil.py            # 邮编（不是压缩包）校验工具：判断配送控件里是否命中目标邮编
+  extension/            # 浏览器插件（Chrome/Edge MV3），见 extension/README.md
+    manifest.json
+    src/page.js           # 页面识别 + ASIN/卖家抽取（纯函数，有 jsdom 规格用例）
+    src/content.js        # 跑在亚马逊页面上：读 DOM、翻页
+    src/background.js     # service worker：设置/队列/翻页状态机/所有 Server 请求
+    src/popup.*           # 弹窗界面（三种页面三套面板）
+    src/options.*         # 选项页（含 host_permissions 运行时授权）
   tools/
     smoke_local.py        # 端到端冒烟测试（上传→拉取→提交→查询→契约校验），面向操作者
     preflight.py          # 上机环境体检：PG 连通性/建表/排序规则/磁盘/依赖，
@@ -791,9 +893,10 @@ amazon-scraper-v4/
 | `batch_asins` | 批次-ASIN 多对多映射 |
 | `asin_data` | ASIN 数据（UNIQUE，覆盖更新） |
 | `asin_changes` | 变动检测历史（价格/库存/标题/新增） |
-| `tasks` | 采集任务队列（含 `lease_epoch` + `auto_retry_count` + 卖家发现任务的 `task_type`/`task_meta`） |
+| `tasks` | 采集任务队列（含 `lease_epoch` + `auto_retry_count` + 发现任务的 `task_type`/`task_meta`）。`task_type`：`asin`（详情）/ `discover_seller`（F-009）/ `discover_search`（F-010）；关键词任务的筛选参数就写在 `task_meta.search` 里下发给 worker |
 | `screenshots` | 截图追踪 |
 | `seller_discoveries` | 卖家店铺发现结果（`(batch_id, seller_id, asin)` 主键） |
+| `search_discoveries` | 关键词搜索发现结果（`(batch_id, keyword, asin)` 主键，另有 `page_no`/`rank`/`is_sponsored`） |
 
 `asin_data` 包含字段：ASIN / 标题 / 品牌 / 价格 / 库存 / 评分 / 评论数 / 卖家店铺 ID / 卖家名 / 父 ASIN / 变体属性 / 类目 / 尺寸 / 重量 / 制造商 / 排名 / ...
 

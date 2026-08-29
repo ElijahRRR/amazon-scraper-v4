@@ -31,3 +31,9 @@ env/
 # 只忽略 worktrees/ 而不是整个 .claude/：将来真要提交
 # .claude/settings.json 或 skills 时，它们还能正常出现在 git status 里。
 .claude/worktrees/
+
+# 插件的页面识别层有一份 Node 测试（tests/test_extension_page_js.py），
+# 需要 jsdom。它是**可选**依赖：装了就跑，没装就 skip（与 tests/pgdb 连不上
+# PostgreSQL 时的处理同款），所以这里只忽略安装产物，不往仓库里加 package.json。
+node_modules/
+package-lock.json

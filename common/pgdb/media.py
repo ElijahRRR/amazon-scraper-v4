@@ -1,6 +1,9 @@
-"""common/pgdb/media.py —— 截图 + 卖家发现（F-009）+ 变体展开。
+"""common/pgdb/media.py —— 截图 + 卖家发现（F-009）+ 关键词发现（F-010）+ 变体展开。
 
-OWNS（10 个方法）:
+OWNS（13 个方法）:
+    create_search_batch            database.py（F-010，无 SQLite 行号：与本文件同批新增）
+    accept_search_discovery_result database.py（同上）
+    get_search_batch_progress      database.py（同上）
     get_pending_screenshots        database.py:2291
     update_screenshot_status       database.py:2298
     get_screenshot_progress        database.py:2333
@@ -85,6 +88,7 @@ from common.core.timeutil import now_ts
 from typing import Any, Dict, List, Optional, Tuple
 
 from common import config
+from common.core.searchurl import normalize_keyword
 from common.pgdb._shared import _normalize_screenshot_path
 
 logger = logging.getLogger(__name__)
@@ -388,6 +392,265 @@ class MediaMixin:
 
             async with rc.execute(
                 "SELECT COUNT(*) FROM seller_discoveries WHERE batch_id=?", (bid,)
+            ) as c:
+                row = await c.fetchone()
+                out["discovered_asins"] = row[0] if row else 0
+        return out
+
+    # ==================== 关键词搜索采集（F-010）====================
+    #
+    # 与上面 F-009 三件套逐条同构。移植要点（与 SQLite 侧的差异）与那边一致：
+    #   * total_changes 差值 -> 单条 set-based INSERT + 命令标签；
+    #   * `?` 占位符由 common/pgdb/pool 翻译，text_affinity / as_int 照打；
+    #   * INSERT OR IGNORE -> ON CONFLICT DO NOTHING（两张发现表都有复合主键
+    #     做合法仲裁者，tasks 有 UNIQUE(batch_id, asin)）。
+    #
+    # ⚠ 一处 F-009 没有的东西：`rank` 是 PG 的**保留字**（窗口函数 RANK()）。
+    #   建表时不带引号能过（PG 允许保留字做列名，只要不在需要消歧的位置），
+    #   但 INSERT 的列清单里必须写成 "rank" —— 不加引号在 PG 16 上直接
+    #   syntax error。SQLite 侧没有这个限制，所以两边的 SQL 文本在这一处
+    #   **有意不同**，不是笔误。
+
+    async def create_search_batch(self, name: str, keywords: List[str],
+                                  search_params: Optional[Dict] = None,
+                                  discover_mode: str = "with_detail",
+                                  zip_code: str = "10001",
+                                  needs_screenshot: bool = False) -> Tuple[int, int]:
+        """创建一个 keyword_discovery 批次，每个关键词一个 discover_search 任务。
+
+        语义与 SQLite 侧同名方法逐字一致，见那边的 docstring。
+
+        Returns: (batch_id, inserted_search_task_count)
+        """
+        if discover_mode not in ("discover_only", "with_detail"):
+            raise ValueError(f"非法 discover_mode: {discover_mode}")
+
+        clean_kws = []
+        seen = set()
+        for kw in keywords or []:
+            kw = normalize_keyword(kw)
+            if kw and kw.lower() not in seen:
+                clean_kws.append(kw)
+                seen.add(kw.lower())
+        if not clean_kws:
+            return (0, 0)
+
+        meta_json = json.dumps({"search": search_params or {}}, ensure_ascii=False)
+        ss_val = 1 if needs_screenshot else 0
+        name_p = self.text_affinity(name)
+        mode_p = self.text_affinity(discover_mode)
+        zip_p = self.text_affinity(zip_code)
+        meta_p = self.text_affinity(meta_json)
+        async with self._write_lock:
+            await self._db.execute("BEGIN")
+            try:
+                await self._db.execute(
+                    "INSERT INTO batches (name, needs_screenshot, is_auto, batch_type, discover_mode) "
+                    "VALUES (?, ?, 0, 'keyword_discovery', ?) "
+                    "ON CONFLICT DO NOTHING",
+                    (name_p, ss_val, mode_p)
+                )
+                # 同名重传：上面被 DO NOTHING 吞掉，这里取回**已存在**的 id
+                # （与 create_seller_batch 同构）。
+                async with self._db.execute("SELECT id FROM batches WHERE name = ?", (name_p,)) as c:
+                    row = await c.fetchone()
+                    batch_id = row[0] if row else 0
+                if not batch_id:
+                    await self._db.execute("ROLLBACK")
+                    return (0, 0)
+
+                cursor = await self._db.execute(
+                    "INSERT INTO tasks "
+                    "(batch_id, asin, zip_code, needs_screenshot, task_type, task_meta) "
+                    "SELECT ?::bigint, u.kw, ?::text, 0, 'discover_search', ?::text "
+                    "  FROM unnest(?::text[]) AS u(kw) "
+                    "ON CONFLICT DO NOTHING",
+                    (batch_id, zip_p, meta_p, clean_kws)
+                )
+                inserted = cursor.rowcount
+                await self._db.execute("COMMIT")
+            except Exception:
+                try:
+                    await self._db.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+        return (batch_id, inserted)
+
+    async def accept_search_discovery_result(self, task_id: int, worker_id: str,
+                                             lease_epoch: int, batch_id: int,
+                                             keyword: str,
+                                             items: List[Dict],
+                                             meta: Optional[Dict] = None) -> Dict:
+        """接受 discover_search 任务结果。语义见 SQLite 侧同名方法。
+
+        Returns: {"accepted","stale","discovered","new_asins","detail_tasks_created"}
+        """
+        now = now_ts()
+        tid = self.as_int(task_id)
+        wid = self.text_affinity(worker_id)
+        epoch = self.as_int(lease_epoch)
+        bid = self.as_int(batch_id)
+        kw = normalize_keyword(keyword) or ""
+        kw_p = self.text_affinity(kw)
+        async with self._write_lock:
+            await self._db.execute("BEGIN")
+            try:
+                # Step 1: 读回既有 task_meta，把建批次时写下的筛选参数保住。
+                # 直接 SET task_meta=? 会把它抹掉（SQLite 侧同注）。
+                async with self._db.execute(
+                    "SELECT task_meta FROM tasks WHERE id=?", (tid,)
+                ) as c:
+                    mrow = await c.fetchone()
+                merged: Dict[str, Any] = {}
+                if mrow and mrow["task_meta"]:
+                    try:
+                        prev = json.loads(mrow["task_meta"])
+                        if isinstance(prev, dict):
+                            merged.update(prev)
+                    except Exception:
+                        pass
+                merged.update(meta or {})
+                meta_json = json.dumps(merged, ensure_ascii=False) if merged else None
+
+                cursor = await self._db.execute(
+                    "UPDATE tasks SET status='done', updated_at=?, task_meta=? "
+                    "WHERE id=? AND worker_id=? AND lease_epoch=? AND status='processing'",
+                    (now, meta_json, tid, wid, epoch)
+                )
+                if cursor.rowcount == 0:
+                    await self._db.execute("ROLLBACK")
+                    return {"accepted": False, "stale": True,
+                            "discovered": 0, "new_asins": 0, "detail_tasks_created": 0}
+
+                # Step 2: 读 batch 元信息
+                async with self._db.execute(
+                    "SELECT discover_mode, needs_screenshot, name FROM batches WHERE id=?",
+                    (bid,)
+                ) as c:
+                    brow = await c.fetchone()
+                discover_mode = brow["discover_mode"] if brow else None
+                needs_screenshot = bool(brow["needs_screenshot"]) if brow else False
+                ss_val = 1 if needs_screenshot else 0
+
+                # Step 3: 写 search_discoveries（去重靠 PK）
+                disc_rows = []
+                seen_asins = set()
+                for it in items or []:
+                    asin = (it.get("asin") or "").strip().upper()
+                    if not asin or asin in seen_asins:
+                        continue
+                    seen_asins.add(asin)
+                    disc_rows.append((
+                        bid, kw_p, asin,
+                        self.text_affinity((it.get("title") or "")[:1000]),
+                        self.text_affinity((it.get("price") or "")[:64]),
+                        self.text_affinity((it.get("image") or "")[:1000]),
+                        self.as_int(it.get("page") or 0),
+                        self.as_int(it.get("rank") or 0),
+                        1 if it.get("sponsored") else 0,
+                    ))
+                if disc_rows:
+                    # 复合主键 (batch_id, keyword, asin) 是合法仲裁者。
+                    # "rank" 必须带引号：PG 保留字（见本节头注）。
+                    await self._db.executemany(
+                        "INSERT INTO search_discoveries "
+                        "(batch_id, keyword, asin, list_title, list_price, list_image, "
+                        ' page_no, "rank", is_sponsored) '
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT DO NOTHING",
+                        disc_rows
+                    )
+
+                # Step 4: 若 with_detail，为每个 ASIN 插入详情任务（同 batch_id）
+                detail_inserted = 0
+                if discover_mode == "with_detail" and seen_asins:
+                    async with self._db.execute(
+                        "SELECT zip_code FROM tasks WHERE id=?", (tid,)
+                    ) as c:
+                        zrow = await c.fetchone()
+                    zip_code = zrow["zip_code"] if zrow else "10001"
+
+                    detail_asins = list(seen_asins)
+                    cursor = await self._db.execute(
+                        "INSERT INTO tasks "
+                        "(batch_id, asin, zip_code, needs_screenshot, task_type) "
+                        "SELECT ?::bigint, u.asin, ?::text, ?::int, 'asin' "
+                        "  FROM unnest(?::text[]) AS u(asin) "
+                        "ON CONFLICT DO NOTHING",
+                        (bid, self.text_affinity(zip_code), ss_val, detail_asins)
+                    )
+                    detail_inserted = cursor.rowcount
+
+                    for a in seen_asins:
+                        async with self._db.execute(
+                            "SELECT 1 FROM asin_data WHERE asin=?", (a,)
+                        ) as c:
+                            exists = await c.fetchone()
+                        await self._db.execute(
+                            "INSERT INTO batch_asins (batch_id, asin, is_new) VALUES (?, ?, ?) "
+                            "ON CONFLICT DO NOTHING",
+                            (bid, a, 0 if exists else 1)
+                        )
+
+                    if needs_screenshot:
+                        await self._db.executemany(
+                            "INSERT INTO screenshots (asin, batch_id) VALUES (?, ?) "
+                            "ON CONFLICT DO NOTHING",
+                            [(a, bid) for a in seen_asins]
+                        )
+
+                await self._db.execute("COMMIT")
+            except Exception:
+                try:
+                    await self._db.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+
+        return {
+            "accepted": True, "stale": False,
+            "discovered": len(seen_asins),
+            "new_asins": len(seen_asins),
+            "detail_tasks_created": detail_inserted,
+        }
+
+    async def get_search_batch_progress(self, batch_id: int) -> Dict:
+        """keyword_discovery 批次的混合进度。语义见 SQLite 侧同名方法。"""
+        out = {
+            "batch_id": batch_id,
+            "discover": {"pending": 0, "processing": 0, "done": 0, "failed": 0, "total": 0},
+            "detail":   {"pending": 0, "processing": 0, "done": 0, "failed": 0, "total": 0},
+            "discovered_asins": 0,
+            "keywords": 0,
+            "discover_mode": None,
+        }
+        bid = self.as_int(batch_id)
+        async with self.read() as rc:
+            async with rc.execute(
+                "SELECT discover_mode FROM batches WHERE id=?", (bid,)
+            ) as c:
+                row = await c.fetchone()
+                if row:
+                    out["discover_mode"] = row["discover_mode"]
+
+            async with rc.execute(
+                "SELECT task_type, status, COUNT(*) as cnt FROM tasks "
+                "WHERE batch_id=? GROUP BY task_type, status",
+                (bid,)
+            ) as c:
+                async for row in c:
+                    tt = row["task_type"] or "asin"
+                    bucket = out["discover"] if tt == "discover_search" else out["detail"]
+                    bucket[row["status"]] = row["cnt"]
+
+            for bucket in (out["discover"], out["detail"]):
+                bucket["total"] = sum(bucket[k] for k in ("pending", "processing", "done", "failed"))
+            out["keywords"] = out["discover"]["total"]
+
+            async with rc.execute(
+                "SELECT COUNT(DISTINCT asin) FROM search_discoveries WHERE batch_id=?",
+                (bid,)
             ) as c:
                 row = await c.fetchone()
                 out["discovered_asins"] = row[0] if row else 0

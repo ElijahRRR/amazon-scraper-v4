@@ -45,7 +45,9 @@ DESCRIPTIONS: Dict[str, str] = {
     VARIANT_OFFSET: "Amazon 把请求重定向到了兄弟 variant 页面（不是目标 ASIN 本身）",
     ZIP_NOT_EFFECTIVE: "邮编设置多次重发仍未生效（页面仍显示默认配送地区）",
     SESSION_NOT_READY: "worker 本地 session 迟迟未就绪（冷启动/轮换中超时）",
-    DISCOVER_FAILED: "卖家店铺发现阶段失败（找不到任何在售 ASIN）",
+    DISCOVER_FAILED: "发现阶段失败：卖家店铺（F-009）翻不出任何在售 ASIN，"
+                     "或关键词搜索（F-010）一页都没成功抓下来；"
+                     "也用于 worker 不认识 server 派下来的 task_type（该升级 worker 了）",
     SERVER_REJECT: "server 端二次校验判定这条结果本身不合法，直接判失败"
                     "（不是 worker 上报的原始错误类型，是 server 改写的）",
     UNKNOWN: "worker 上报的 error_type 不在此表中，已被改写为 unknown；"

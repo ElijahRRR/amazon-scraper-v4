@@ -133,8 +133,9 @@ class AdminMixin:
 
     # ==================== 管理（清库）====================
 
-    #: SQLite 侧 5 张带 AUTOINCREMENT 的表。``batch_asins`` / ``seller_discoveries``
-    #: 是复合主键，没有序列，不在这里。
+    #: SQLite 侧 5 张带 AUTOINCREMENT 的表。``batch_asins`` /
+    #: ``seller_discoveries`` / ``search_discoveries`` 是复合主键，没有序列，
+    #: 不在这里（后者是 F-010 新增的，与 seller 那张同构，同样无序列）。
     #: （Phase 3.8 批 (1) 之前这份清单写在 ``pool.py`` 的 ``_STATEMENT_OVERRIDES``
     #:  里，靠匹配 handler 那句 ``DELETE FROM sqlite_sequence`` 的字面量触发。）
     RESTART_IDENTITY_TABLES = ("batches", "asin_data", "asin_changes",
