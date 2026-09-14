@@ -96,6 +96,7 @@ class AsinData:
     # `/api/export/fields` 与所有导出文件的表头顺序（黄金基线的一步）。
     # 落在末尾 = 导出多一列在最右边，既有列一列没动、没有重排。
     subtitle: str = ""
+    offer_condition: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)

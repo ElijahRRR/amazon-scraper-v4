@@ -384,6 +384,23 @@ status.status == "completed"
 | 字段 | 含义 |
 |---|---|
 | `items` | 结果行数组。**当前 55 个键**（`asin`/`title`/`brand`/`current_price`/`screenshot_path`/…），且**会随 `asin_data` 加列而增长** —— 见 §3.2 的例外 |
+
+> **2026-09 新增 `offer_condition`**（§3.2 允许单方面加字段）。它是**这次采集时
+> buybox 胜出的那个 offer 的品相**，不是 ASIN 的固有属性 —— 同一个 ASIN 上可以
+> 同时挂全新和二手 offer，buybox 换人这个值就变。
+>
+> 取值：`Used - Like New` / `Used - Very Good` / `Used - Good` /
+> `Used - Acceptable` / `Open Box` / `Collectible` / `Renewed` / `Refurbished`，
+> 读不到一律 `N/A`。
+>
+> ⚠ **全新品也是 `N/A`，不是 `New`** —— 全新 offer 的 buybox 不写品相，
+> 我们没有"页面明确说了这是全新"的证据。所以 `N/A` 的含义是
+> **「未知」，不是「全新」**，不要把它当全新处理。
+>
+> ⚠ 这一列直接影响价格的可比性：二手 offer 的 `current_price` / `buybox_price`
+> 是**二手价**，与全新价不可混用。实例：`B0G449YVHD` 采到 `$20.70`，卖家是
+> Amazon Resale（亚马逊自营退货/开箱件）。
+
 | `has_more` | 还有下一页。**翻页的唯一终止条件** |
 | `next_cursor` | 下一页的游标（`direction=next` 用）= 本页最后一行的 `id` |
 | `prev_cursor` | 上一页的游标（`direction=prev` 用）= 本页第一行的 `id` |
