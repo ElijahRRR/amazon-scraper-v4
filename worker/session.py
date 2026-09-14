@@ -17,6 +17,7 @@ from curl_cffi import CurlHttpVersion
 from curl_cffi.requests import AsyncSession, Response
 
 from common import config
+from common.core.searchurl import build_search_url
 from worker.proxy import ProxyManager
 from worker.ziputil import zip_effective_in_html
 
@@ -417,6 +418,51 @@ class AmazonSession:
             return resp
         except Exception as e:
             logger.error(f"❌ 卖家列表请求失败 seller={seller_id} page={page}: {e}")
+            return None
+
+    async def fetch_search_page(self, keyword: str, page: int = 1,
+                                search_params: Optional[dict] = None,
+                                max_recv_speed: int = 0) -> Optional[Response]:
+        """采集 Amazon 关键词搜索结果页（F-010）。
+
+        URL 由 `common.core.searchurl.build_search_url` 构造 —— **不在这里拼**。
+        理由见那个模块的头注：server 校验筛选参数、worker 拼 URL，两件事必须
+        由同一份规则驱动，否则会出现"server 收下了 delivery=prime、worker 拼
+        URL 时把它丢了"这种静默失效（批次名、进度、发现数全部正常，只有数据是错的）。
+
+        ⚠ 这里**不用** `self.AMAZON_BASE`：搜索支持跨站点（`params['domain']`），
+        而 AMAZON_BASE 是 session 建立时钉死的单一站点。build_search_url 返回
+        绝对 URL，站点信息在参数里。
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        if self._session is None:
+            logger.warning(f"⚠️ Session 未就绪，跳过 search={keyword!r} page={page}")
+            return None
+
+        url = build_search_url(keyword, page, search_params or {})
+        referer = self._last_url or f"{self.AMAZON_BASE}/"
+        headers = self._build_headers(referer=referer)
+
+        try:
+            resp = await self._session.get(
+                url,
+                headers=headers,
+                max_recv_speed=max_recv_speed,
+            )
+            self._last_url = url
+            self._request_count += 1
+
+            # 与 fetch_seller_listing_page 同一条兜底：200 但体积过小 = 空壳页，
+            # 当作失败让上层重试，而不是当成"这个关键词没有结果"。
+            if resp.status_code == 200 and len(resp.content) < 1000:
+                logger.warning(
+                    f"⚠️ search={keyword!r} page={page} 响应体过短 ({len(resp.content)} bytes)，视为空页")
+                return None
+            return resp
+        except Exception as e:
+            logger.error(f"❌ 搜索页请求失败 keyword={keyword!r} page={page}: {e}")
             return None
 
     def is_ready(self) -> bool:

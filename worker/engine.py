@@ -11,6 +11,7 @@ Amazon 产品采集系统 v2 - Worker 采集引擎（流水线 + 自适应并发
 """
 import asyncio
 import argparse
+import json
 import logging
 import os
 import random
@@ -26,6 +27,7 @@ import httpx
 
 from common import config
 from common.core import error_types
+from common.core import searchurl
 from common.slowhash import SLOW_HASH_FIELDS
 from worker.proxy import get_proxy_manager
 from worker.session import AmazonSession
@@ -740,10 +742,30 @@ class Worker:
                     # 确保 AIMD 看到的 p50 延迟是真实的 HTTP 往返时间，而非含重试/等待的总任务时间。
                     self._active_task_count += 1
                     try:
-                        if task.get("task_type") == "discover_seller":
+                        # 任务分派。**必须显式列举**，不能让未知 task_type 落进
+                        # else 分支：那样一个新版 server 派下来的 discover_* 任务
+                        # 会被当成 ASIN 去采（"wireless mouse" 当 ASIN 请求
+                        # /dp/wireless%20mouse），拿到 404 之后走 not_found 通道
+                        # **写进 asin_data**——一条以关键词为 ASIN 的垃圾行，
+                        # 而且看起来完全正常。宁可当场判失败。
+                        task_type = task.get("task_type") or "asin"
+                        if task_type == "discover_seller":
                             await self._process_seller_task(task, slot)
-                        else:
+                        elif task_type == "discover_search":
+                            await self._process_search_task(task, slot)
+                        elif task_type == "asin":
                             await self._process_task(task, slot)
+                        else:
+                            logger.error(
+                                f"未知 task_type={task_type!r}（task_id={task.get('id')}）——"
+                                "这个 worker 比 server 旧，请升级 worker")
+                            await self._submit_result(
+                                task["id"], None, success=False,
+                                error_type=error_types.DISCOVER_FAILED,
+                                error_detail=f"worker 不认识 task_type={task_type!r}，需要升级",
+                                batch_id=task.get("batch_id"),
+                                lease_epoch=task.get("lease_epoch", 0),
+                            )
                     finally:
                         self._active_task_count = max(0, self._active_task_count - 1)
 
@@ -1892,6 +1914,247 @@ class Worker:
                 logger.warning(f"seller_result HTTP {resp.status_code} (尝试 {attempt+1}/3)")
             except Exception as e:
                 logger.error(f"seller_result 异常 (尝试 {attempt+1}/3): {type(e).__name__}: {e}")
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+        return False
+
+    # ═══════════════════════════════════════════════
+    # 关键词搜索发现任务（F-010：task_type='discover_search'）
+    # ═══════════════════════════════════════════════
+
+    async def _process_search_task(self, task: Dict, slot: "SessionSlot"):
+        """处理 discover_search 类型任务：按关键词翻页抓搜索结果并提交 ASIN 列表。
+
+        结构与 `_process_seller_task` 逐段对应（同样的 slot / 限流 / CAPTCHA 自解 /
+        失败通道），三处不同：
+
+        1. **翻页上限来自任务本身**（`task_meta.search.max_pages`），不是类常量。
+           关键词场景下"翻多少页"是用户的采集意图（前 3 页 vs 前 7 页差别很大），
+           卖家场景下则是"把店掏空"，只需要一个技术上限。
+        2. **每条结果带页号与页内名次**，落进 `search_discoveries.page_no/rank`。
+        3. **广告位可选丢弃**（`include_sponsored`，默认丢）。丢弃发生在
+           worker 侧而不是入库时 —— 广告位不入库就不会衍生详情任务，
+           省的是采集配额，不只是磁盘。
+        """
+        from worker.parser import parse_search_listing
+        keyword = (task["asin"] or "").strip()
+        task_id = task["id"]
+        lease_epoch = task.get("lease_epoch", 0)
+        batch_id = task.get("batch_id")
+        max_retries = self._max_retries
+
+        # 筛选参数：建批次时写进 task_meta 的 "search" 块。
+        # 读不出来就用空 dict —— build_search_url 对缺键有缺省，退化成"不带筛选
+        # 的裸关键词搜索"，比整条任务失败好。但要记一条 warning：静默降级正是
+        # 这个功能最难查的故障形态。
+        search_params: Dict = {}
+        raw_meta = task.get("task_meta")
+        if raw_meta:
+            try:
+                parsed_meta = json.loads(raw_meta) if isinstance(raw_meta, str) else raw_meta
+                if isinstance(parsed_meta, dict):
+                    search_params = parsed_meta.get("search") or {}
+            except Exception as e:
+                logger.warning(f"keyword={keyword!r} task_meta 解析失败，退化为无筛选搜索: {e}")
+        if not search_params:
+            logger.warning(f"keyword={keyword!r} 没有筛选参数，本次按裸关键词搜索")
+
+        max_pages = search_params.get("max_pages") or searchurl.DEFAULT_MAX_PAGES
+        try:
+            max_pages = max(1, min(int(max_pages), searchurl.MAX_PAGES_CAP))
+        except (TypeError, ValueError):
+            max_pages = searchurl.DEFAULT_MAX_PAGES
+        include_sponsored = bool(search_params.get("include_sponsored"))
+
+        all_items: List[Dict] = []
+        seen_asins = set()
+        pages_scanned = 0
+        sponsored_skipped = 0
+        truncated = False
+        last_error_type = error_types.NETWORK
+        last_error_detail = ""
+
+        page = 1
+        attempt = 0
+        while page <= max_pages:
+            try:
+                if not await slot.ensure_ready():
+                    attempt += 1
+                    if attempt >= max_retries:
+                        last_error_type = error_types.SESSION_NOT_READY
+                        break
+                    await asyncio.sleep(2)
+                    continue
+                session = slot.session
+
+                if self._rate_limiter:
+                    await self._rate_limiter.acquire()
+                await self._controller.acquire()
+                await self._apply_jitter()
+                recv_speed = self._calc_recv_speed()
+                req_start = time.time()
+                try:
+                    resp = await session.fetch_search_page(
+                        keyword, page=page, search_params=search_params,
+                        max_recv_speed=recv_speed
+                    )
+                    resp_bytes = len(resp.content) if resp and hasattr(resp, 'content') else 0
+                finally:
+                    req_elapsed = time.time() - req_start
+                    self._controller.release()
+
+                if resp is None:
+                    self._controller.record_result(req_elapsed, False, False, 0)
+                    attempt += 1
+                    if attempt >= max_retries:
+                        last_error_type = error_types.TIMEOUT
+                        last_error_detail = f"page={page} 多次超时"
+                        break
+                    await asyncio.sleep(2)
+                    continue
+
+                if session.is_blocked(resp):
+                    if session.is_captcha(resp):
+                        if await session.solve_captcha(resp):
+                            continue
+                    self._controller.record_result(req_elapsed, False, True, resp_bytes)
+                    attempt += 1
+                    self._stats["blocked"] += 1
+                    last_error_type = error_types.BLOCKED
+                    last_error_detail = f"page={page} HTTP {resp.status_code}"
+                    await slot.rotate(reason="搜索页被封")
+                    if attempt >= max_retries:
+                        break
+                    continue
+
+                if session.is_404(resp):
+                    # 搜索页返回 404 = 没有更多结果（边界，不是错误）
+                    last_error_type = ""
+                    break
+
+                parsed = parse_search_listing(resp.text)
+                page_info = parsed.get("page_info", "")
+                if page_info in ("captcha", "blocked"):
+                    self._controller.record_result(req_elapsed, False, True, resp_bytes)
+                    attempt += 1
+                    self._stats["blocked"] += 1
+                    last_error_type = error_types.BLOCKED
+                    last_error_detail = f"page={page} parse:{page_info}"
+                    await slot.rotate(reason=f"搜索页 {page_info}")
+                    if attempt >= max_retries:
+                        break
+                    continue
+
+                self._controller.record_result(req_elapsed, True, False, resp_bytes)
+                pages_scanned += 1
+
+                items = parsed.get("items", [])
+                added = 0
+                for it in items:
+                    if it.get("sponsored") and not include_sponsored:
+                        sponsored_skipped += 1
+                        continue
+                    a = it.get("asin")
+                    if a and a not in seen_asins:
+                        seen_asins.add(a)
+                        # 页号是 worker 才知道的（parser 只给页内名次）
+                        it["page"] = page
+                        all_items.append(it)
+                        added += 1
+                logger.info(
+                    f"keyword={keyword!r} page={page} 抓到 {added} 个新 ASIN，"
+                    f"累计 {len(seen_asins)}（跳过广告位 {sponsored_skipped}）")
+
+                if not parsed.get("has_next") or not items:
+                    break
+
+                page += 1
+                attempt = 0
+
+                slot.note_success()
+                if slot.should_rotate_proactive():
+                    await slot.rotate(reason="搜索翻页主动轮换")
+
+            except Exception as e:
+                attempt += 1
+                err_name = type(e).__name__
+                last_error_type = error_types.TIMEOUT if "timeout" in err_name.lower() else error_types.NETWORK
+                last_error_detail = f"page={page} {err_name}: {str(e)[:200]}"
+                logger.error(f"keyword={keyword!r} page={page} 异常 (尝试 {attempt}/{max_retries}): {e}")
+                if attempt >= max_retries:
+                    break
+                await asyncio.sleep(2)
+
+        if page > max_pages:
+            truncated = True
+
+        # 没有任何成功页 → 整个任务失败，走现有重试通道
+        if pages_scanned == 0:
+            logger.error(f"keyword={keyword!r} 全部失败，标记失败 [{last_error_type}]")
+            await self._submit_result(
+                task_id, None, success=False,
+                error_type=last_error_type or error_types.DISCOVER_FAILED,
+                error_detail=last_error_detail or "no page scanned",
+                batch_id=batch_id, lease_epoch=lease_epoch,
+            )
+            self._stats["failed"] += 1
+            self._stats["total"] += 1
+            return
+
+        meta = {
+            "pages_scanned": pages_scanned,
+            "truncated": truncated,
+            "sponsored_skipped": sponsored_skipped,
+        }
+        ok = await self._submit_search_result(
+            task_id=task_id,
+            keyword=keyword,
+            items=all_items,
+            meta=meta,
+            lease_epoch=lease_epoch,
+            batch_id=batch_id,
+        )
+        if ok:
+            self._stats["success"] += 1
+            logger.info(
+                f"✅ keyword={keyword!r} 完成: pages={pages_scanned} "
+                f"asins={len(all_items)} truncated={truncated}"
+            )
+        else:
+            self._stats["failed"] += 1
+            logger.error(f"keyword={keyword!r} 提交失败")
+        self._stats["total"] += 1
+
+    async def _submit_search_result(self, task_id: int, keyword: str,
+                                    items: List[Dict], meta: Dict,
+                                    lease_epoch: int, batch_id: Optional[int]) -> bool:
+        """直接 POST /api/tasks/search-result（每个关键词任务一次提交，同 F-009）。"""
+        url = f"{self.server_url}/api/tasks/search-result"
+        payload = {
+            "task_id": task_id,
+            "batch_id": batch_id,
+            "worker_id": self.worker_id,
+            "lease_epoch": lease_epoch,
+            "keyword": keyword,
+            "items": items,
+            "meta": meta,
+        }
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    resp = await client.post(url, json=payload)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("accepted"):
+                        self._stats["accepted"] += 1
+                        return True
+                    if data.get("stale"):
+                        self._stats["stale"] += 1
+                        logger.warning(f"search_result stale: task_id={task_id}")
+                        return False
+                logger.warning(f"search_result HTTP {resp.status_code} (尝试 {attempt+1}/3)")
+            except Exception as e:
+                logger.error(f"search_result 异常 (尝试 {attempt+1}/3): {type(e).__name__}: {e}")
             if attempt < 2:
                 await asyncio.sleep(2 ** attempt)
         return False

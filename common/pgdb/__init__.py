@@ -70,6 +70,9 @@ PUBLIC_API = (
     # 卖家（F-009）
     "create_seller_batch", "accept_seller_discovery_result",
     "get_seller_batch_progress",
+    # 关键词搜索（F-010）—— 与上面三件套逐条同构，见 media.py
+    "create_search_batch", "accept_search_discovery_result",
+    "get_search_batch_progress",
     # 结果写入
     "accept_success_result", "accept_results_batch", "accept_failed_result",
     "_save_result_inner_unlocked", "save_result", "save_results_batch",

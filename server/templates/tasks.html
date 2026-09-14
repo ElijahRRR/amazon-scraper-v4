@@ -101,6 +101,100 @@
     </div>
 </div>
 
+<!-- F-010: 按关键词采集 -->
+<div class="card mb-4">
+    <div class="card-header"><i class="bi bi-search"></i> 按关键词采集 <small class="text-secondary">（搜索结果自动翻页发现 ASIN，可设价格区间与配送方式）</small></div>
+    <div class="card-body">
+        <form id="keywordForm">
+            <div class="row g-3 mb-3">
+                <div class="col-md-12">
+                    <label class="form-label">关键词（每行一个，或用逗号分隔）</label>
+                    <textarea class="form-control" name="keywords" id="kwKeywords" rows="3"
+                              placeholder="wireless mouse&#10;usb c hub&#10;mechanical keyboard" required></textarea>
+                </div>
+            </div>
+            <div class="row g-3 mb-3">
+                <div class="col-md-2">
+                    <label class="form-label">最低价</label>
+                    <input type="number" step="0.01" min="0" class="form-control" id="kwMinPrice" placeholder="不限">
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label">最高价</label>
+                    <input type="number" step="0.01" min="0" class="form-control" id="kwMaxPrice" placeholder="不限">
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label">配送方式</label>
+                    <select class="form-select" id="kwDelivery">
+                        <option value="" selected>不限</option>
+                    </select>
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label">排序</label>
+                    <select class="form-select" id="kwSort">
+                        <option value="" selected>默认（相关度）</option>
+                    </select>
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label">翻页上限</label>
+                    <input type="number" min="1" class="form-control" id="kwMaxPages" value="7">
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label">站点</label>
+                    <select class="form-select" id="kwDomain"></select>
+                </div>
+            </div>
+            <div class="row g-3 mb-3">
+                <div class="col-md-3">
+                    <label class="form-label">批次名称（可选）</label>
+                    <input type="text" class="form-control" id="kwBatchName" placeholder="自动生成 keywords_xxx">
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">配送邮编</label>
+                    <input type="text" class="form-control" id="kwZip"
+                           value="{{ default_zip_code }}" placeholder="10001">
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">采集深度</label>
+                    <select class="form-select" id="kwDiscoverMode">
+                        <option value="with_detail" selected>发现 ASIN + 抓详情</option>
+                        <option value="discover_only">仅发现 ASIN（不抓详情）</option>
+                    </select>
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label" title="原样拼进 Amazon 的 rh= 参数，用于本页没预置的筛选（品牌/类目/评分…）">
+                        高级筛选 rh（可选）
+                    </label>
+                    <input type="text" class="form-control" id="kwRhExtra" placeholder="如 p_72:1248879011">
+                </div>
+            </div>
+            <div class="d-flex justify-content-between align-items-center">
+                <div class="d-flex align-items-center gap-3">
+                    <small class="text-secondary">
+                        搜索页只有 ASIN/标题/价格/缩略图，详情由 worker 队列另采
+                    </small>
+                    <div class="form-check form-switch">
+                        <input class="form-check-input" type="checkbox" id="kwSponsored">
+                        <label class="form-check-label small" for="kwSponsored"
+                               title="默认丢弃广告位：它们每次请求都不同，且会挤掉自然位配额">
+                            <i class="bi bi-megaphone"></i> 保留广告位结果
+                        </label>
+                    </div>
+                    <div class="form-check form-switch">
+                        <input class="form-check-input" type="checkbox" id="kwScreenshot">
+                        <label class="form-check-label small" for="kwScreenshot">
+                            <i class="bi bi-camera"></i> 详情阶段开启截图
+                        </label>
+                    </div>
+                </div>
+                <button type="submit" class="btn btn-accent" id="kwSubmitBtn">
+                    <i class="bi bi-search"></i> 开始采集
+                </button>
+            </div>
+        </form>
+        <div id="kwResult" class="mt-3" style="display:none;"></div>
+    </div>
+</div>
+
 <!-- 批次列表 -->
 <div class="card">
     <div class="card-header d-flex justify-content-between align-items-center">
@@ -293,6 +387,155 @@ document.getElementById('sellerUploadForm').addEventListener('submit', async (e)
     }
     btn.disabled = false;
     btn.innerHTML = '<i class="bi bi-shop"></i> 开始发现';
+});
+
+// F-010: 按关键词采集
+//
+// 配送方式/排序/站点三个下拉不写死在模板里，而是拉 /api/search-options ——
+// delivery 背后是 Amazon 的 refinement 节点 ID，按站点不同且会随改版变化
+// （见 common/core/searchurl 头注）。写死在前端的话，改配置还要发版；
+// 更糟的是站点切换后会留下一个该站点根本不存在的选项，选了它 Amazon 静默
+// 忽略 —— 采回一批没筛过的数据，而没有任何一侧会报错。
+async function loadSearchOptions(domain) {
+    const url = '/api/search-options' + (domain ? ('?domain=' + encodeURIComponent(domain)) : '');
+    const resp = await fetch(url);
+    if (!resp.ok) return;
+    const opt = await resp.json();
+
+    const domainSel = document.getElementById('kwDomain');
+    if (!domainSel.options.length) {
+        opt.domains.forEach(d => {
+            const o = document.createElement('option');
+            o.value = d; o.textContent = d;
+            if (d === opt.domain) o.selected = true;
+            domainSel.appendChild(o);
+        });
+    }
+
+    const delSel = document.getElementById('kwDelivery');
+    const keepDelivery = delSel.value;
+    delSel.innerHTML = '';
+    const anyOpt = document.createElement('option');
+    anyOpt.value = ''; anyOpt.textContent = '不限';
+    delSel.appendChild(anyOpt);
+    const DELIVERY_LABELS = {
+        prime: 'Prime 资格',
+        free_shipping: '免运费',
+        sold_by_amazon: 'Amazon 自营',
+        get_it_today: '当日达',
+    };
+    opt.delivery.forEach(d => {
+        const o = document.createElement('option');
+        o.value = d; o.textContent = DELIVERY_LABELS[d] || d;
+        if (d === keepDelivery) o.selected = true;
+        delSel.appendChild(o);
+    });
+    if (!opt.delivery.length) {
+        anyOpt.textContent = '不限（该站点未配置配送筛选）';
+    }
+
+    const sortSel = document.getElementById('kwSort');
+    if (sortSel.options.length <= 1) {
+        const SORT_LABELS = {
+            relevance: '相关度', price_asc: '价格从低到高', price_desc: '价格从高到低',
+            newest: '最新上架', review_rank: '评价最好', featured: '精选',
+        };
+        opt.sort.forEach(s => {
+            if (s === 'relevance') return;  // 与"默认"重复
+            const o = document.createElement('option');
+            o.value = s; o.textContent = SORT_LABELS[s] || s;
+            sortSel.appendChild(o);
+        });
+    }
+
+    const pagesInput = document.getElementById('kwMaxPages');
+    pagesInput.max = opt.max_pages_cap;
+    pagesInput.title = `上限 ${opt.max_pages_cap} 页`;
+}
+
+document.getElementById('kwDomain').addEventListener('change', (e) => {
+    loadSearchOptions(e.target.value);
+});
+loadSearchOptions();
+
+document.getElementById('keywordForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = document.getElementById('kwSubmitBtn');
+    const resultDiv = document.getElementById('kwResult');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> 提交中...';
+
+    // 空字符串一律送 null 而不是 ""：服务端把 "" 当"没填"，但把 0 当"填了 0"，
+    // 两者不能混。数字框留空时 .value 是 ""，parseFloat("") 是 NaN，
+    // 直接送 NaN 会被 JSON.stringify 变成 null —— 结果对，路径不清晰，所以显式判。
+    const num = (id) => {
+        const v = document.getElementById(id).value.trim();
+        return v === '' ? null : parseFloat(v);
+    };
+    const str = (id) => {
+        const v = document.getElementById(id).value.trim();
+        return v === '' ? null : v;
+    };
+
+    const payload = {
+        keywords: document.getElementById('kwKeywords').value,
+        min_price: num('kwMinPrice'),
+        max_price: num('kwMaxPrice'),
+        delivery: str('kwDelivery'),
+        sort: str('kwSort'),
+        rh_extra: str('kwRhExtra'),
+        max_pages: parseInt(document.getElementById('kwMaxPages').value, 10) || 7,
+        domain: str('kwDomain'),
+        discover_mode: document.getElementById('kwDiscoverMode').value,
+        zip_code: str('kwZip'),
+        batch_name: str('kwBatchName'),
+        needs_screenshot: document.getElementById('kwScreenshot').checked,
+        include_sponsored: document.getElementById('kwSponsored').checked,
+    };
+
+    try {
+        const resp = await fetch('/api/search-batches', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        // ⚠ 只在成功分支读 json：resp.body 只能读一次，失败分支要留给
+        // apiErrText 自己去读（它对非 JSON 响应也有兜底）。
+        const data = resp.ok ? await resp.json() : null;
+        resultDiv.style.display = 'block';
+        resultDiv.innerHTML = '';
+        const alertDiv = document.createElement('div');
+        if (resp.ok) {
+            alertDiv.className = 'alert alert-success';
+            const modeLabel = data.discover_mode === 'with_detail' ? '发现+抓详情' : '仅发现';
+            const batchSpan = document.createElement('strong');
+            batchSpan.textContent = data.batch_name;
+            alertDiv.append(
+                '✅ 已创建关键词批次: ', batchSpan,
+                `，模式: ${modeLabel}，${parseInt(data.total_keywords)} 个关键词，` +
+                `插入 ${parseInt(data.inserted_tasks)} 个发现任务`
+            );
+            resultDiv.appendChild(alertDiv);
+            setTimeout(() => location.reload(), 1500);
+        } else {
+            alertDiv.className = 'alert alert-danger';
+            // 走 base.html 的 window.apiErrText（PR #18 引入的统一写法）：
+            // 它认 message/detail/error 三种键并带上状态码。自己读 data.detail
+            // 的话，401（ADMIN_TOKEN 拦下）这类**没有 detail 键**的响应会显示
+            // "undefined"，用户完全看不出是鉴权问题。
+            alertDiv.textContent = '❌ ' + await window.apiErrText(resp);
+            resultDiv.appendChild(alertDiv);
+        }
+    } catch(err) {
+        resultDiv.style.display = 'block';
+        resultDiv.innerHTML = '';
+        const alertDiv = document.createElement('div');
+        alertDiv.className = 'alert alert-danger';
+        alertDiv.textContent = '❌ 网络错误: ' + err.message;
+        resultDiv.appendChild(alertDiv);
+    }
+    btn.disabled = false;
+    btn.innerHTML = '<i class="bi bi-search"></i> 开始采集';
 });
 
 async function retryBatch(ev, name) {

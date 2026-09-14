@@ -1,0 +1,210 @@
+/* popup 的样式。刻意不引任何外部资源 —— 扩展页面的 CSP 默认禁止远程加载，
+   而且离线可用是插件该有的样子。 */
+
+:root {
+  --bg: #ffffff;
+  --fg: #1c1f23;
+  --muted: #6b7280;
+  --border: #e3e6ea;
+  --panel: #f7f8fa;
+  --primary: #2563eb;
+  --accent: #0f9d58;
+  --danger: #d93025;
+  --warn-bg: #fff4e5;
+  --warn-fg: #8a5300;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1b1d20;
+    --fg: #e8eaed;
+    --muted: #9aa0a6;
+    --border: #34383d;
+    --panel: #24272b;
+    --warn-bg: #3a2c14;
+    --warn-fg: #f0c078;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  width: 340px;
+  margin: 0;
+  padding: 12px;
+  font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.brand { font-weight: 600; }
+
+.link {
+  color: var(--primary);
+  text-decoration: none;
+  font-size: 12px;
+}
+.link:hover { text-decoration: underline; }
+
+.badge {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.badge-list    { background: #e3edff; color: #1a4fbd; }
+.badge-seller  { background: #e2f6ea; color: #0b6b3a; }
+.badge-detail  { background: #fdf0e0; color: #96560a; }
+.badge-unknown { background: var(--panel); color: var(--muted); }
+
+.meta {
+  color: var(--muted);
+  font-size: 12px;
+  margin-bottom: 10px;
+  word-break: break-all;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px;
+  margin-bottom: 10px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.row.indent { justify-content: flex-start; padding-left: 22px; }
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+  cursor: pointer;
+}
+
+input[type="number"] {
+  width: 60px;
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.btn {
+  display: block;
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  color: #fff;
+}
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+.btn-primary { background: var(--primary); }
+.btn-accent  { background: var(--accent); }
+.btn-danger  { background: var(--danger); }
+.btn-plain   { background: transparent; color: var(--muted); border-color: var(--border); }
+
+.btn-row { display: flex; gap: 8px; }
+.btn-row .btn { flex: 1; }
+
+.hint {
+  color: var(--muted);
+  font-size: 11.5px;
+  margin-top: 6px;
+}
+
+.warn {
+  margin-top: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--warn-bg);
+  color: var(--warn-fg);
+  font-size: 11.5px;
+}
+
+.queue {
+  list-style: none;
+  margin: 0 0 8px;
+  padding: 0;
+  max-height: 150px;
+  overflow-y: auto;
+}
+.queue li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.queue li:last-child { border-bottom: none; }
+.queue .q-asin { font-family: ui-monospace, Menlo, monospace; }
+.queue .q-title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+}
+.queue .q-seller { color: var(--accent); font-size: 11px; }
+.queue .q-del {
+  border: none;
+  background: none;
+  color: var(--danger);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.status {
+  padding: 7px 9px;
+  border-radius: 6px;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.status.ok   { background: #e2f6ea; color: #0b6b3a; }
+.status.err  { background: #fde8e6; color: #a3251c; }
+.status.busy { background: var(--panel); color: var(--muted); }
+
+.hidden { display: none !important; }
+
+/* ──────────────────────────────────────────────────────────────
+   面板模式（同一份 popup.html 被 content.js 用 iframe 装在页面右侧）
+   ──────────────────────────────────────────────────────────────
+   差别只有尺寸：弹窗是浏览器给的固定 340px 小窗，面板要撑满 iframe
+   的高度并能滚动。功能与结构一字不改 —— 那正是复用同一份的意义。 */
+body.in-panel {
+  width: auto;
+  min-height: 100%;
+  padding: 12px 14px 20px;
+}
+
+/* 面板里队列可以给更多高度：它不像弹窗那样受浏览器窗口高度限制。 */
+body.in-panel .queue { max-height: 260px; }

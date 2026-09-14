@@ -167,12 +167,19 @@ common.pgdb` 直接炸。多重继承下重复定义不会报错、只会被 MRO
 `iter_results` (2344，**async generator**) · `get_total_asins` (2464) ·
 `get_all_asins` (2468) · `get_change_stats` (2476)
 
-### media.py（10 项）— MediaMixin · agent G
+### media.py（13 项）— MediaMixin · agent G
 `get_pending_screenshots` (2291) · `update_screenshot_status` (2298) ·
 `get_screenshot_progress` (2333) · `_get_done_screenshot_path` (2008) ·
 `_get_done_screenshot_paths` (2033) · `_hydrate_screenshot_paths` (2071) ·
 `create_seller_batch` (1443) · `accept_seller_discovery_result` (1500) ·
-`get_seller_batch_progress` (1616) · `expand_batch_variants` (851)
+`get_seller_batch_progress` (1616) · `expand_batch_variants` (851) ·
+`create_search_batch` · `accept_search_discovery_result` ·
+`get_search_batch_progress`
+
+后三项是 F-010 关键词采集，**两个后端同批新增**（不是从 SQLite 移植过来的），
+所以没有 `common/database.py` 的行号可标 —— 那一列的意义是"移植自哪一行"，
+新增的方法填不出来也不该编一个。它们与 F-009 那三项逐条同构，
+差异只有三处（筛选参数下发 / task_meta 合并 / 发现表多三列），见 media.py 的节头注。
 
 ### 跨文件欠账（先声明，谁都不用等谁）
 ```
