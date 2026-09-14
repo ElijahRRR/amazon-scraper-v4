@@ -54,6 +54,31 @@ PUBLIC_BASE_PATH = os.environ.get("PUBLIC_BASE_PATH", "").strip().rstrip("/")
 # 读侧连接池大小（写侧是**一条专用连接**，见 common/pgdb/pool.py 的决策 D-2）。
 PG_POOL_MIN = int(os.environ.get("PG_POOL_MIN", "2"))
 PG_POOL_MAX = int(os.environ.get("PG_POOL_MAX", "10"))
+# 变动检测总开关。**默认关闭**（2026-09）。
+#
+# 它做的事：每次保存采集结果时，把这次的值和 baseline（上一次**定时采集**的
+# 数据）比对，发现差异就往 `asin_changes` 插一行，分 price_stock / title_bullets
+# / new 三类。
+#
+# 为什么默认关掉：这套数据在本部署**没有消费方**。唯一还在读它的是采集结果页
+# 那个「变动筛选」下拉框（本轮一并拆掉）；对外契约的增量导出
+# （`/api/export/incremental`）走的是 `scraper.scrape_events` 事件流，与它无关。
+#
+# 关掉省下什么（都发生在**写锁内**，而写锁是这个项目的瓶颈）：
+#   * 每次保存少一次 baseline 比对；
+#   * 有变动时少 1~2 条 INSERT；
+#   * `asin_changes` 不再增长（线上曾约 140 万行），它的持续写入会不断把
+#     可见性图打脏 —— 那正是 `COUNT(*)` 从 78ms 退化到 683ms 的推手之一。
+#
+# ⚠ 关掉**不删表、不删端点**：`asin_changes` 表、`GET /api/changes/stats`、
+#   `/api/results?change_filter=` 三者全部保留（对外契约 §3.2 只许加不许删），
+#   只是不再产生新行。存量行需要手工清，见 README「清空变动记录」。
+#
+# 设 CHANGE_DETECTION_ENABLED=1 可以重新打开（需重启）。tests 里靠
+# monkeypatch 这个属性来继续覆盖检测逻辑，所以代码路径不会腐烂。
+CHANGE_DETECTION_ENABLED = os.environ.get(
+    "CHANGE_DETECTION_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+
 # 单条语句超时（秒）。导出会长时间占用连接，别设得太小。
 PG_COMMAND_TIMEOUT = float(os.environ.get("PG_COMMAND_TIMEOUT", "60"))
 EXPORT_DIR = os.path.join(PROJECT_DIR, "data", "exports")
@@ -258,6 +283,7 @@ HEADER_MAP = {
     # 既拼进「商品标题」也单独成列。少了这一行，导出表头会直接写
     # 英文键名 `subtitle`（_get_export_headers 的 `HEADER_MAP.get(f, f)` 兜底）。
     "subtitle": "副标题",
+    "offer_condition": "品相",
 }
 
 EXPORT_COLUMN_ORDER = [

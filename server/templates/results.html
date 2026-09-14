@@ -16,15 +16,6 @@
                     <option value="">全部批次</option>
                 </select>
             </div>
-            <div class="col-md-2">
-                <label class="form-label">变动筛选</label>
-                <select id="changeFilter" class="form-select">
-                    <option value="all">全部 ASIN</option>
-                    <option value="price_stock">价格/库存变动</option>
-                    <option value="title_bullets">标题/五点描述变动</option>
-                    <option value="new">新增 ASIN</option>
-                </select>
-            </div>
             <div class="col-md-3">
                 <label class="form-label">搜索（支持批量，换行或逗号分隔）</label>
                 <textarea id="searchInput" class="form-control" rows="1" placeholder="ASIN / 标题 / 品牌，多个用换行或逗号分隔"
@@ -168,7 +159,6 @@ const esc = s => {
 let state = {
     batchId: null,
     search: '',
-    changeFilter: 'all',
     nextCursor: null,
     prevCursor: null,
     cursorStack: [],
@@ -182,7 +172,6 @@ let state = {
     totalIsEstimate: false,
 };
 
-const CHANGE_FILTERS = ['all', 'price_stock', 'title_bullets', 'new'];
 
 // URL <-> 筛选状态。
 //
@@ -195,8 +184,9 @@ function readFiltersFromUrl() {
     const bid = q.get('batch_id');
     // 只认纯数字：后面要用它和 <option value> 做 == 比较，也要拼进 API 查询串
     if (bid && /^\d+$/.test(bid)) state.batchId = bid;
-    const cf = q.get('change_filter');
-    if (cf && CHANGE_FILTERS.includes(cf)) state.changeFilter = cf;
+    // change_filter 的 UI 已于 2026-09 下线（变动检测默认关闭，见 config.py
+    // 的 CHANGE_DETECTION_ENABLED）。服务端**仍然接受**这个参数，只是本页不再
+    // 读写它 —— 端点参数是对外契约，不能因为控制台不用了就删。
     const sq = q.get('search');
     if (sq) state.search = normalizeSearch(sq);
 }
@@ -205,7 +195,6 @@ function readFiltersFromUrl() {
 function syncUrl() {
     const q = new URLSearchParams();
     if (state.batchId) q.set('batch_id', state.batchId);
-    if (state.changeFilter && state.changeFilter !== 'all') q.set('change_filter', state.changeFilter);
     if (state.search) q.set('search', state.search);
     const qs = q.toString();
     history.replaceState(null, '', qs ? `${location.pathname}?${qs}` : location.pathname);
@@ -228,7 +217,6 @@ function resetPaging() {
 // 初始化
 document.addEventListener('DOMContentLoaded', async () => {
     readFiltersFromUrl();
-    document.getElementById('changeFilter').value = state.changeFilter;
     document.getElementById('searchInput').value = state.search;
 
     // ⚠ 必须**先 await** loadBatches()：它会重建整个 <select> 的 <option>，
@@ -257,13 +245,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         loadResults();
     });
 
-    document.getElementById('changeFilter').addEventListener('change', () => {
-        state.changeFilter = document.getElementById('changeFilter').value;
-        resetPaging();
-        clearFilterNotice();
-        syncUrl();
-        loadResults();
-    });
 
     // ⚠ #searchInput 是 <textarea>（要支持"换行或逗号分隔"的批量粘贴），
     // 所以回车会先把 '\n' 插进 value，keyup 才触发。原来直接把 e.target.value
@@ -324,7 +305,6 @@ async function loadResults(cursor = null, direction = 'next') {
     // 批量搜索：换行/逗号分隔 → 逗号连接
     const rawSearch = document.getElementById('searchInput').value.trim();
     state.search = rawSearch.split(/[\n,]+/).map(s => s.trim()).filter(s => s).join(',');
-    state.changeFilter = document.getElementById('changeFilter').value;
 
     // 只要这张表真正渲染的列。默认的 SELECT d.* 是 56 列，其中
     // bullet_points / image_urls / long_description 这三个大块头这张表一个都
@@ -345,7 +325,7 @@ async function loadResults(cursor = null, direction = 'next') {
     // sort=recent = 「最近采的排前面」。服务端默认是 sort=id（首次入库倒序），
     // 那个默认不能动 —— 游标语义是对外契约，改默认会让老调用方拿着同一个游标
     // 翻出语义完全不同的一页。所以由前端显式要。
-    let url = `/api/results?limit=50&change_filter=${state.changeFilter}&direction=${direction}`
+    let url = `/api/results?limit=50&direction=${direction}`
             + `&fields=${UI_FIELDS}&sort=recent`;
     if (!needTotal) url += '&with_total=false';
     if (state.batchId) url += `&batch_id=${state.batchId}`;
@@ -548,9 +528,7 @@ async function openExportModal() {
     // 显示导出范围
     const batchSel = document.getElementById('batchFilter');
     const batchText = batchSel.options[batchSel.selectedIndex]?.text || '全部';
-    const filterSel = document.getElementById('changeFilter');
-    const filterText = filterSel.options[filterSel.selectedIndex]?.text || '全部';
-    document.getElementById('exportScope').textContent = `${batchText} / ${filterText}`;
+    document.getElementById('exportScope').textContent = batchText;
 
     // 渲染字段复选框
     const saved = JSON.parse(localStorage.getItem('export_fields') || 'null');
@@ -604,7 +582,7 @@ async function doExport() {
         url = '/api/export/all';
     }
 
-    url += `?format=${format}&change_filter=${state.changeFilter}&fields=${selected.join(',')}`;
+    url += `?format=${format}&fields=${selected.join(',')}`;
     bootstrap.Modal.getInstance(document.getElementById('exportModal'))?.hide();
     window.open(url, '_blank');
 }
