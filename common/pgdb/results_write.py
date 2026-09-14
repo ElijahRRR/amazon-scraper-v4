@@ -134,6 +134,7 @@ from __future__ import annotations
 
 import logging
 import time
+from common import config
 from common.core.timeutil import now_ts
 from typing import List
 
@@ -616,7 +617,12 @@ class ResultsWriteMixin:
             # 两条假变动（实测，见文件头第 2/3 条）。title_bullets 那条现在已经
             # 被"不算哈希"消掉了（空 hash 走 `bl_tb_hash and new_tb_hash` 短路），
             # 价格那条只能在这里拦。
-            if has_baseline and not not_found:
+            # ⚠ 读 `config.CHANGE_DETECTION_ENABLED` 用的是**属性访问**（不是
+            #   `from ... import CHANGE_DETECTION_ENABLED`）—— 后者会在导入时把值
+            #   定死，测试就没法 monkeypatch 它把检测打开。默认关闭之后，这个
+            #   代码路径在生产上不再执行，唯一还在覆盖它的就是那几条把开关拨到
+            #   True 的用例；写成 import 常量的话它们会静默失效，逻辑随后腐烂。
+            if config.CHANGE_DETECTION_ENABLED and has_baseline and not not_found:
                 # 1. 价格/库存变动（对比 baseline）
                 price_change = _compare_price(bl_price, data.get("current_price"))
                 buybox_change = _compare_price(bl_buybox, data.get("buybox_price"))

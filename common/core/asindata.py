@@ -144,6 +144,15 @@ ASIN_DATA_FIELDS = [
     # tests/test_asin_data_field_table_guard.py 逐位比对。新列只能落在末尾，
     # 理由见 DDL 里的注释（老库靠 ALTER 追加）。
     "subtitle",
+    # 2026-09：buybox offer 的品相（"Used - Like New" / "Used - Very Good" /
+    # "Used - Acceptable" / "Renewed" 等；全新或读不到时为 "N/A"）。
+    #
+    # ⚠ 名字是 offer_condition 而不是 condition，两个理由：
+    #   1. 语义 —— 它描述的是**这次采集时 buybox 胜出的那个 offer**，不是 ASIN
+    #      的固有属性。同一个 ASIN 上可以同时挂全新和二手 offer，buybox 换人
+    #      这个值就变。读的人必须知道它会变。
+    #   2. CONDITION 是 SQL 标准保留字（PG 里恰好非保留，但 SQLite/未来迁移不保证）。
+    "offer_condition",
 ]
 
 # asin_data 合法列名集合（含内部列）：iter_results 收窄投影时用作白名单，

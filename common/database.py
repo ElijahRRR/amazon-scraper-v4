@@ -334,7 +334,10 @@ class Database:
                 -- 下面那条 ALTER 升级，而 ALTER 只能追加到末尾。插在 title 后面
                 -- 会让新建库与升级库的物理列序分叉，而 `SELECT d.*` 没有
                 -- response_model，列序整个泄进 erpAPI 的响应。
-                subtitle TEXT
+                subtitle TEXT,
+                -- 2026-09：buybox offer 的品相。**新的最后一列** —— 上面那段
+                -- "必须是最后一列"的警告现在指向这一行。
+                offer_condition TEXT
             );
 
             -- 变动记录表（预计算，按类型索引，支持高效筛选）
@@ -513,8 +516,9 @@ class Database:
             except Exception:
                 pass
 
-        # 迁移：asin_data 表添加副标题（2026-08 Amazon Title Differentiators）
-        for col in ["subtitle"]:
+        # 迁移：asin_data 表追加列（2026-08 副标题 / 2026-09 buybox 品相）。
+        # 逐列 try/except：已存在就 pass，所以重复启动安全。
+        for col in ["subtitle", "offer_condition"]:
             try:
                 await self._db.execute(f"ALTER TABLE asin_data ADD COLUMN {col} TEXT")
                 logger.info(f"数据库迁移: asin_data 表新增 {col} 列")
@@ -1964,7 +1968,12 @@ class Database:
             bl_tb_hash = existing_dict.get("baseline_title_bullets_hash")
             has_baseline = bl_price is not None  # baseline 存在才做变动检测
 
-            if has_baseline:
+            # ⚠ 读 `config.CHANGE_DETECTION_ENABLED` 用的是**属性访问**（不是
+            #   `from ... import CHANGE_DETECTION_ENABLED`）—— 后者会在导入时把值
+            #   定死，测试就没法 monkeypatch 它把检测打开。默认关闭之后，这个
+            #   代码路径在生产上不再执行，唯一还在覆盖它的就是那几条把开关拨到
+            #   True 的用例；写成 import 常量的话它们会静默失效，逻辑随后腐烂。
+            if config.CHANGE_DETECTION_ENABLED and has_baseline:
                 # 1. 价格/库存变动（对比 baseline）
                 price_change = _compare_price(bl_price, data.get("current_price"))
                 buybox_change = _compare_price(bl_buybox, data.get("buybox_price"))

@@ -472,6 +472,10 @@ class AmazonParser:
         seller_id, seller_name = self._parse_seller(tree, html_text)
         result["seller_id"] = seller_id
         result["seller_name"] = seller_name
+        # buybox offer 的品相（二手/翻新）。放在 seller 之后 —— 两者同源于
+        # buybox 区域，而品相要用到已解析好的 title 做翻新品兜底。
+        result["offer_condition"] = self._parse_offer_condition(
+            tree, result.get("title") or "")
 
         return result
 
@@ -1330,6 +1334,10 @@ class AmazonParser:
         seller_id, seller_name = self._parse_seller(tree, html_text)
         result["seller_id"] = seller_id
         result["seller_name"] = seller_name
+        # buybox offer 的品相（二手/翻新）。放在 seller 之后 —— 两者同源于
+        # buybox 区域，而品相要用到已解析好的 title 做翻新品兜底。
+        result["offer_condition"] = self._parse_offer_condition(
+            tree, result.get("title") or "")
 
         return result
 
@@ -1481,6 +1489,82 @@ class AmazonParser:
         return "N/A"
 
     # ==================== 卖家店铺 ID + 名 ====================
+
+    #: Amazon 的品相词表（**规范拼写**）。
+    #:
+    #: ⚠ 关于顺序：四个 Used 等级的正则是**互斥**的（实测 'used - very good'
+    #:   只命中 "Used - Very Good" 一条 —— `used\s*[-–—:]\s*good` 要求破折号后
+    #:   紧跟 good，吃不下中间的 "very"），所以等级之间**不存在**谁先谁后的问题。
+    #:   顺序唯一起作用的场合是**同一段文本里出现多个不同品相**（例如 buybox 写
+    #:   "Used - Very Good" 而页面别处又有 "Renewed"）：那时先匹配到的赢，
+    #:   具体的 Used 等级因此排在泛化的 Renewed/Refurbished 之前。
+    #:   test_specific_used_grade_beats_generic_renewed 钉的就是这一条。
+    #: 只认这张表里的字面量 —— 宁可返回 "N/A" 也不要把 "15 used & new offers"
+    #: 里那个 used 当成品相（那是"其他卖家"的计数文案，不是本 offer 的品相）。
+    _CONDITION_PATTERNS = (
+        ("Used - Like New",   r"used\s*[-–—:]\s*like\s+new"),
+        ("Used - Very Good",  r"used\s*[-–—:]\s*very\s+good"),
+        ("Used - Good",       r"used\s*[-–—:]\s*good"),
+        ("Used - Acceptable", r"used\s*[-–—:]\s*acceptable"),
+        ("Collectible",       r"collectible\s*[-–—:]"),
+        ("Open Box",          r"\bopen\s*box\b"),
+        ("Renewed",           r"\brenewed\b"),
+        ("Refurbished",       r"\brefurbished\b"),
+    )
+
+    #: 只在这几个容器里找品相。**故意不含 `#rightCol`**：那一栏里有
+    #: "12 used & new from $X" / "Buy used: $20.70" 这类文案，泛扫必然误判。
+    _CONDITION_SCOPES = (
+        # Amazon 二手 listing 的专用品相行，最可靠
+        ('#condition-and-price-row', '//*[@id="condition-and-price-row"]'),
+        ('#usedBuySection', '//*[@id="usedBuySection"]'),
+        # buybox 本体（新版/旧版两种布局）
+        ('#desktop_buybox', '//*[@id="desktop_buybox"]'),
+        ('#buybox', '//*[@id="buybox"]'),
+        ('#tabular-buybox', '//*[@id="tabular-buybox"]'),
+    )
+
+    def _parse_offer_condition(self, tree, title: str = "") -> str:
+        """buybox offer 的品相；判不出来返回 "N/A"（**不猜**）。
+
+        语义：描述的是**这次采集时 buybox 胜出的那个 offer**，不是 ASIN 的固有
+        属性。同一 ASIN 上可以同时挂全新与二手 offer，buybox 换人这个值就变 ——
+        所以它是一个观测值，不是产品属性。
+
+        两类来源，性质不同，都要：
+
+        1. **DOM 品相行** —— 同 ASIN 的二手 offer（如卖家 "Amazon Resale"，即原
+           Amazon Warehouse 的退货/开箱件）。标题里**没有**任何二手标记，只能从
+           buybox 区域读。这是漏网的大头。
+        2. **标题里的 (Renewed) / (Refurbished)** —— 亚马逊给翻新品**单独的
+           ASIN**，是产品属性，不随 buybox 变。标题就能判。
+
+        ⚠ 可靠性说明（写给下一个人）：上面那几个容器 id 来自 Amazon 已知的 DOM
+          结构，但**没有拿真实二手页面验证过** —— 开发沙箱里没有 Amazon 的访问
+          通道，库里也只存 PNG 截图、不存 HTML，没有可回放的语料。
+          单元测试覆盖的是"给定这样的 HTML 应当得出什么"，不是"Amazon 今天真的
+          长这样"。所以：
+            * 取不到一律 "N/A"，绝不编造 —— 误判成 "New" 比留空危险得多；
+            * 第一次上线后请拿一个已知二手 ASIN 实测一次（README 有命令）；
+            * 结构变了只会退回 "N/A"（静默变空），不会串味成别的品相。
+        """
+        # 1) DOM：只在白名单容器里找
+        for css, xp in self._CONDITION_SCOPES:
+            blob = (self._uni_first_text(tree, css, xp) or "").lower()
+            if not blob:
+                continue
+            for canonical, pat in self._CONDITION_PATTERNS:
+                if re.search(pat, blob):
+                    return canonical
+
+        # 2) 标题：翻新品的独立 ASIN。放在 DOM 之后 —— DOM 说的是本次 offer，
+        #    比标题这个产品级标记更具体。
+        t = (title or "").lower()
+        for canonical, pat in self._CONDITION_PATTERNS:
+            if canonical in ("Renewed", "Refurbished") and re.search(pat, t):
+                return canonical
+
+        return "N/A"
 
     def _parse_seller(self, tree, html_text: str = "") -> Tuple[str, str]:
         """返回 (seller_id, seller_name)。
@@ -1798,6 +1882,7 @@ class AmazonParser:
             "review_count": "N/A",
             "seller_id": "N/A",
             "seller_name": "N/A",
+            "offer_condition": "N/A",
         }
 
     # ============ 引擎无关原语（P4-2 / P4-6 两条路径共用同一份逻辑）============

@@ -132,9 +132,38 @@ async def test_save_results_batch_counts_only_saved(db):
 
 
 # ==================== 变动检测 ====================
+#
+# 2026-09：`config.CHANGE_DETECTION_ENABLED` 默认已改为 **False**（本部署没有
+# 消费方，代价全在写锁内）。下面这一族是**检测逻辑的既有守卫**，必须继续覆盖
+# 那条路径 —— 生产上不再执行的代码如果没人测，它会在后续重构里静默腐烂，等哪天
+# 想重新打开时已经坏了。
+#
+# 所以这里提供一个夹具把开关拨回 True，而**不是**把用例删掉或改成断言"什么都
+# 没发生"。后者会让"整段检测代码被删掉"这个变更也全绿。
+#
+# ⚠ 故意**不用 autouse**：那会把本文件另外十几条用例（TEXT affinity / 截图路径
+#   / accept_* …）也拖到非生产配置下去跑。只有真正关心检测的用例显式声明它。
+#
+# ⚠ `test_no_baseline_price_disables_change_detection` **也必须带上它**：那条断言
+#   的是"没有 baseline 就不检测"，开关关着时它会因为**另一个**原因而通过 ——
+#   一次空心的绿。带上夹具之后，它测的才是它声称在测的东西。
+#
+# `test_is_auto_batch_refreshes_baseline` 不带 —— baseline 的刷新在这个开关
+# 之外（开关只包住"算变动"那一段），它与检测开关无关。
+#
+# 开关自身的行为（关着就不写、'new' 不受开关管）由
+# tests/pgdb/test_change_detection_switch.py 覆盖，两个文件分工不重叠。
+
+
+@pytest.fixture
+def change_detection_on(monkeypatch):
+    """把变动检测拨回 True（生产默认已关）。"""
+    from common import config
+    monkeypatch.setattr(config, "CHANGE_DETECTION_ENABLED", True)
+
 
 @pytest.mark.asyncio
-async def test_change_detection_against_baseline_not_current(db):
+async def test_change_detection_against_baseline_not_current(db, change_detection_on):
     bid = await db.create_batch("b_chg")
     await db.save_result(mk("B0CHG00001"), bid)
     # 手动批次：baseline 不动，所以第二次和第三次都拿 10.00 当基准
@@ -155,7 +184,7 @@ async def test_change_detection_against_baseline_not_current(db):
 
 
 @pytest.mark.asyncio
-async def test_title_bullets_change(db):
+async def test_title_bullets_change(db, change_detection_on):
     bid = await db.create_batch("b_tb")
     await db.save_result(mk("B0TB000001"), bid)
     await db.save_result(mk("B0TB000001", title="RENAMED",
@@ -169,7 +198,7 @@ async def test_title_bullets_change(db):
 
 
 @pytest.mark.asyncio
-async def test_no_baseline_price_disables_change_detection(db):
+async def test_no_baseline_price_disables_change_detection(db, change_detection_on):
     """has_baseline 只看 baseline_price 一列——现状 bug，照抄。"""
     bid = await db.create_batch("b_nobl")
     await db.save_result(mk("B0NOBL0001"), bid)

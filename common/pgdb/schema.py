@@ -189,7 +189,11 @@ DDL_TABLES: List[str] = [
         -- `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`，PG 的 ADD COLUMN 同样
         -- 只追加到末尾；插在别处会让新建库与升级库的列序分叉，而
         -- verify_schema 只能对上其中一种。
-        subtitle                    text COLLATE "C"
+        subtitle                    text COLLATE "C",
+        -- 2026-09：buybox offer 的品相。**新的最后一列**（上面 subtitle 那段
+        -- "必须是最后一列"的警告现在指向这一行 —— 规则是"新列只能追加到末尾"，
+        -- 标记永远跟着当前的末列走）。
+        offer_condition             text COLLATE "C"
     );
     """,
 
@@ -364,6 +368,7 @@ UPDATE batches
 #: 列序是 API 契约（`SELECT d.*` 无 response_model）。
 DDL_ALTERS: List[str] = [
     'ALTER TABLE asin_data ADD COLUMN IF NOT EXISTS subtitle text COLLATE "C"',
+    'ALTER TABLE asin_data ADD COLUMN IF NOT EXISTS offer_condition text COLLATE "C"',
 ]
 
 # 期望列序：verify_schema() 用它做硬闸门。
@@ -393,8 +398,8 @@ EXPECTED_COLUMNS: Dict[str, List[str]] = {
         "baseline_stock_status", "baseline_title_bullets_hash",
         "baseline_updated_at", "rating", "review_count", "seller_id", "seller_name",
         "created_at", "updated_at",
-        # 2026-08 追加，见 DDL 里的说明：新列只能落在末尾。
-        "subtitle",
+        # 2026-08 / 2026-09 追加，见 DDL 里的说明：新列只能落在末尾。
+        "subtitle", "offer_condition",
     ],
     "asin_changes": [
         "id", "asin", "batch_id", "change_type", "change_detail",

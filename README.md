@@ -359,6 +359,73 @@ ASIN 只有一行，后采的覆盖先采的；而 `/api/results?batch_id=` 的 
   放在对账里则一处代码、不在写热路径、覆盖全部终态路径，**部署后存量卡死批次
   会自己解开并补发回调**。
 
+- **变动检测已默认关闭**（2026-09）：`CHANGE_DETECTION_ENABLED=0`（`common/config.py`）。
+
+  它原来做的事：每次保存采集结果时把这次的值和 baseline（上一次**定时采集**的
+  数据）比对，差异写进 `asin_changes`，分 `price_stock` / `title_bullets` / `new`
+  三类。关掉的理由是**本部署没有消费方** —— 唯一还在读它的是采集结果页那个
+  「变动筛选」下拉框（本轮一并下线）；对外契约的增量导出
+  `/api/export/incremental` 走的是 `scraper.scrape_events` 事件流，与它无关。
+
+  省下的都在**写锁内**（写锁是这个项目的瓶颈）：每次保存少一次比对、有变动时
+  少 1~2 条 INSERT，`asin_changes` 不再增长（线上曾约 140 万行，它的持续写入
+  正是把可见性图打脏、让 `COUNT(*)` 从 78ms 退化到 683ms 的推手之一）。
+
+  ⚠️ **关掉不等于删掉**：`asin_changes` 表、`GET /api/changes/stats`、
+  `/api/results?change_filter=` 三者**全部保留**（契约 §3.2 只许加不许删），
+  只是不再产生新行。`change_type='new'` 那一类**不受开关管** —— 它是入库事实
+  本身、每个 ASIN 一次、不随重采增长，所以 `change_filter=new` 仍然可用。
+
+  ⚠️ 想重新打开：`CHANGE_DETECTION_ENABLED=1` + 重启。检测逻辑仍有用例覆盖
+  （`tests/pgdb/test_change_detection_switch.py` 把开关拨到 True 再跑），
+  所以它不会因为生产上不执行而腐烂。检测逻辑的既有守卫在
+  `tests/pgdb/test_results_write.py` 的「变动检测」一节（4 条），它们用
+  `change_detection_on` 夹具把开关拨回 True；**黄金基线**过去只覆盖到
+  `change_type='new'`，两条比对路径它一次都没走过 —— 所以别指望基线能拦住
+  这块的回归。
+
+  清空存量行：`psql -f deploy/clear_asin_changes.sql`（TRUNCATE，**不可逆**；
+  别用 `DELETE /api/database`，那会连 `asin_data` 和全部截图一起清）。
+
+- **`offer_condition`：能分辨二手/翻新了**（2026-09，`asin_data` 新增末列）。
+
+  之前采集数据**完全无法**分辨品相：57 列里没有品相字段，parser 里
+  `used` / `renewed` / `refurbished` / `condition` 一个都搜不到。
+  实例：`B0G449YVHD` 采到 `$20.70`，而它的 buybox 卖家是 **Amazon Resale**
+  （原 Amazon Warehouse，亚马逊自营的退货/开箱件）—— 那是个**二手价**，
+  拿去和全新价比价或算利润就是错的，而数据里没有任何一列能看出来。
+
+  语义上它是**这次采集时 buybox 胜出的那个 offer 的品相**，不是 ASIN 的固有
+  属性（所以叫 `offer_condition` 而不是 `condition`；`CONDITION` 还是 SQL 标准
+  保留字）。同一 ASIN 上可以同时挂全新和二手 offer，buybox 换人这个值就变。
+
+  两类来源，性质不同：
+
+  | 来源 | 覆盖 | 会不会随 buybox 变 |
+  |---|---|---|
+  | buybox 区域的品相行（`#condition-and-price-row` 等） | 同 ASIN 的二手 offer（如 Amazon Resale） | **会** |
+  | 标题里的 `(Renewed)` / `(Refurbished)` | 亚马逊给翻新品的**独立 ASIN** | 不会 |
+
+  取值：`Used - Like New` / `Used - Very Good` / `Used - Good` /
+  `Used - Acceptable` / `Open Box` / `Collectible` / `Renewed` / `Refurbished`，
+  **读不到一律 `N/A`**。⚠️ 全新品也是 `N/A`，**不是** `New` —— 全新 offer 的
+  buybox 根本不写品相，返回 `New` 等于把"没读到"伪装成"读到了全新"。
+
+  ⚠️ **上线后需要一次真实验证**：那几个容器 id 来自 Amazon 已知的 DOM 结构，
+  但开发环境没有 Amazon 访问通道、库里也只存 PNG 不存 HTML，**没有真实二手
+  页面的语料可回放**。单元测试覆盖的是"给定这样的 HTML 应当得出什么"，不是
+  "Amazon 今天真的长这样"。结构若已变化，症状是静默返回 `N/A`（不会串味成
+  错误品相）。拿一个已知二手 ASIN 实测：
+
+  ```bash
+  curl -s 'http://<host>/amazon-v4/api/results/B0G449YVHD' \
+    | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("offer_condition"), "|", d.get("seller_name"))'
+  # 期望：Used - Very Good | Amazon Resale   （品相具体等级视实物而定）
+  # 若得到：N/A | Amazon Resale  -> 选择器需要按真实 HTML 调整
+  ```
+
+  历史数据补不回来 —— 已采的行这一列是空的，只能等重采时填上。
+
 - **选中删除**：勾选行 checkbox，点击"删除选中"（同时删除关联截图文件）
   - 删除类操作失败时，前端弹的是**服务端给的原因**（`window.apiErrText`，定义在
     `base.html`，四个删除入口共用）。最常见的一条是配了 `ADMIN_TOKEN` 却没在
