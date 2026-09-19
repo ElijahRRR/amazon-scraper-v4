@@ -1335,7 +1335,8 @@ class Worker:
         tests/test_engine_not_found.py 里有一条用真实 `_default_result` +
         真实 `_is_parse_failure` 的断言钉住这个耦合。
         """
-        full = self.parser._default_result(asin, zip_requested)
+        full = self.parser._default_result(
+            asin, zip_requested, _marketplace.get(marketplace))
         result = {k: v for k, v in full.items()
                   if k not in _NOT_FOUND_PRESERVED_FIELDS}
         # 404 没有商品页可测：completeness=0（UNMEASURED）、parse_engine=None、
@@ -1464,7 +1465,7 @@ class Worker:
 
                 # ── 404：商品不存在（P4-3）────────────────────────────────
                 # 不重试、不轮换 IP。四条理由（都能在本仓库里核对）：
-                #  1. 404 的来源是**可信的**：请求走 https://www.amazon.com/dp/...
+                #  1. 404 的来源是**可信的**：请求走 <站点 base>/dp/...
                 #     （worker/session.py:353），代理是 CONNECT 隧道，TLS 端到端。
                 #     中间人伪造不出 404 —— 这个状态码只可能来自 Amazon 自己。
                 #  2. 仓库自己的模型就是"404 不是软封锁"：
@@ -1496,6 +1497,7 @@ class Worker:
                             batch_name=task.get("batch_name", ""),
                             batch_id=task.get("batch_id"),
                             html_content=self._build_missing_product_html(asin),
+                            marketplace=task_marketplace,
                         )
                     self._stats["success"] += 1
                     self._stats["not_found"] = self._stats.get("not_found", 0) + 1
@@ -1511,7 +1513,8 @@ class Worker:
                 # 更糟的是 None 会被 `if val is not None` 跳过，
                 # asin_data.zip_code 保留**上一次采集**的邮编（可能是别的邮编）。
                 t_parse_start = time.time()
-                result_data = self.parser.parse_product(resp.text, asin, target_zip)
+                result_data = self.parser.parse_product(
+                    resp.text, asin, target_zip, task_marketplace)
                 t_parse = time.time() - t_parse_start
                 result_data["batch_name"] = task.get("batch_name", "")
 
@@ -1663,10 +1666,25 @@ class Worker:
                 # v3: No Featured Offer 产品请求 AOD AJAX 端点补充价格/运费/配送/FBA
                 if result_data.get("current_price") == "No Featured Offer":
                     try:
-                        aod_url = f"https://www.amazon.com/gp/product/ajax/aodAjaxMain/ref=dp_aod_unknown_mbc?asin={asin}&m=&qid=&smid=&sourcecustomerorglistid=&sourcecustomerorglistitemid=&sr=&pc=dp"
+                        # F-012：AOD 端点**按站点**拼。
+                        #
+                        # 这条写死成 amazon.com 是本功能里最要命的一处遗漏：
+                        # 下面那几行会把 AOD 拿回来的 price / buybox_price /
+                        # is_fba / shipping / delivery **覆盖**进 result_data，
+                        # 也就是说一个加拿大站商品（current_price 是
+                        # "No Featured Offer"）会被写进**美国站的报价**，
+                        # 然后落进 (asin, amazon.ca) 那一行。
+                        # 同一个 ASIN 在美国站多半也存在，所以这个请求不会 404、
+                        # 不会报错，采回来的数字看着完全正常。
+                        aod_url = (
+                            f"{session.AMAZON_BASE}/gp/product/ajax/aodAjaxMain"
+                            f"/ref=dp_aod_unknown_mbc?asin={asin}&m=&qid=&smid="
+                            f"&sourcecustomerorglistid=&sourcecustomerorglistitemid="
+                            f"&sr=&pc=dp")
                         olp_resp = await session.fetch_product_page_by_url(aod_url)
                         if olp_resp and hasattr(olp_resp, 'text') and olp_resp.text:
-                            offer = self.parser.parse_offer_listing(olp_resp.text)
+                            offer = self.parser.parse_offer_listing(
+                                olp_resp.text, _marketplace.get(task_marketplace))
                             if offer and offer.get('price'):
                                 result_data["current_price"] = offer['price']
                                 result_data["buybox_price"] = offer['price']
@@ -1731,6 +1749,7 @@ class Worker:
                         batch_name=task.get("batch_name", ""),
                         batch_id=task.get("batch_id"),
                         html_content=resp.text,
+                        marketplace=task_marketplace,
                     )
 
                 # 主动轮换：每 N 次成功请求更换本 slot 的 session 防止被检测
@@ -2664,9 +2683,41 @@ class Worker:
         logger.info("=" * 60)
 
 
+    @staticmethod
+    def _inject_base_href(html: str, marketplace: str) -> str:
+        """给截图用的 HTML 注入 ``<base href>``（F-012：按站点）。
+
+        为什么在这里注入、而不是留给截图子进程：**子进程不知道站点**。
+        它只从磁盘读 ``<批次名>/<asin>.html``，文件里没有任何站点信息，
+        于是它只能写死一个 —— 改造前写死的就是 ``https://www.amazon.com/``。
+
+        影响面小但方向确定：``<base>`` 决定页面里**相对** URL 的解析基点。
+        Amazon 的图片/CSS 绝大多数是绝对 URL（``m.media-amazon.com``），
+        所以错一个 host 多半看不出来；但"多半看不出来"不是"对"，
+        而这里把它改对的成本只有几行。
+
+        判据与 ``worker/screenshot.py`` 那条**保持一致**（``"<base " not in``
+        前 2000 字符），所以两边不会重复注入：engine 注入过的，子进程看到
+        已经有 ``<base >`` 就不再动；没经过 engine 的老文件仍走子进程的兜底。
+        """
+        lower = html[:2000].lower()
+        if "<base " in lower:
+            return html
+        pos = lower.find("<head")
+        if pos == -1:
+            return html
+        try:
+            close = html.index(">", pos) + 1
+        except ValueError:
+            return html
+        base = _marketplace.get(marketplace).base_url
+        return html[:close] + f'<base href="{base}/">' + html[close:]
+
     async def _enqueue_screenshot_html(self, asin: str, batch_name: str,
-                                       batch_id: Optional[int], html_content: str):
+                                       batch_id: Optional[int], html_content: str,
+                                       marketplace: str = None):
         """将截图 HTML 写入隔离缓存目录并确保截图子进程已启动。"""
+        html_content = self._inject_base_href(html_content, marketplace)
         html_dir = os.path.join(self._screenshot_html_dir, batch_name)
         os.makedirs(html_dir, exist_ok=True)
         html_path = os.path.join(html_dir, f"{asin}.html")

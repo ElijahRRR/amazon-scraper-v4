@@ -316,8 +316,8 @@ curl -X POST http://<server>:8899/api/search-batches \
 |---|---|---|
 | 站点键 | `amazon.com` | `amazon.ca` |
 | 币种 | USD | CAD |
-| 邮编 | 5 位数字 `10001` | `M5V 3L9`（字母数字） |
-| 默认投递地 | `10001` | `M5V 3L9` |
+| 邮编 | 5 位数字 `10001` | `K1V 7P8`（字母数字） |
+| 默认投递地 | `10001` | `K1V 7P8` |
 | `delivery` 筛选 | 4 个取值 | 需配 `SEARCH_DELIVERY_FILTERS` 或用 `rh_extra` |
 
 #### ⚠ 同一个 ASIN 在两个站点是**两行**
@@ -348,6 +348,13 @@ glow 文案是否含完整邮编、价格渲染成 `$` 还是 `CDN$`。
 PROXY_URL='http://user:pass@host:port' \
   python -m tools.probe_marketplace --marketplace amazon.ca
 ```
+
+#### 默认邮编的作用
+
+`default_postal` 与美国站的 `10001` 承担同一个职责：**把「页面按哪个地区渲染」钉死**。
+不指定的话 Amazon 会按出口 IP 自己挑一个地区，于是同一批任务采回来的价格、配送时长、
+库存来自不同地区 —— 而数据看起来完全正常。加拿大站当前是 `K1V 7P8`（渥太华）。
+
 
 探针只发几个 GET/POST 然后打印，不写库、不改配置。跑完把实测结果回填进注册表，
 再把 `verified` 改成 `True`。

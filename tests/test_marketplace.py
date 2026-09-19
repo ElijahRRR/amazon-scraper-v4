@@ -349,5 +349,157 @@ class WiredIntoStorage(unittest.TestCase):
         self.assertNotIn("marketplace", SLOW_HASH_FIELDS)
 
 
+# ==========================================================================
+# 8) 审计补漏：第一轮改造漏掉、第二轮才补上的那几处
+# ==========================================================================
+class ThingsTheFirstPassMissed(unittest.TestCase):
+    """第一轮把「站点」贯通了主干，但漏了几条支路。
+
+    这一组每条对应一个**实际会产生错数据**的遗漏，写成用例是为了它们不会
+    在下次重构时悄悄退回去。共同特征：漏掉时**不报错**，数据看着正常。
+    """
+
+    def setUp(self):
+        from worker.parser import AmazonParser
+        self.p = AmazonParser()
+
+    def _page(self, site_word, currency, shown):
+        return (
+            '<html><head><script type="application/ld+json">'
+            '{"@type":"Product","name":"W","offers":{"@type":"Offer",'
+            f'"price":"24.99","priceCurrency":"{currency}",'
+            '"availability":"http://schema.org/InStock"}}'
+            '</script></head><body>'
+            '<span id="productTitle">Widget</span>'
+            f'<div id="corePrice_feature_div"><span class="a-offscreen">{shown}</span></div>'
+            f'<div id="merchant-info">Ships from {site_word} Sold by {site_word}</div>'
+            '</body></html>')
+
+    def test_product_url_points_at_the_right_site(self):
+        """写死 amazon.com 的话，加拿大商品的链接指向**另一个国家**的商品页。
+
+        而同一个 ASIN 在美国站多半也存在，所以点进去能打开、看不出是错的。
+        """
+        ca = self.p.parse_product(self._page("Amazon.ca", "CAD", "$24.99"),
+                                  "B0URLTEST1", "K1V 7P8", "amazon.ca")
+        self.assertEqual(ca["product_url"], "https://www.amazon.ca/dp/B0URLTEST1")
+        us = self.p.parse_product(self._page("Amazon.com", "USD", "$19.99"),
+                                  "B0URLTEST1", "10001")
+        self.assertEqual(us["product_url"], "https://www.amazon.com/dp/B0URLTEST1",
+                         "美国站必须逐字节不变")
+
+    def test_first_party_seller_is_detected_on_each_site(self):
+        """自营文案里的域名跟着站点变：加拿大站是 "Sold by Amazon.ca"。
+
+        写死 amazon.com 不会让解析失败，而是**静默走错分支** —— 掉进
+        merchantID 兜底，seller_id/seller_name（两个导出列）变成别的值。
+        """
+        ca = self.p.parse_product(self._page("Amazon.ca", "CAD", "$24.99"),
+                                  "B0SELLCA01", "K1V 7P8", "amazon.ca")
+        self.assertEqual((ca["seller_id"], ca["seller_name"]), ("AMAZON", "Amazon.ca"))
+        us = self.p.parse_product(self._page("Amazon.com", "USD", "$19.99"),
+                                  "B0SELLUS01", "10001")
+        self.assertEqual((us["seller_id"], us["seller_name"]), ("AMAZON", "Amazon.com"))
+
+    def test_a_ca_page_parsed_as_us_does_not_claim_amazon_first_party(self):
+        """反向哨兵：站点传错时宁可认不出，也不要认错。"""
+        r = self.p.parse_product(self._page("Amazon.ca", "CAD", "$24.99"),
+                                 "B0MIXED0001", "10001", "amazon.com")
+        self.assertNotEqual(r["seller_id"], "AMAZON")
+
+    def test_jsonld_rejects_an_offer_in_another_currency(self):
+        """JSON-LD 的 priceCurrency 是唯一能看见真实币种代码的地方。
+
+        ⚠ 这条用例**只能**测 JSON-LD 这一条路，所以页面里故意不放 CSS 价格。
+          第一版写成"整页都有价格"然后断言美国站不收 CAD —— 那是错的，
+          而且错得有意义：CSS 路径拿到的是一个 ``$24.99`` 字符串，
+          美加两站长得一模一样，**它永远分辨不出币种**。
+          真正的保障不是"解析器能认出来"，而是"站点决定去哪抓、决定币种"
+          —— 也就是本文件其余那些用例守的东西。这条只守最后一道明关。
+        """
+        jsonld_only = (
+            '<html><head><script type="application/ld+json">'
+            '{"@type":"Product","name":"W","offers":{"@type":"Offer",'
+            '"price":"24.99","priceCurrency":"CAD",'
+            '"availability":"http://schema.org/InStock"}}'
+            '</script></head><body><span id="productTitle">Widget</span>'
+            '</body></html>')
+        us = self.p.parse_product(jsonld_only, "B0CURTEST1", "10001", "amazon.com")
+        self.assertEqual(us["current_price"], "N/A",
+                         "标着 CAD 的 offer 不该被美国站收下")
+        ca = self.p.parse_product(jsonld_only, "B0CURTEST1", "K1V 7P8", "amazon.ca")
+        self.assertEqual(ca["current_price"], "$24.99",
+                         "同一条 CAD offer 在加拿大站必须被收下")
+
+    def test_screenshot_base_href_follows_the_site(self):
+        """截图子进程拿不到站点，所以 base 必须由 engine 在写盘前注入。"""
+        from worker.engine import Worker
+        html = "<html><head><meta charset='utf-8'></head><body>x</body></html>"
+        self.assertIn('<base href="https://www.amazon.ca/">',
+                      Worker._inject_base_href(html, "amazon.ca"))
+        self.assertIn('<base href="https://www.amazon.com/">',
+                      Worker._inject_base_href(html, None))
+
+    def test_screenshot_base_href_is_not_injected_twice(self):
+        """判据必须与 worker/screenshot.py 那条一致，否则会注入两个 <base>。"""
+        from worker.engine import Worker
+        once = "<html><head><base href=\"https://www.amazon.ca/\"></head></html>"
+        self.assertEqual(Worker._inject_base_href(once, "amazon.com"), once)
+
+    def test_no_hardcoded_amazon_com_url_left_in_worker_code(self):
+        """代码级哨兵：worker/ 的**代码**里不许再出现写死的 amazon.com URL。
+
+        用 AST 而不是文本扫描：第一版写成 ``line.split("#")[0]``，
+        把 docstring 里的说明文字也算成了代码，于是 4 条纯注释被报成违规。
+        哨兵误报比没有哨兵更糟 —— 它会训练人去忽略它。
+
+        这里只看**真正会被执行**的字符串字面量（排除模块/类/函数的 docstring），
+        且只查 ``https://www.amazon.com`` 这种 URL 形态。
+        唯一的白名单是 ``worker/screenshot.py`` 的 ``<base>`` 兜底：
+        那个子进程只从磁盘读 HTML、拿不到站点，正常路径由
+        ``engine._inject_base_href`` 按站点注入，它只接住改造前遗留的老文件
+        （那些必然是美国站的）。
+        """
+        import ast
+        import os
+
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        allowed = {("screenshot.py",)}          # 见 docstring
+        offenders = []
+
+        for fn in sorted(os.listdir(os.path.join(root, "worker"))):
+            if not fn.endswith(".py"):
+                continue
+            path = os.path.join(root, "worker", fn)
+            tree = ast.parse(open(path, encoding="utf-8").read(), filename=path)
+
+            # 收集全部 docstring 节点，后面跳过它们
+            docstrings = set()
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.Module, ast.ClassDef,
+                                     ast.FunctionDef, ast.AsyncFunctionDef)):
+                    body = getattr(node, "body", None)
+                    if (body and isinstance(body[0], ast.Expr)
+                            and isinstance(body[0].value, ast.Constant)
+                            and isinstance(body[0].value.value, str)):
+                        docstrings.add(id(body[0].value))
+
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Constant):
+                    continue
+                if not isinstance(node.value, str) or id(node) in docstrings:
+                    continue
+                if "https://www.amazon.com" not in node.value:
+                    continue
+                if (fn,) in allowed:
+                    continue
+                offenders.append(
+                    f"worker/{fn}:{node.lineno}: {node.value[:70]!r}")
+
+        self.assertEqual(offenders, [],
+                         "worker 代码里还有写死的 amazon.com URL：\n  "
+                         + "\n  ".join(offenders))
+
+
 if __name__ == "__main__":
     unittest.main()
