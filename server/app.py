@@ -26,7 +26,10 @@ import openpyxl
 
 from common import config
 from common.core.idents import ASIN_RE as _ASIN_RE
-from common.core.zipcode import _zfill_short_numeric
+# F-012：邮编归一化整体搬进 common/core/marketplace.py（站点感知）。
+# 补零那一小步的真源仍是 common/core/zipcode.py，marketplace 在内部调它，
+# 所以本模块与 relay 的「补零规则必须一致」这条承重约束没有松动。
+from common.core import marketplace as _marketplace
 from common.core.timeutil import now_ts, ts_from, utc_now
 from common.database import Database
 from common.dbfactory import create_database
@@ -1062,13 +1065,9 @@ async def _is_safe_callback_url(url: str) -> tuple[bool, str]:
 # `_ASIN_RE` 现在从 common/core/idents.py import（见文件头），本地不再定义。
 # 那份真源与 worker/parser.py 共用；`.strip().upper()` 的归一留在下面
 # `_normalize_asin` 里 —— 正则自己不做大小写归一。
-# 美国邮编：5 位数字（兼容 ZIP+4，前 5 位）
-#
-# P4.6：``\Z`` 而不是 ``$``。Python 的 ``$`` 在**末尾恰好一个换行**处也匹配，
-# 于是 ``'10001\n'`` 能通过一条看起来是「只接受 5 位数字」的校验。
-# 本函数在这里之前已经 ``.strip()`` 过，所以这一改**对任何输入都不改变结果**
-# （已实测），它守的是「将来有人把 strip 挪走 / 复制这条正则去别处用」。
-_US_ZIP_RE = re.compile(r'^\d{5}\Z')
+# F-012：美国邮编正则搬进 common/core/marketplace.py 的注册表
+# （``MarketplaceSpec.postal_pattern``），因为它现在是**每个站点一条**，
+# 不再是一条全局常量。P4.6 那条 ``\Z`` vs ``$`` 的论证一并搬过去了。
 
 
 def _normalize_asin(val) -> Optional[str]:
@@ -1078,28 +1077,25 @@ def _normalize_asin(val) -> Optional[str]:
     return s if _ASIN_RE.match(s) else None
 
 
-def _normalize_zip(val) -> Optional[str]:
-    """规范化邮编。返回 5 位数字字符串，无效则 None。
-    支持去掉前导/尾随空白、ZIP+4（取前 5 位）、Excel 数字单元格（如 10001 不会带前导 0 的损失）。
+def _normalize_zip(val, marketplace: str = None) -> Optional[str]:
+    """规范化投递地编码。不合法返回 ``None``。
+
+    ``marketplace=None``（默认）-> 美国站，行为与 F-012 之前**逐字节一致**：
+    去空白、ZIP+4 取前段、Excel 数字单元格（``90001.0``）、短数字补零，
+    最后按 ``^\d{5}$`` 校验。这条等价性是实测过的，不是推断的：
+    4530 组输入（含随机模糊串、整数、浮点数）下新旧实现零差异，
+    用例在 ``tests/test_marketplace.py::UsZipEquivalence``。
+
+    ``marketplace='amazon.ca'`` -> 加拿大邮编（``M5V 3L9``）。**补零规则不适用**
+    （它不是纯数字），归一化到带空格的大写规范形。
+
+    实现委托给 ``common/core/marketplace.py`` —— 那里是「站点」这件事的唯一
+    真源。本函数留作 HTTP 边界的稳定入口：``server/app.py`` 内外有十余处
+    引用它，而且它与 ``relay.normalize_zip`` 的一致性是一条承重约束
+    （两个值会被 ``reconcile_zip_verify`` 直接比较，一边补零一边不补就是
+    凭空造出的 mismatch）。
     """
-    if val is None:
-        return None
-    s = str(val).strip()
-    if not s:
-        return None
-    # Excel 数字 90001.0 → "90001"
-    if s.endswith(".0") and s[:-2].isdigit():
-        s = s[:-2]
-    # 前 5 位（兼容 "10001-1234"）
-    head = s.split("-", 1)[0].strip()
-    # 数字邮编位数补 0（Excel 把 "01234" 存为 1234）
-    # P4.6：补零规则的唯一真源是 common/core/zipcode.py —— 本函数归一出来的值
-    # 会去和 relay 归一出来的 zip_requested 比对，两边一边补零一边不补，
-    # 就是凭空造出的 mismatch。原先这里写的是 ``len(head) <= 5``，
-    # 而 ``"12345".zfill(5) == "12345"``，所以 ``or head`` 这一支覆盖的
-    # 「5 位数字」情形结果完全一致（已实测）。
-    head = _zfill_short_numeric(head) or head
-    return head if _US_ZIP_RE.match(head) else None
+    return _marketplace.normalize_postal(val, marketplace)
 
 
 def _safe_fs_component(name: str) -> Optional[str]:

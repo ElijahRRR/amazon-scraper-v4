@@ -138,6 +138,8 @@ from common.pgdb._shared import (  # noqa: F401
 from common.pgdb.outbox import emit, emit_stale_event_own_tx
 from common.pgdb.relay import outcome_for_error_type
 
+from common.core import marketplace as _marketplace
+
 logger = logging.getLogger(__name__)
 
 
@@ -149,10 +151,16 @@ class TasksMixin:
     async def create_tasks(self, batch_id: int, asins: List[str],
                            zip_code: str = "10001",
                            needs_screenshot: bool = False,
-                           per_asin_zip: Dict[str, str] = None) -> int:
+                           per_asin_zip: Dict[str, str] = None,
+                           marketplace: str = None) -> int:
         """批量创建采集任务，同时维护 batch_asins 关联。
 
         per_asin_zip: 可选 {asin: zip} 映射；某个 asin 在其中则用该 zip，否则回落到 zip_code。
+        marketplace:  采集来源站点（F-012）。``None`` -> 美国站，与改造前一致。
+
+        ⚠ ``marketplace`` 作为**关键字参数加在末尾**且有默认值，是为了让既有
+        调用方（server/app.py、schedules.py、extension.py……）一个字不改就仍然
+        建出美国站任务 —— 改造前它们建的就是美国站任务。
         """
         clean_asins = []
         seen = set()
@@ -171,6 +179,9 @@ class TasksMixin:
         bid = self.as_int(batch_id)
         zips = [self.text_affinity(per_asin_zip.get(asin) or zip_code)
                 for asin in clean_asins]
+        # 站点不合法就抛（ValueError），不静默回退 —— 与写入侧同一条口径：
+        # 悄悄把加拿大任务建成美国任务，采回来的数据会覆盖真的美国数据。
+        mkt_p = self.text_affinity(_marketplace.get(marketplace).id)
 
         async with self._write_lock:
             await self._db.execute("BEGIN")
@@ -182,18 +193,23 @@ class TasksMixin:
                 # 所以 identity 的烧号与 SQLite 逐个 INSERT OR IGNORE 完全一致，
                 # 而标签里的计数 = 真正落库的行数 = total_changes 的差值。
                 cursor = await self._db.execute(
-                    "INSERT INTO tasks (batch_id, asin, zip_code, needs_screenshot) "
-                    "SELECT ?::bigint, u.asin, u.zip, ?::int "
+                    "INSERT INTO tasks "
+                    "(batch_id, asin, zip_code, needs_screenshot, marketplace) "
+                    "SELECT ?::bigint, u.asin, u.zip, ?::int, ?::text "
                     "  FROM unnest(?::text[], ?::text[]) AS u(asin, zip) "
                     "ON CONFLICT DO NOTHING",
-                    (bid, ss_val, clean_asins, zips)
+                    (bid, ss_val, mkt_p, clean_asins, zips)
                 )
                 task_inserted = cursor.rowcount
 
                 # 维护 batch_asins（判断是否新 ASIN）
                 for asin in clean_asins:
+                    # F-012：按 (asin, marketplace) 判新旧。一个 ASIN 在加拿大站
+                    # 是**新的**，哪怕美国站早就采过 —— 它们是两件不同的商品
+                    # 数据，而 is_new 驱动的是「这批里哪些是首次见到」。
                     async with self._db.execute(
-                        "SELECT 1 FROM asin_data WHERE asin = ?", (asin,)
+                        "SELECT 1 FROM asin_data WHERE asin = ? AND marketplace = ?",
+                        (asin, mkt_p)
                     ) as c:
                         exists = await c.fetchone()
                     is_new = 0 if exists else 1

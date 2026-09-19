@@ -1096,10 +1096,13 @@ class Database:
 
     async def create_tasks(self, batch_id: int, asins: List[str], zip_code: str = "10001",
                            needs_screenshot: bool = False,
-                           per_asin_zip: Dict[str, str] = None) -> int:
+                           per_asin_zip: Dict[str, str] = None,
+                           marketplace: str = None) -> int:
         """批量创建采集任务，同时维护 batch_asins 关联。
 
         per_asin_zip: 可选 {asin: zip} 映射；某个 asin 在其中则用该 zip，否则回落到 zip_code。
+        marketplace:  采集来源站点（F-012）。``None`` -> 美国站。语义与 PG 侧
+                      ``common/pgdb/tasks.py`` 同名方法逐字一致。
         """
         clean_asins = []
         seen = set()
@@ -1114,6 +1117,7 @@ class Database:
             return 0
 
         per_asin_zip = per_asin_zip or {}
+        mkt = _marketplace.get(marketplace).id
 
         async with self._write_lock:
             await self._db.execute("BEGIN")
@@ -1121,16 +1125,20 @@ class Database:
                 # 插入任务（每个 asin 用各自指定的 zip，未指定则用批次默认）
                 before_tasks = self._db.total_changes
                 await self._db.executemany(
-                    "INSERT OR IGNORE INTO tasks (batch_id, asin, zip_code, needs_screenshot) VALUES (?, ?, ?, ?)",
-                    [(batch_id, asin, per_asin_zip.get(asin) or zip_code, ss_val)
+                    "INSERT OR IGNORE INTO tasks "
+                    "(batch_id, asin, zip_code, needs_screenshot, marketplace) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    [(batch_id, asin, per_asin_zip.get(asin) or zip_code, ss_val, mkt)
                      for asin in clean_asins]
                 )
                 task_inserted = self._db.total_changes - before_tasks
 
                 # 维护 batch_asins（判断是否新 ASIN）
                 for asin in clean_asins:
+                    # F-012：按 (asin, marketplace) 判新旧，口径同 PG 侧。
                     async with self._db.execute(
-                        "SELECT 1 FROM asin_data WHERE asin = ?", (asin,)
+                        "SELECT 1 FROM asin_data WHERE asin = ? AND marketplace = ?",
+                        (asin, mkt)
                     ) as c:
                         exists = await c.fetchone()
                     is_new = 0 if exists else 1
@@ -1610,7 +1618,8 @@ class Database:
     async def create_seller_batch(self, name: str, seller_ids: List[str],
                                    discover_mode: str = "with_detail",
                                    zip_code: str = "10001",
-                                   needs_screenshot: bool = False) -> Tuple[int, int]:
+                                   needs_screenshot: bool = False,
+                                   marketplace: str = None) -> Tuple[int, int]:
         """创建一个 seller_discovery 类型的批次，并为每个 seller_id 插入一个 discover_seller 任务。
 
         - 衍生的 ASIN 详情任务在 discover 任务完成时由 accept_seller_discovery_result 动态插入。
@@ -1632,6 +1641,8 @@ class Database:
             return (0, 0)
 
         ss_val = 1 if needs_screenshot else 0
+        # F-012：不合法就抛，不静默回退（口径见 create_tasks）。
+        mkt = _marketplace.get(marketplace).id
         async with self._write_lock:
             await self._db.execute("BEGIN")
             try:
@@ -1650,9 +1661,9 @@ class Database:
                 before = self._db.total_changes
                 await self._db.executemany(
                     "INSERT OR IGNORE INTO tasks "
-                    "(batch_id, asin, zip_code, needs_screenshot, task_type) "
-                    "VALUES (?, ?, ?, 0, 'discover_seller')",
-                    [(batch_id, sid, zip_code) for sid in clean_ids]
+                    "(batch_id, asin, zip_code, needs_screenshot, task_type, marketplace) "
+                    "VALUES (?, ?, ?, 0, 'discover_seller', ?)",
+                    [(batch_id, sid, zip_code, mkt) for sid in clean_ids]
                 )
                 inserted = self._db.total_changes - before
                 await self._db.execute("COMMIT")
@@ -1734,24 +1745,29 @@ class Database:
                 if discover_mode == "with_detail" and seen_asins:
                     # 取该 task 的 zip_code 复用
                     async with self._db.execute(
-                        "SELECT zip_code FROM tasks WHERE id=?", (task_id,)
+                        "SELECT zip_code, marketplace FROM tasks WHERE id=?", (task_id,)
                     ) as c:
                         zrow = await c.fetchone()
                     zip_code = zrow["zip_code"] if zrow else "10001"
+                    # F-012：站点从 discover 任务继承（同 PG 侧）。
+                    mkt = (zrow["marketplace"] if zrow
+                           else _marketplace.DEFAULT_MARKETPLACE)
 
                     before = self._db.total_changes
                     await self._db.executemany(
                         "INSERT OR IGNORE INTO tasks "
-                        "(batch_id, asin, zip_code, needs_screenshot, task_type) "
-                        "VALUES (?, ?, ?, ?, 'asin')",
-                        [(batch_id, a, zip_code, ss_val) for a in seen_asins]
+                        "(batch_id, asin, zip_code, needs_screenshot, task_type, "
+                        " marketplace) "
+                        "VALUES (?, ?, ?, ?, 'asin', ?)",
+                        [(batch_id, a, zip_code, ss_val, mkt) for a in seen_asins]
                     )
                     detail_inserted = self._db.total_changes - before
 
                     # 维护 batch_asins 关联（is_new 判定参考 create_tasks）
                     for a in seen_asins:
                         async with self._db.execute(
-                            "SELECT 1 FROM asin_data WHERE asin=?", (a,)
+                            "SELECT 1 FROM asin_data WHERE asin=? AND marketplace=?",
+                            (a, mkt)
                         ) as c:
                             exists = await c.fetchone()
                         await self._db.execute(
@@ -1865,6 +1881,8 @@ class Database:
 
         meta_json = json.dumps({"search": search_params or {}}, ensure_ascii=False)
         ss_val = 1 if needs_screenshot else 0
+        # F-012：站点从搜索参数的 domain 推导，语义见 PG 侧同名方法的注释。
+        mkt = _marketplace.get((search_params or {}).get("domain")).id
         async with self._write_lock:
             await self._db.execute("BEGIN")
             try:
@@ -1883,9 +1901,10 @@ class Database:
                 before = self._db.total_changes
                 await self._db.executemany(
                     "INSERT OR IGNORE INTO tasks "
-                    "(batch_id, asin, zip_code, needs_screenshot, task_type, task_meta) "
-                    "VALUES (?, ?, ?, 0, 'discover_search', ?)",
-                    [(batch_id, kw, zip_code, meta_json) for kw in clean_kws]
+                    "(batch_id, asin, zip_code, needs_screenshot, task_type, task_meta, "
+                    " marketplace) "
+                    "VALUES (?, ?, ?, 0, 'discover_search', ?, ?)",
+                    [(batch_id, kw, zip_code, meta_json, mkt) for kw in clean_kws]
                 )
                 inserted = self._db.total_changes - before
                 await self._db.execute("COMMIT")
@@ -1987,23 +2006,28 @@ class Database:
                 detail_inserted = 0
                 if discover_mode == "with_detail" and seen_asins:
                     async with self._db.execute(
-                        "SELECT zip_code FROM tasks WHERE id=?", (task_id,)
+                        "SELECT zip_code, marketplace FROM tasks WHERE id=?", (task_id,)
                     ) as c:
                         zrow = await c.fetchone()
                     zip_code = zrow["zip_code"] if zrow else "10001"
+                    # F-012：站点从 discover 任务继承（同 PG 侧）。
+                    mkt = (zrow["marketplace"] if zrow
+                           else _marketplace.DEFAULT_MARKETPLACE)
 
                     before = self._db.total_changes
                     await self._db.executemany(
                         "INSERT OR IGNORE INTO tasks "
-                        "(batch_id, asin, zip_code, needs_screenshot, task_type) "
-                        "VALUES (?, ?, ?, ?, 'asin')",
-                        [(batch_id, a, zip_code, ss_val) for a in seen_asins]
+                        "(batch_id, asin, zip_code, needs_screenshot, task_type, "
+                        " marketplace) "
+                        "VALUES (?, ?, ?, ?, 'asin', ?)",
+                        [(batch_id, a, zip_code, ss_val, mkt) for a in seen_asins]
                     )
                     detail_inserted = self._db.total_changes - before
 
                     for a in seen_asins:
                         async with self._db.execute(
-                            "SELECT 1 FROM asin_data WHERE asin=?", (a,)
+                            "SELECT 1 FROM asin_data WHERE asin=? AND marketplace=?",
+                            (a, mkt)
                         ) as c:
                             exists = await c.fetchone()
                         await self._db.execute(
