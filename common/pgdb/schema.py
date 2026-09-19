@@ -56,6 +56,7 @@ from typing import Dict, List
 
 # 排序键表达式的唯一真源（core 零依赖，不会把驱动拖进来）
 from common.core.results_sort import sort_key as _sort_key
+from common.core import marketplace as _mkt
 
 logger = logging.getLogger(__name__)
 
@@ -625,8 +626,17 @@ EVENT_CONTRACT_VERSION = "1"
 EVENT_OUTCOMES = ("ok", "not_found", "blocked", "parse_failed", "stale")
 
 #: marketplace 封闭集。计划 §2.3：**绝不**透传 parser 的 ``site``（那是 "US"）。
-EVENT_MARKETPLACES = ("amazon.com",)
-EVENT_DEFAULT_MARKETPLACE = "amazon.com"
+#:
+#: F-012：值域从 ``common/core/marketplace.py`` 的注册表派生，不再手写一份。
+#: 手写两份的后果是往注册表加站点之后事件流悄悄把它纠正成 amazon.com ——
+#: asin_data 里是 amazon.ca、事件流里是 amazon.com，而这两张表正是要靠
+#: marketplace join 起来的（下游 erpAPI 的复合主键就是 (marketplace, asin)）。
+#:
+#: ⚠ 「绝不透传 parser 的 site」这条**没有松动**：透传的是 engine 从 task
+#:   挂上来的 ``marketplace``（采集参数，engine 才知道），不是 parser 的
+#:   ``site``（恒为 "US" 的硬编码值）。两者是不同的键、不同的值域。
+EVENT_MARKETPLACES = _mkt.all_ids()
+EVENT_DEFAULT_MARKETPLACE = _mkt.DEFAULT_MARKETPLACE
 
 # ==========================================================================
 # Phase 4：采集质量信号的值域
@@ -695,6 +705,111 @@ EVENT_META_PARSE_ENGINE = "_parse_engine"
 #: 自己 stale 是没有意义的 —— 它不知道自己的租约还在不在。
 EVENT_WORKER_OUTCOMES = ("ok", "not_found")
 
+#: 老库升级：把 scrape_events 上那条 marketplace CHECK 换成当前值域。
+#:
+#: ⚠ 必须单独有这一条。``CREATE TABLE IF NOT EXISTS`` 对**已存在**的表是
+#:   no-op，所以改上面那条 DDL 里的 CHECK **只对全新库生效** ——
+#:   生产库（表早就在）会继续用建库那天的旧约束，于是第一条加拿大事件被
+#:   CHECK 拒掉、relay 事务回滚、整条事件流停摆。
+#:   schema.py 文件头 D-10 那段注释早就写过这个坑（「老库与新库的失败面
+#:   从此不同，那比没有约束更糟」），这里是它的兑现。
+#:
+#: ⚠ 父表加约束会自动传播到所有分区，**不需要**逐分区 ALTER；但
+#:   ``scrape_events`` 是分区表，DROP/ADD CONSTRAINT 要在父表上做。
+#:   ADD CONSTRAINT 会全表校验现有行 —— 现有行全是 'amazon.com'、
+#:   而它在新值域里，所以校验必然通过，代价是一次全表扫描。
+#:   对事件流（按 seq 分区、老分区会被 retention 清掉）可以接受；
+#:   真要避免可以加 NOT VALID 再 VALIDATE，但那样就有一个"约束在但没验过"
+#:   的中间态，对一条只追加的流不值得。
+#:
+#: 先建新的、再删旧的：中间任何一刻都至少有一条约束在守着这一列。
+#: ``CHECK (marketplace IN (...))`` 的字面量片段，从注册表派生。
+#:
+#: 手工引号而不是参数化：这是 **DDL**，PG 的 CREATE TABLE 里不能用绑定参数。
+#: 值来自本进程的注册表常量（不是用户输入），但仍然把单引号转义掉 ——
+#: 一个拼 SQL 的地方不该依赖"数据源可信"这个前提，尤其它将来可能从
+#: 环境变量扩充（searchurl 的 SEARCH_DELIVERY_FILTERS 就是这么长出来的）。
+_EVENT_MARKETPLACES_SQL = ", ".join(
+    "'" + m.replace("'", "''") + "'" for m in EVENT_MARKETPLACES
+)
+
+#: 老库升级：把 scrape_events（**含全部分区**）上的 marketplace CHECK
+#: 换成当前值域。
+#:
+#: ⚠ 为什么必须有这一条：``CREATE TABLE IF NOT EXISTS`` 对已存在的表是 no-op，
+#:   所以改 DDL 里那条 CHECK **只对全新库生效**。生产库会继续用建库那天的旧
+#:   约束，第一条加拿大事件被拒 -> relay 事务回滚 -> 整条事件流停摆。
+#:   文件头 D-10 早就写过这个坑（「老库与新库的失败面从此不同，那比没有约束
+#:   更糟」），这里是它的兑现。
+#:
+#: ⚠ 为什么要逐分区处理而不是只改父表：分区是
+#:   ``CREATE TABLE ... (LIKE scraper.scrape_events INCLUDING ALL)`` 建的，
+#:   ``INCLUDING ALL`` 蕴含 ``INCLUDING CONSTRAINTS`` —— 每个分区都**复制**了
+#:   一份父表当时那条 CHECK，而且同名。实测（Phase 2 建的库，连库即现）：
+#:
+#:       scrape_events     scrape_events_marketplace_check  CHECK (marketplace = \'amazon.com\')
+#:       scrape_events_p0  scrape_events_marketplace_check  CHECK (marketplace = \'amazon.com\')
+#:       scrape_events_p1  scrape_events_marketplace_check  CHECK (marketplace = \'amazon.com\')
+#:       scrape_events_p2  scrape_events_marketplace_check  CHECK (marketplace = \'amazon.com\')
+#:
+#:   只改父表的话，一条 amazon.ca 事件落到 p2 时会撞上 **p2 自己那份**旧约束。
+#:   这与上面 B1（分区抄来别人的 range CHECK）是同一个机制的第二次发作。
+#:
+#: 顺序：先删旧的（父表 + 各分区）、再在父表加新的 —— 与 asin_data 那条
+#: 「先建后删」相反。那边新旧约束可以共存（都允许同一批行），这边不行：
+#: 旧约束只允许 amazon.com，两条并存时 amazon.ca 照样进不来，
+#: 「中间态也安全」这个好处根本拿不到。中间窗口在同一条 DDL 语句内，
+#: 且 relay 是唯一写入者、值域已由 normalize_marketplace 在 Python 侧保证。
+#:
+#: 新约束显式命名 ``_allowed`` 而不是让 PG 自动生成：自动名就是
+#: ``scrape_events_marketplace_check``，与要删的那条同名，幂等判定没法写。
+EVENT_MARKETPLACE_CHECK_MIGRATION = f"""
+DO $$
+DECLARE
+    part record;
+BEGIN
+    -- 父表已经是新约束 -> 整条迁移 no-op（可反复执行）。
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = \'scraper.scrape_events\'::regclass
+          AND conname  = \'scrape_events_marketplace_allowed\'
+    ) THEN
+        RETURN;
+    END IF;
+
+    -- 1) 删父表旧约束。分区上**继承来的**副本（p0 是 PARTITION OF 建的）
+    --    会跟着一起没，所以这一步在第 2 步之前。
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = \'scraper.scrape_events\'::regclass
+          AND conname  = \'scrape_events_marketplace_check\'
+    ) THEN
+        ALTER TABLE scraper.scrape_events
+            DROP CONSTRAINT scrape_events_marketplace_check;
+    END IF;
+
+    -- 2) 删各分区上**本地的**副本（p1 起是 LIKE INCLUDING ALL 抄来的，
+    --    不是继承，父表删了它们还在）。
+    FOR part IN
+        SELECT c.oid::regclass AS rel
+          FROM pg_inherits i
+          JOIN pg_class c ON c.oid = i.inhrelid
+         WHERE i.inhparent = \'scraper.scrape_events\'::regclass
+    LOOP
+        EXECUTE format(
+            \'ALTER TABLE %s DROP CONSTRAINT IF EXISTS \'
+            \'scrape_events_marketplace_check\', part.rel);
+    END LOOP;
+
+    -- 3) 父表加新约束。分区表上的 ADD CONSTRAINT 会自动传播到全部分区，
+    --    这里**不**需要再循环一次。
+    ALTER TABLE scraper.scrape_events
+        ADD CONSTRAINT scrape_events_marketplace_allowed
+        CHECK (marketplace IN ({_EVENT_MARKETPLACES_SQL}));
+END $$;
+"""
+
+
 EVENT_STREAM_DDL: List[str] = [
     "CREATE SCHEMA IF NOT EXISTS scraper",
 
@@ -730,7 +845,7 @@ EVENT_STREAM_DDL: List[str] = [
     # ---------------- 事件流：只追加，唯一写入者是 relay ----------------
     # 逐列照抄计划 §2.1，只补了 D-10 的 COLLATE "C"（字节序，扛得住
     # 「恢复进另一台 collation 不同的库」）。
-    """
+    f"""
     CREATE TABLE IF NOT EXISTS scraper.scrape_events (
         seq           bigserial   NOT NULL,
         source_id     text COLLATE "C" NOT NULL,
@@ -738,7 +853,7 @@ EVENT_STREAM_DDL: List[str] = [
         asin          text COLLATE "C" NOT NULL,
 
         marketplace   text COLLATE "C" NOT NULL
-                      CHECK (marketplace IN ('amazon.com')),
+                      CHECK (marketplace IN ({_EVENT_MARKETPLACES_SQL})),
         zip_requested text COLLATE "C" NOT NULL,
         zip_observed  text COLLATE "C",
         zip_verify    text COLLATE "C" NOT NULL,

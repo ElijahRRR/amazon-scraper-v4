@@ -121,7 +121,18 @@ class MarketplaceSpec:
     #: ISO 4217 币种码。**站点决定币种**，不看页面符号 —— 见模块 docstring 第四节。
     currency: str
     #: 价格串的符号前缀，只用于「这串文字是不是价格」的定位，不用于判定币种。
+    #: 顺序无关紧要（它只被 ``any(sym in s ...)`` 用），**不要**从这里推断
+    #: "拼价格串时该用哪个符号" —— 那是下面 ``render_symbol`` 的事。
     price_symbols: Tuple[str, ...]
+    #: 我们**自己拼**一个价格串时用的符号（页面只给了裸数字时）。
+    #:
+    #: 单列一个字段而不是从 price_symbols 里挑，是因为挑不出来：
+    #: 美国站是 ("$", "US$")、加拿大站是 ("CDN$", "C$", "$")，
+    #: "第一个"对美国站对、对加拿大站错，"最后一个"反过来。
+    #: F-012 的实现里真的先写成了「取最后一个」，于是美国站拼出了 "US$19.99"
+    #: —— 一个既有行为的静默改动，而且只有拼接路径（页面给裸数字时）才走到。
+    #: 显式字段没有这种隐式约定可以踩错。
+    render_symbol: str
     #: 出现即说明页面不在本站点语境（串区 / 代理落错国家 / 被重定向）。
     foreign_currency_markers: Tuple[str, ...]
     #: 邮编/邮政编码的形状。``None`` 表示这个站点还没定规则（见 ``validate_postal``）。
@@ -192,6 +203,8 @@ _REGISTRY: Dict[str, MarketplaceSpec] = {
         label="美国站",
         currency="USD",
         price_symbols=("$", "US$"),
+        # 逐字节等于改造前那些 f"${...}" 字面量。
+        render_symbol="$",
         # ⚠ 逐字节照抄改造前的 worker/ziputil.py:_NON_US_CURRENCY。
         #   **没有**补 "CDN$"/"C$"：补了就是改既有的美国站判定，
         #   而这次改造的前提是美国站行为一个字节都不变。
@@ -210,6 +223,10 @@ _REGISTRY: Dict[str, MarketplaceSpec] = {
         # "$" 必须在列：加拿大站大量页面就渲染成 $24.99，不含 CDN 前缀。
         # 正因如此，**币种不能从符号推**，见模块 docstring 第四节。
         price_symbols=("CDN$", "C$", "$"),
+        # 加拿大站页面上 "$24.99" 与 "CDN$ 24.99" 两种都有，拼接时用裸 $：
+        # 它是该站点更常见的渲染形态，而 marketplace 列已经说明了币种，
+        # 不需要靠符号去承载"这是加元"这个信息。
+        render_symbol="$",
         # 美元符号不在这里：它在加拿大站是**本地**币种符号。
         # 能说明「串区了」的是欧元/英镑/人民币/日元这些。
         foreign_currency_markers=("CNY", "¥", "€", "£", "JP¥"),

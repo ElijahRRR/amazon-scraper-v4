@@ -31,6 +31,7 @@ from worker.ziputil import _GLOW_LINE2_RE as _GLOW_INGRESS_LINE2_RE
 # 局部的 `ASIN_RE = r'B[0-9A-Z]{9}'`（_extract_page_asin 里那个无锚点裸片段）
 # 是另一回事，**不搬**，理由写在 common/core/idents.py 的 docstring 里。
 from common.core.idents import ASIN_RE as _ASIN_RE
+from common.core import marketplace as _marketplace
 from common.core.textclean import clean_deep as _clean_deep
 
 # ==========================================================================
@@ -115,6 +116,61 @@ ZIP_VERIFY_UNVERIFIED = "unverified"    # 根本没测（空页 / 拦截 / 解�
 
 #: 5 位邮编。两侧的零宽断言防止把 ZIP+4 的后 4 位或长数字串的一段当成邮编。
 _ZIP5_RE = re.compile(r"(?<!\d)(\d{5})(?!\d)")
+
+# ==========================================================================
+# F-012：站点相关的货币口径
+# ==========================================================================
+# 解析器的方法签名上一律用 ``spec=None`` 而不是 ``marketplace: str = None``：
+# 站点在 parse_product 入口解析**一次**，之后逐层往下传的是已经解析好的
+# MarketplaceSpec 对象。每个价格方法各自再 get() 一遍是白白做十几次字典查找
+# 与归一化，而且给了"某一层忘了传、悄悄落回美国站"的机会。
+#
+# ⚠ 站点绝不存进 self。AmazonParser 的实例在 worker 里是**全协程共享**的一个
+#   （worker/engine.py:340），不同协程同时解析不同站点的页面；写进 self 就是
+#   一个只在并发下出现、且只表现为"币种偶尔记错"的竞态。
+
+def _spec_or_default(spec):
+    """``None`` -> 美国站。所有下面这些小助手的共同入口。"""
+    return spec if spec is not None else _marketplace.get(None)
+
+
+def _mid(spec) -> str:
+    """站点规范键（'amazon.com'）。"""
+    return _spec_or_default(spec).id
+
+
+def _cur(spec) -> str:
+    """该站点的期望币种（'USD' / 'CAD'）。"""
+    return _spec_or_default(spec).currency
+
+
+def _sym(spec) -> str:
+    """拼价格串时用的货币符号（页面只给了裸数字时）。
+
+    读注册表的 ``render_symbol`` 显式字段，**不**从 ``price_symbols`` 里挑：
+    那个元组的顺序对两个站点是反的（美国 ("$","US$")、加拿大 ("CDN$","C$","$")），
+    "取第一个"和"取最后一个"各自只对一半。F-012 的实现里真踩过这一脚，
+    美国站拼出了 "US$19.99"。
+    """
+    return _spec_or_default(spec).render_symbol
+
+
+def _sym_re(spec) -> str:
+    """把货币符号转义成可以安全拼进正则的形式。
+
+    ``$`` 在正则里是行尾锚点，``CDN$`` 里的 ``$`` 同理 —— 不转义的话
+    ``'on orders over $'`` 这个模式会变成"行尾之后还有内容"，永远匹配不上。
+    """
+    return re.escape(_sym(spec))
+
+
+#: 页面上出现了**别的国家**的货币（串区 / 代理落错国家）。
+#:
+#: 逐字节等于改造前 _slx_parse_current_price 里那条内联正则 —— 它是"标记但仍
+#: 提取"的触发条件，不是币种判定。故意**不**做成按站点取：这几个符号
+#: （CNY/EUR/GBP/JPY）对美加两站来说都是"外国货币"，而把 $ 加进去会让
+#: 美国站的每一条价格都被标记。
+_FOREIGN_PRICE_RE = re.compile(r'(?:CNY|EUR|GBP|JPY|¥|€|£)\s*[\d,]+\.?\d*')
 
 # ==========================================================================
 # P4-9：parse_engine 取值
@@ -288,12 +344,24 @@ class AmazonParser:
         "full refund", "eligible for return",
     ]
 
-    def parse_product(self, html_text: str, asin: str, zip_code: str = "10001") -> Dict[str, Any]:
+    def parse_product(self, html_text: str, asin: str, zip_code: str = "10001",
+                      marketplace: str = None) -> Dict[str, Any]:
         """
         解析 Amazon 商品页面
         返回包含所有字段的字典
         即使某些字段提取失败也不会崩溃
+
+        ``marketplace``（F-012）决定**币种口径**。``None`` -> 美国站，
+        与改造前逐字节一致。
+
+        ⚠ 站点通过**参数**一路传下去，不存成 self 上的属性。
+          ``AmazonParser`` 的实例在 worker 里是**全协程共享**的一个
+          （worker/engine.py:340 `self.parser = _ParserClass()`），
+          而不同协程同时在解析不同站点的页面。把站点写进 self 会让 A 协程
+          的加拿大页面用上 B 协程刚设的美国口径 —— 一个只在并发下出现、
+          且只体现为"币种偶尔记错"的竞态。参数传递是唯一安全的做法。
         """
+        spec = _marketplace.get(marketplace)
         result = self._default_result(asin, zip_code)
 
         if not html_text:
@@ -301,12 +369,14 @@ class AmazonParser:
             return result
 
         # JSON-LD 优先提取：从结构化数据获取核心字段
-        jsonld = self._extract_jsonld(html_text)
+        jsonld = self._extract_jsonld(html_text, spec)
 
         if _USE_SELECTOLAX:
-            parsed = self._parse_with_selectolax(html_text, asin, zip_code, result, jsonld)
+            parsed = self._parse_with_selectolax(html_text, asin, zip_code,
+                                                 result, jsonld, spec)
         else:
-            parsed = self._parse_with_lxml(html_text, asin, zip_code, result, jsonld)
+            parsed = self._parse_with_lxml(html_text, asin, zip_code, result,
+                                           jsonld, spec)
 
         # 统一在**出口**剔除不可见控制字符（U+200E 等），两个引擎共用这一处。
         #
@@ -321,7 +391,8 @@ class AmazonParser:
 
     # ==================== selectolax 解析路径 ====================
 
-    def _parse_with_selectolax(self, html_text: str, asin: str, zip_code: str, result: Dict, jsonld: Dict) -> Dict:
+    def _parse_with_selectolax(self, html_text: str, asin: str, zip_code: str,
+                               result: Dict, jsonld: Dict, spec=None) -> Dict:
         """使用 selectolax 解析"""
         # P4-9：先记引擎再解析 —— 连「解析器自己炸了」的记录也要能归因到引擎。
         result["_parse_engine"] = ENGINE_SELECTOLAX
@@ -397,7 +468,7 @@ class AmazonParser:
             result["current_price"] = "See price in cart"
             result["buybox_price"] = "N/A"
             result["original_price"] = self._slx_parse_original_price(tree)
-            result["buybox_shipping"] = self._slx_parse_buybox_shipping(tree, None)
+            result["buybox_shipping"] = self._slx_parse_buybox_shipping(tree, None, spec)
             result["is_fba"] = self._slx_parse_fulfillment(tree, html_text)
             avail_node = tree.css_first('div#availability span')
             stock_text = avail_node.text(strip=True) if avail_node else ""
@@ -408,11 +479,11 @@ class AmazonParser:
             result["delivery_time"] = d_time
         else:
             # v3 增强价格解析
-            result["current_price"] = self._slx_parse_price_enhanced(tree, jsonld, sp_data)
+            result["current_price"] = self._slx_parse_price_enhanced(tree, jsonld, sp_data, spec)
             bb = self._slx_parse_buybox_price(tree)
             result["buybox_price"] = bb if bb else result["current_price"]
             result["original_price"] = self._slx_parse_original_price(tree)
-            result["buybox_shipping"] = self._slx_parse_buybox_shipping(tree, result["current_price"])
+            result["buybox_shipping"] = self._slx_parse_buybox_shipping(tree, result["current_price"], spec)
             result["is_fba"] = self._slx_parse_fulfillment(tree, html_text)
             # v3 增强库存解析
             result["stock_status"] = self._slx_parse_stock_enhanced(tree, jsonld, sp_data, html_text)
@@ -700,7 +771,7 @@ class AmazonParser:
             pass
         return "N/A"
 
-    def _slx_parse_current_price(self, tree) -> str:
+    def _slx_parse_current_price(self, tree, spec=None) -> str:
         try:
             # 方法1: 价格容器内的 a-offscreen（限定到价格区域，避免全页匹配）
             price_selectors = [
@@ -717,11 +788,20 @@ class AmazonParser:
                 node = tree.css_first(sel)
                 if node:
                     p = node.text(strip=True)
-                    if p and "$" in p:
+                    # F-012：认的是**本站点**的货币符号。
+                    #
+                    # ⚠ 这里绝不能反过来「按符号推币种」：美加两站的价格都
+                    #   渲染成 $24.99，按符号推会把加元当美元原样收下 ——
+                    #   数字对、币种错、没有任何标记。币种由站点决定
+                    #   （common/core/marketplace.py 的模块 docstring 第四节）。
+                    if p and _marketplace.has_local_price_symbol(p, _mid(spec)):
                         return p
-                    # v3: 检测非 USD 价格（CNY, EUR, GBP 等）— 标记但仍提取
-                    if p and re.search(r'(?:CNY|EUR|GBP|JPY|¥|€|£)\s*[\d,]+\.?\d*', p):
-                        return f"[非USD]{p}"
+                    # 页面渲染出了**别的国家**的货币（串区 / 代理落错国家）：
+                    # 标记但仍提取，让下游看得见这条记录有问题。
+                    # 标签按站点取：美国站仍是历史上的 "[非USD]"（逐字节不变），
+                    # 其它站点用 "[非CAD]" 这种同构写法。
+                    if p and _FOREIGN_PRICE_RE.search(p):
+                        return f"[非{_cur(spec)}]{p}"
             # 方法2: 拆分整数+小数（限定到价格容器）
             for container in ['#corePrice_feature_div', '#corePriceDisplay_desktop_feature_div',
                               '#corePrice_desktop', '#price', '#apex_offerDisplay_desktop']:
@@ -732,7 +812,7 @@ class AmazonParser:
                     whole = whole_node.text(strip=True)
                     frac = frac_node.text(strip=True)
                     if whole and frac:
-                        return f"${whole.replace('.', '')}.{frac}"
+                        return f"{_sym(spec)}{whole.replace('.', '')}.{frac}"
         except Exception:
             pass
         return "N/A"
@@ -769,7 +849,8 @@ class AmazonParser:
             pass
         return "N/A"
 
-    def _slx_parse_buybox_shipping(self, tree, current_price: Optional[str]) -> str:
+    def _slx_parse_buybox_shipping(self, tree, current_price: Optional[str],
+                                   spec=None) -> str:
         try:
             delivery_nodes = tree.css('div#deliveryBlockMessage *')
             delivery_block = " ".join(n.text(strip=True) for n in delivery_nodes if n.text(strip=True))
@@ -779,11 +860,16 @@ class AmazonParser:
                 return "FREE"
 
             # 满额免邮
-            free_over = re.search(r'free delivery.*?on orders over \$(\d+(?:\.\d+)?)', delivery_block, re.IGNORECASE)
+            # F-012：货币符号按站点转义后拼进正则。加拿大站的文案是
+            # "FREE delivery ... on orders over CDN$ 35.00"，用写死的 \$ 会
+            # 匹配不到 —— 匹配不到的后果不是报错，是 buybox_shipping 静默写错。
+            free_over = re.search(
+                r'free delivery.*?on orders over\s*%s\s*(\d+(?:\.\d+)?)' % _sym_re(spec),
+                delivery_block, re.IGNORECASE)
             if free_over:
                 threshold = float(free_over.group(1))
                 if current_price and current_price not in ['N/A', 'See price in cart', '不可售']:
-                    price_match = re.search(r'\$?([\d,]+\.?\d*)', current_price)
+                    price_match = re.search(r'[^\d]*([\d,]+\.?\d*)', current_price)
                     if price_match:
                         price_val = float(price_match.group(1).replace(',', ''))
                         if price_val >= threshold:
@@ -1208,7 +1294,8 @@ class AmazonParser:
 
     # ==================== lxml 解析路径 (fallback) ====================
 
-    def _parse_with_lxml(self, html_text: str, asin: str, zip_code: str, result: Dict, jsonld: Dict) -> Dict:
+    def _parse_with_lxml(self, html_text: str, asin: str, zip_code: str,
+                         result: Dict, jsonld: Dict, spec=None) -> Dict:
         """使用 lxml 解析（fallback）"""
         # P4-9：同 selectolax 路径，先记引擎。
         result["_parse_engine"] = ENGINE_LXML
@@ -1261,7 +1348,7 @@ class AmazonParser:
             result["current_price"] = "See price in cart"
             result["buybox_price"] = "N/A"
             result["original_price"] = self._parse_original_price(tree)
-            result["buybox_shipping"] = self._parse_buybox_shipping(tree, None)
+            result["buybox_shipping"] = self._parse_buybox_shipping(tree, None, spec)
             result["is_fba"] = self._parse_fulfillment(tree, html_text)
             stock_text = self._get_text(tree, ['//div[@id="availability"]/span/text()'])
             result["stock_status"] = stock_text.strip() if stock_text else "In Stock"
@@ -1270,12 +1357,12 @@ class AmazonParser:
             result["delivery_date"] = d_date
             result["delivery_time"] = d_time
         else:
-            css_price = self._parse_current_price(tree)
+            css_price = self._parse_current_price(tree, spec)
             result["current_price"] = css_price if css_price != "N/A" else jsonld.get("current_price", "N/A")
             bb = self._parse_buybox_price(tree)
             result["buybox_price"] = bb if bb else result["current_price"]
             result["original_price"] = self._parse_original_price(tree)
-            result["buybox_shipping"] = self._parse_buybox_shipping(tree, result["current_price"])
+            result["buybox_shipping"] = self._parse_buybox_shipping(tree, result["current_price"], spec)
             result["is_fba"] = self._parse_fulfillment(tree, html_text)
             stock_text = self._get_text(tree, ['//div[@id="availability"]/span/text()'])
             result["stock_status"] = stock_text.strip() if stock_text else jsonld.get("stock_status", "In Stock")
@@ -1366,7 +1453,7 @@ class AmazonParser:
             if twister_match:
                 try:
                     price_val = float(twister_match.group(1))
-                    result["_twister_price"] = f"${price_val:.2f}"
+                    result["_twister_price"] = f"{_sym(spec)}{price_val:.2f}"
                 except (ValueError, TypeError):
                     pass
 
@@ -1630,9 +1717,10 @@ class AmazonParser:
 
         return "N/A", "N/A"
 
-    def _slx_parse_price_enhanced(self, tree, jsonld: dict, sp_data: dict) -> str:
+    def _slx_parse_price_enhanced(self, tree, jsonld: dict, sp_data: dict,
+                                  spec=None) -> str:
         """增强价格解析：CSS → JSON-LD → JS脚本数据"""
-        css_price = self._slx_parse_current_price(tree)
+        css_price = self._slx_parse_current_price(tree, spec)
         if css_price and css_price != "N/A":
             return css_price
 
@@ -1644,9 +1732,10 @@ class AmazonParser:
         for key in ["_js_display_price", "_twister_price", "_sp_price"]:
             val = sp_data.get(key)
             if val:
-                if "$" not in str(val):
+                # JS 脚本里的裸数字没有货币符号，补上**本站点**的那个。
+                if not _marketplace.has_local_price_symbol(val, _mid(spec)):
                     try:
-                        return f"${float(val):.2f}"
+                        return f"{_sym(spec)}{float(val):.2f}"
                     except (ValueError, TypeError):
                         continue
                 return str(val)
@@ -2114,7 +2203,7 @@ class AmazonParser:
 
         return None
 
-    def _extract_jsonld(self, html_text: str) -> Dict[str, Any]:
+    def _extract_jsonld(self, html_text: str, spec=None) -> Dict[str, Any]:
         """
         从 <script type="application/ld+json"> 中提取 Product 结构化数据。
         Amazon 页面通常包含 Schema.org Product 对象，字段稳定性远高于 CSS class。
@@ -2181,14 +2270,20 @@ class AmazonParser:
             for offer in offers_list:
                 if not isinstance(offer, dict):
                     continue
-                currency = offer.get("priceCurrency", "USD")
-                if currency != "USD":
+                # F-012：期望币种由**站点**决定，不再写死 USD。
+                # 这是全仓库唯一一处能看见真实币种代码的地方（JSON-LD 的
+                # priceCurrency 是 Amazon 自己标的），所以这一条判定也是
+                # 唯一能挡住"加元被当美元"的硬关卡 —— CSS 那几条只看得见
+                # 一个 $ 符号，永远分辨不出来。
+                want = _cur(spec)
+                currency = offer.get("priceCurrency", want)
+                if currency != want:
                     continue
                 price = offer.get("price") or offer.get("lowPrice")
                 if price is not None:
                     try:
                         price_val = float(price)
-                        result["current_price"] = f"${price_val:,.2f}"
+                        result["current_price"] = f"{_sym(spec)}{price_val:,.2f}"
                     except (ValueError, TypeError):
                         pass
 
@@ -2198,7 +2293,7 @@ class AmazonParser:
                     result["stock_status"] = "In Stock"
                 elif "OutOfStock" in avail:
                     result["stock_status"] = "Out of Stock"
-                break  # 只取第一个 USD offer
+                break  # 只取第一个**本站点币种**的 offer
 
             # EAN / GTIN
             gtin13 = product.get("gtin13")
@@ -2466,7 +2561,7 @@ class AmazonParser:
             pass
         return "N/A"
 
-    def _parse_current_price(self, tree) -> str:
+    def _parse_current_price(self, tree, spec=None) -> str:
         try:
             # 限定到价格容器内（避免全页匹配 a-offscreen）
             price_xpaths = [
@@ -2481,7 +2576,9 @@ class AmazonParser:
             for xp in price_xpaths:
                 vals = tree.xpath(xp)
                 for v in vals:
-                    if isinstance(v, str) and "$" in v:
+                    # F-012：口径与 selectolax 孪生实现 _slx_parse_current_price
+                    # 完全一致（按站点的本地符号定位，不按符号推币种）。
+                    if isinstance(v, str) and _marketplace.has_local_price_symbol(v, _mid(spec)):
                         return v.strip()
             # fallback: 拆分整数+小数（限定到价格容器）
             for container_id in ['corePrice_feature_div', 'corePriceDisplay_desktop_feature_div',
@@ -2492,7 +2589,7 @@ class AmazonParser:
                     w = whole[0].strip().replace('.', '')
                     f = frac[0].strip()
                     if w and f:
-                        return f"${w}.{f}"
+                        return f"{_sym(spec)}{w}.{f}"
             # 全局 fallback 已移除，避免匹配推荐区域价格
         except Exception:
             pass
@@ -2529,7 +2626,8 @@ class AmazonParser:
             pass
         return "N/A"
 
-    def _parse_buybox_shipping(self, tree, current_price: Optional[str]) -> str:
+    def _parse_buybox_shipping(self, tree, current_price: Optional[str],
+                               spec=None) -> str:
         try:
             delivery_texts = self._get_all_text(tree, '//div[@id="deliveryBlockMessage"]//text()')
             delivery_block = " ".join(delivery_texts)
@@ -2537,11 +2635,16 @@ class AmazonParser:
             if "prime members get free delivery" in delivery_block.lower():
                 return "FREE"
 
-            free_over = re.search(r'free delivery.*?on orders over \$(\d+(?:\.\d+)?)', delivery_block, re.IGNORECASE)
+            # F-012：货币符号按站点转义后拼进正则。加拿大站的文案是
+            # "FREE delivery ... on orders over CDN$ 35.00"，用写死的 \$ 会
+            # 匹配不到 —— 匹配不到的后果不是报错，是 buybox_shipping 静默写错。
+            free_over = re.search(
+                r'free delivery.*?on orders over\s*%s\s*(\d+(?:\.\d+)?)' % _sym_re(spec),
+                delivery_block, re.IGNORECASE)
             if free_over:
                 threshold = float(free_over.group(1))
                 if current_price and current_price not in ['N/A', 'See price in cart', '不可售']:
-                    price_match = re.search(r'\$?([\d,]+\.?\d*)', current_price)
+                    price_match = re.search(r'[^\d]*([\d,]+\.?\d*)', current_price)
                     if price_match:
                         price_val = float(price_match.group(1).replace(',', ''))
                         if price_val >= threshold:
