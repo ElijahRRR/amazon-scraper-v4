@@ -164,6 +164,32 @@ def _sym_re(spec) -> str:
     return re.escape(_sym(spec))
 
 
+#: 零宽 / 方向控制字符。Amazon 页面上这些混在文本里很常见
+#: （``&zwnj;`` / ``&lrm;`` / BOM），它们不可见，但会让任何"整串匹配"
+#: 的正则失配 —— 而失配的表现是字段悄悄变空，不是报错。
+#: 详情表里「这一行说的是**包装/运输件**，不是商品本身」的标志词（压紧形）。
+#:
+#: ⚠ ``parcel`` 是 F-012 实测补进来的：加拿大站的标签是 **"Parcel Dimensions"**，
+#:   不是美国站常见的 "Package Dimensions"。原判据只认 ``package``，于是
+#:   加拿大站的**包装**尺寸/重量被存进了 item_dimensions / item_weight ——
+#:   不是漏采，是**存错了字段**，而两个字段都有值、看不出哪个是错的。
+#:   这正是用户报的「包装尺寸误存为商品尺寸」。
+#: ``shipping`` 同理（"Shipping Weight"），两个站点都出现过。
+_PACKAGE_WORDS = ("package", "parcel", "shipping")
+
+#: BSR 值里的 "(See Top 100 in XXX)" —— 那是个导航链接的文字，不是排名。
+_BSR_NAV_RE = re.compile(r"\(\s*See Top 100[^)]*\)", re.I)
+
+
+def _strip_bsr_nav(v: str) -> str:
+    """去掉 BSR 值里的 "(See Top 100 in ...)" 并折叠空白。"""
+    if not v:
+        return v
+    return re.sub(r"\s+", " ", _BSR_NAV_RE.sub(" ", str(v))).strip()
+
+_ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff]")
+
+
 def _extract_postal(text: str, spec=None) -> Optional[str]:
     """从一段文字里**抽出**该站点形状的投递地编码；抽不到返回 None。
 
@@ -180,11 +206,25 @@ def _extract_postal(text: str, spec=None) -> Optional[str]:
     候选切法按空白分词后再尝试相邻两词的拼接 —— 加拿大邮编规范形里**有一个
     空格**（``K1V 7P8``），只按空白切会把它劈成两半，两半都不匹配。
     """
+    import html as _htmlmod
     from common.core import marketplace as _m
     sp = _spec_or_default(spec)
     if not text:
         return None
-    words = str(text).replace(",", " ").split()
+    # ⚠ 先反转义 + 去零宽字符，再分词。
+    #
+    # 本函数的输入来自 ``_parse_zip_observed``，而那个函数是拿正则**直接扫原始
+    # HTML** 的 —— 解析器出口那道「统一剔除不可见控制字符」它享受不到。
+    # 实测（加拿大站真实页面）glow 挂件的内容是：
+    #
+    #     <span id="glow-ingress-line2">\n     K1V 7P8&zwnj;\n   </span>
+    #
+    # 尾巴上那个 ``&zwnj;``（零宽非连接符）会让 "7P8&zwnj;" 归一化失败，
+    # 于是**整个邮编抽不出来**。这是 zip_observed 恒空的第二个原因，
+    # 与第一个（用了 5 位数字正则）互相独立 —— 修好前者才看得见后者。
+    raw = _htmlmod.unescape(str(text))
+    raw = _ZERO_WIDTH_RE.sub("", raw)
+    words = raw.replace(",", " ").split()
     # 先试单词，再试相邻两词拼接（覆盖带空格的加拿大邮编）
     candidates = list(words)
     candidates += [f"{a} {b}" for a, b in zip(words, words[1:])]
@@ -1314,16 +1354,20 @@ class AmazonParser:
                 try:
                     th = row.css_first('th')
                     tds = row.css('td')
+                    # ⚠ 值一律用 separator=" " 取。
+                    #   无分隔符拼接会把相邻元素的文字粘在一起，实测产出
+                    #   "#48 inDesks & Workstations"（in 和类目名之间没有空格）。
+                    #   这条**两个站点都有**，只是 BSR 这种多元素的值才看得出来。
                     if th and tds:
                         k = th.text(strip=True)
-                        v = tds[0].text(strip=True)
+                        v = tds[0].text(separator=" ", strip=True)
                         if k and v:
                             self._map_detail(d, k, v)
                     elif len(tds) >= 2:
                         # 两列 td 布局：第一列通常是加粗的 key（a-text-bold）
                         key_span = tds[0].css_first('span.a-text-bold') or tds[0]
                         k = key_span.text(strip=True)
-                        v = tds[1].text(strip=True)
+                        v = tds[1].text(separator=" ", strip=True)
                         if k and v and len(k) <= 50:
                             self._map_detail(d, k, v)
                 except Exception:
@@ -1339,7 +1383,24 @@ class AmazonParser:
                         spans = parent.css('span')
                         for i, sp in enumerate(spans):
                             if sp.text(strip=True) == k and i + 1 < len(spans):
-                                v = spans[i + 1].text(strip=True)
+                                v = spans[i + 1].text(separator=" ", strip=True)
+                                # F-012 实测修复：**大类排名**。
+                                #
+                                # BSR 那一行的结构是嵌套的，一个商品有多个排名：
+                                #   Best Sellers Rank: #105 in Clothing... (See Top 100...)
+                                #                      #3 in Men's T-Shirts
+                                # 取 spans[i+1] 只拿到**最里层**那个 span，
+                                # 也就是最后一个子类目排名 —— 大类那条（#105）
+                                # 整个丢了。用户报的「大类排名漏采」就是这条。
+                                #
+                                # 另外 text(strip=True) 无分隔符拼接会产出
+                                # "#3 inMen's T-Shirts"（in 和类目名粘在一起）——
+                                # 这一处同样是**两个站点都有**的老问题。
+                                #
+                                # 所以 BSR 特殊处理：取整个 li 的文本、去掉键名、
+                                # 去掉 "(See Top 100 in ...)" 这类导航链接。
+                                if 'bestsellersrank' in self._compact_key(k):
+                                    v = self._clean_bsr(parent, k) or v
                                 if k and v:
                                     self._map_detail(d, k.replace(':', ''), v)
                                 break
@@ -1739,6 +1800,12 @@ class AmazonParser:
 
         # 2) 备选：任意带 seller= 的链接（href 路径变化时兜底）
         for css, xp in (
+            # F-012 实测补：2026 版 buybox 的卖家挂件。实测两张加拿大站页面上
+            # **老的三个容器一个都不存在**，用的全是这个。
+            # 它排在页面级兜底 `a[href*="seller="]` **之前**是有意的：
+            # 那条兜底是全页扫描，会把"其它卖家"区块里的链接也捞进来。
+            ('#merchantInfoFeature_feature_div a[href*="seller="]',
+             '//*[@id="merchantInfoFeature_feature_div"]//a[contains(@href, "seller=")]'),
             ('#merchant-info a[href*="seller="]',
              '//*[@id="merchant-info"]//a[contains(@href, "seller=")]'),
             ('#tabular-buybox a[href*="seller="]',
@@ -1760,13 +1827,32 @@ class AmazonParser:
         #    selectolax 默认的 `text(strip=True)`（无分隔符拼接），真实页面上的
         #    `Sold by <a>Amazon.com</a>` 会被拼成 `Sold byAmazon.com`，这个子串
         #    判断因此**从来没命中过**，自营页恒返回 ("N/A","N/A")。
-        for css, xp in (
-            ('#merchant-info', '//*[@id="merchant-info"]'),
-            ('#tabular-buybox', '//*[@id="tabular-buybox"]'),
-            ('#offerDisplay_feature_div', '//*[@id="offerDisplay_feature_div"]'),
+        site = _mid(spec)                      # 'amazon.com' / 'amazon.ca'
+        # ⚠ 两类容器用**两套判据**，不是疏忽：
+        #
+        #   merchant_only=True  —— 这个容器**只装卖家**（2026 版 buybox 把
+        #       卖家和发货方拆成了两个 feature div）。里面出现站点域名就等于
+        #       "卖家是 Amazon 自营"，光凭域名判定是安全的。
+        #       必须这样判，因为加拿大站的文案是 **"Shipper / Seller Amazon.ca"**
+        #       —— 既不是 "Sold by" 也不是 "Ships from"，枚举文案是枚举不完的。
+        #
+        #   merchant_only=False —— 老容器把卖家和发货方混在一起。那里光看域名
+        #       会把「三方卖家 + Amazon 发货」误判成自营（blob 里有
+        #       "Ships from Amazon.ca" 也有 "Sold by SomeShop"）。所以那些容器
+        #       必须继续用"Sold by <站点>"这种带主语的短语判。
+        for css, xp, merchant_only in (
+            ('#merchantInfoFeature_feature_div',
+             '//*[@id="merchantInfoFeature_feature_div"]', True),
+            ('#merchant-info', '//*[@id="merchant-info"]', False),
+            ('#tabular-buybox', '//*[@id="tabular-buybox"]', False),
+            ('#offerDisplay_feature_div', '//*[@id="offerDisplay_feature_div"]', False),
         ):
             blob = (self._uni_first_text(tree, css, xp) or "").lower()
             if not blob:
+                continue
+            if merchant_only:
+                if site in blob:
+                    return "AMAZON", site.capitalize()
                 continue
             # F-012：自营文案里的域名**跟着站点变** —— 加拿大站是
             # "Sold by Amazon.ca" / "Ships from Amazon.ca"。
@@ -1775,7 +1861,6 @@ class AmazonParser:
             # 加拿大站的自营商品匹配不上，掉进下面那条 merchantID 兜底，
             # seller_id/seller_name（两个导出列）于是变成别的值或 N/A，
             # 而这条记录看起来完全正常。
-            site = _mid(spec)                      # 'amazon.com' / 'amazon.ca'
             if f"sold by {site}" in blob or f"ships from {site}" in blob:
                 # 返回值保持**首字母大写的站点域名**（"Amazon.com" / "Amazon.ca"），
                 # 与改造前美国站那个字面量同形。
@@ -2561,31 +2646,76 @@ class AmazonParser:
         """详情表键名归一化：小写 → 非 [a-z0-9&/ ] 字符换空格 → 折叠空白。"""
         return re.sub(r"\s+", " ", cls._KEY_JUNK_RE.sub(" ", (k or "").lower())).strip()
 
+    @staticmethod
+    def _compact_key(k: str) -> str:
+        """键名压成**只剩小写字母数字** —— 空格、冒号、双向控制符全部去掉。
+
+        F-012 实测修复：Amazon 同一个字段的标签**空格数不固定**。
+        实测（加拿大站 YATINEY 书桌）页面上写的是：
+
+            <tr><td>ManufacturerPartNumber</td><td>DN01UDBBY2</td></tr>
+
+        —— 一个空格都没有。而映射的判据是 ``'part number' in k_lower``，
+        于是 ``part_number`` 恒空。同一张页面上 ``Model Number`` 是带空格的，
+        所以 model_number 取到了 —— 一半对一半错，最难发现的那种。
+
+        压紧之后 ``manufacturerpartnumber`` 与 ``manufacturer part number``
+        归到同一个串，两种写法都认。
+        """
+        return re.sub(r"[^a-z0-9]", "", (k or "").lower())
+
+    @staticmethod
+    def _clean_bsr(node, key: str) -> str:
+        """从 BSR 那一行里取出**完整**排名串（含大类 + 各子类）。
+
+        取整个容器的文本（带空格分隔），砍掉键名前缀，再去掉
+        ``(See Top 100 in ...)`` 这种导航链接文字 —— 那是个链接，不是排名。
+
+        产出形如：``#105 in Clothing, Shoes & Accessories #3 in Men's T-Shirts``
+        """
+        try:
+            txt = node.text(separator=" ", strip=True)
+        except Exception:
+            return ""
+        if not txt:
+            return ""
+        # 砍键名前缀（键名自带的冒号可能在也可能不在）
+        idx = txt.find(key)
+        if idx >= 0:
+            txt = txt[idx + len(key):]
+        txt = txt.lstrip(": \u200e\u200f")
+        # 导航链接的清理交给 _map_detail 统一做（两条来源共用一处）。
+        return re.sub(r"\s+", " ", txt).strip()
+
     def _map_detail(self, d: Dict, k: str, v: str):
         """字段名映射"""
         k_lower = k.lower()
-        if 'model number' in k_lower:
+        # 压紧形：对"标签里有没有空格"免疫，见 _compact_key 的说明。
+        k_flat = self._compact_key(k)
+        if 'modelnumber' in k_flat:
             d['model_number'] = v
-        elif 'part number' in k_lower:
-            # 'part number' 排在 'manufacturer' 之前，所以 "Manufacturer Part Number"
+        elif 'partnumber' in k_flat:
+            # 'partnumber' 排在 'manufacturer' 之前，所以 "Manufacturer Part Number"
             # 一直落位正确 —— 当年活着的只有年龄段那一条。
             d['part_number'] = v
-        elif 'country of origin' in k_lower:
+        elif 'countryoforigin' in k_flat:
             d['country_of_origin'] = v
-        elif 'best sellers rank' in k_lower:
-            d['best_sellers_rank'] = v
+        elif 'bestsellersrank' in k_flat:
+            # "( See Top 100 in XXX )" 是个**导航链接**，不是排名 —— 去掉。
+            # 放在这里（而不是各提取路径里）是因为 BSR 有两条来源：
+            # detailBullets 的 li 和 tech-spec 的 tr，两边都会撞上它。
+            d['best_sellers_rank'] = _strip_bsr_nav(v)
         elif self._norm_detail_key(k) in self._MANUFACTURER_KEYS:
             d['manufacturer'] = v
         elif k_lower.strip() == 'brand':
             d['brand'] = v
-        elif 'date first available' in k_lower:
+        elif 'datefirstavailable' in k_flat:
             d['date_first_available'] = v
         elif 'upc' in k_lower:
             d['upc'] = v
-        elif 'weight' in k_lower and 'item' in k_lower:
+        elif 'weight' in k_flat and 'item' in k_flat:
             d['item_weight'] = v
-        elif 'weight' in k_lower and ('package' in k_lower
-                                      or 'shipping' in k_lower):
+        elif 'weight' in k_flat and any(w in k_flat for w in _PACKAGE_WORDS):
             # F-012 实测修复：加上 ``shipping``。
             #
             # Amazon 这一行的标签有两种写法：``Package Weight`` 与
@@ -2608,7 +2738,7 @@ class AmazonParser:
             #   这条与站点无关，美国站一直也是这样 —— F-012 实测顺带发现。
             dim_part, w = self._split_dim_weight(v)
             d['package_weight'] = w if w != "N/A" else dim_part
-        elif 'dimensions' in k_lower:
+        elif 'dimensions' in k_flat:
             # F-012 实测修复：**重量那一半不再丢掉**。
             #
             # Amazon 常把尺寸和重量塞进同一行，用分号分隔：
@@ -2622,7 +2752,7 @@ class AmazonParser:
             # （字典迭代顺序 = 页面上的行序，所以"先到先得"不可靠，
             #   必须显式判空。）
             dim, w = self._split_dim_weight(v)
-            if 'package' in k_lower:
+            if any(w_ in k_flat for w_ in _PACKAGE_WORDS):
                 d['package_dimensions'] = dim
                 if w != "N/A" and not d.get('package_weight'):
                     d['package_weight'] = w
@@ -2903,9 +3033,21 @@ class AmazonParser:
 
     def _parse_bullet_points(self, tree) -> str:
         try:
-            bullets = self._get_all_text(tree, '//div[@id="feature-bullets"]//ul/li//span[@class="a-list-item"]//text()')
+            # ⚠ ``contains(@class, ...)`` 而不是 ``@class="..."``。
+            #
+            # ``@class="a-list-item"`` 要求 class 属性**完全等于**这一个词，
+            # 而真实页面上是 ``class="a-list-item a-size-base a-color-base"``
+            # —— 于是这条 xpath 在**任何现代 Amazon 页面上都匹配 0 个节点**，
+            # lxml 引擎的 bullet_points 恒为空。
+            #
+            # 这条与站点无关（美国站也一样），是 F-012 用真实加拿大页面跑
+            # 双引擎一致性（tests/test_ca_real_pages.py:BothEnginesAgree）时
+            # 暴露的 —— selectolax 的 ``span.a-list-item`` 是"包含"语义，
+            # 两条引擎因此给出完全不同的答案，而构造的测试 HTML 里 class 恰好
+            # 只有一个词，所以一直没被发现。
+            bullets = self._get_all_text(tree, '//div[@id="feature-bullets"]//ul/li//span[contains(@class,"a-list-item")]//text()')
             if not bullets:
-                bullets = self._get_all_text(tree, '//div[contains(@class,"a-expander-content")]//ul/li//span[@class="a-list-item"]//text()')
+                bullets = self._get_all_text(tree, '//div[contains(@class,"a-expander-content")]//ul/li//span[contains(@class,"a-list-item")]//text()')
 
             clean = []
             for b in bullets:
