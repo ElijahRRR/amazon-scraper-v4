@@ -501,5 +501,145 @@ class ThingsTheFirstPassMissed(unittest.TestCase):
                          + "\n  ".join(offenders))
 
 
+# ==========================================================================
+# 9) 真实采集（加拿大站）暴露出来的字段级缺陷
+# ==========================================================================
+class FieldBugsFoundByRealCollection(unittest.TestCase):
+    """2026-09-19 真机采两件加拿大商品时发现的缺陷，逐条钉住。
+
+    这一组和上面所有组的性质不同：上面那些是**读代码**推出来的，
+    这一组是**页面打脸**打出来的 —— 采集成功、completeness 过得去、
+    库里那一行看着完全正常，只有拿网页逐字段对照才看得见。
+
+    ⚠ 其中三条（Shipping Weight、尺寸行里的重量、纯重量值）**与站点无关**，
+      美国站一直也是错的。是开加拿大站时顺带发现的。
+    """
+
+    def setUp(self):
+        from worker.parser import AmazonParser
+        self.p = AmazonParser()
+
+    # ---------------------------------------------------------- 邮编观测
+    def test_zip_observed_is_extracted_on_a_canadian_page(self):
+        """实测症状：两件商品的 zip_observed 都是空，页面明明显示了完整邮编。
+
+        根因：``_parse_zip_observed`` 用 ``_ZIP5_RE``（5 位数字），
+        而 "Ottawa K1V 7P8" 里没有 5 位连续数字。
+        第一轮改造泛化了 ``worker/ziputil.py``，漏了 parser 里这份独立实现。
+        """
+        html = ('<html><body><span id="glow-ingress-line2">Ottawa K1V 7P8</span>'
+                '<span id="productTitle">T</span></body></html>')
+        r = self.p.parse_product(html, "B0ZIPOBS01", "K1V 7P8", "amazon.ca")
+        self.assertEqual(r["_zip_observed"], "K1V 7P8")
+        self.assertEqual(r["_zip_verify"], "confirmed",
+                         "观测值抽不出来时这里会恒落 assumed —— 那正是实测看到的")
+
+    def test_zip_mismatch_is_still_detected_on_a_canadian_page(self):
+        """反向哨兵：别为了让 confirmed 出现而把判定变成常量。"""
+        html = ('<html><body><span id="glow-ingress-line2">Toronto M5V 3L9</span>'
+                '<span id="productTitle">T</span></body></html>')
+        r = self.p.parse_product(html, "B0ZIPMIS01", "K1V 7P8", "amazon.ca")
+        self.assertEqual(r["_zip_observed"], "M5V 3L9")
+        self.assertEqual(r["_zip_verify"], "mismatch")
+
+    def test_us_zip_observation_is_unchanged(self):
+        """美国站这条路一个字节没动。"""
+        html = ('<html><body><span id="glow-ingress-line2">New York 10001</span>'
+                '<span id="productTitle">T</span></body></html>')
+        r = self.p.parse_product(html, "B0ZIPUS001", "10001")
+        self.assertEqual(r["_zip_observed"], "10001")
+        self.assertEqual(r["_zip_verify"], "confirmed")
+
+    # ---------------------------------------------------------- 卖点重复
+    def test_bullets_are_deduped(self):
+        """实测症状：六条卖点采成十二条 —— 正好两倍。
+
+        根因：``#feature-bullets`` 里同时有可见的 ul 和 "See more" 展开区
+        （``div.a-expander-content``）里的同一份副本，选择器两份都命中。
+        """
+        lis = "".join(f'<li><span class="a-list-item">卖点{i}</span></li>'
+                      for i in range(1, 7))
+        html = (f'<html><body><span id="productTitle">T</span>'
+                f'<div id="feature-bullets"><ul>{lis}</ul>'
+                f'<div class="a-expander-content"><ul>{lis}</ul></div>'
+                f'</div></body></html>')
+        r = self.p.parse_product(html, "B0BULLET01", "K1V 7P8", "amazon.ca")
+        bullets = r["bullet_points"].split("\n")
+        self.assertEqual(len(bullets), 6, f"应当去重成 6 条，实得 {len(bullets)}")
+        self.assertEqual(bullets, [f"卖点{i}" for i in range(1, 7)],
+                         "去重必须保序")
+
+    def test_genuinely_different_bullets_are_all_kept(self):
+        """反向哨兵：去重不能把"真的两组卖点"砍掉一组。"""
+        a = "".join(f'<li><span class="a-list-item">A{i}</span></li>' for i in (1, 2))
+        b = "".join(f'<li><span class="a-list-item">B{i}</span></li>' for i in (1, 2))
+        html = (f'<html><body><span id="productTitle">T</span>'
+                f'<div id="feature-bullets"><ul>{a}</ul><ul>{b}</ul>'
+                f'</div></body></html>')
+        r = self.p.parse_product(html, "B0BULLET02", "10001")
+        self.assertEqual(r["bullet_points"].split("\n"), ["A1", "A2", "B1", "B2"])
+
+    # ---------------------------------------------------------- 尺寸 / 重量
+    def _details_page(self, rows):
+        trs = "".join(f"<tr><th>{k}</th><td>{v}</td></tr>" for k, v in rows)
+        return (f'<html><body><span id="productTitle">T</span>'
+                f'<table id="productDetails_techSpec_section_1">{trs}</table>'
+                f'</body></html>')
+
+    def test_shipping_weight_label_is_recognised(self):
+        """实测症状：包装重量漏采。
+
+        根因：判据是 ``'weight' and 'package'``，而 Amazon 另一种写法是
+        ``Shipping Weight`` —— 两个条件都不满足，**整条 elif 链走空**，
+        不是存错位置，是一个字都没存。与站点无关，美国站一直也是这样。
+        """
+        for label in ("Package Weight", "Shipping Weight"):
+            with self.subTest(label=label):
+                r = self.p.parse_product(
+                    self._details_page([(label, "200 g")]), "B0WT000001", "10001")
+                self.assertEqual(r["package_weight"], "200 g", label)
+
+    def test_a_weight_only_value_is_not_swallowed(self):
+        """纯重量值（没有分号）不能被当成尺寸丢掉。
+
+        ``_split_dim_weight`` 按分号拆 "尺寸; 重量"，重量行本身没有分号 ->
+        parts[1] 不存在 -> 原实现存了 "N/A"，真值被扔在 parts[0]。
+        """
+        r = self.p.parse_product(
+            self._details_page([("Package Weight", "1.2 pounds")]),
+            "B0WT000002", "10001")
+        self.assertEqual(r["package_weight"], "1.2 pounds")
+
+    def test_weight_embedded_in_a_dimensions_row_is_kept(self):
+        """Amazon 常把尺寸和重量塞进同一行，原实现把重量那一半直接扔了。
+
+            Product Dimensions: 25 x 20 x 5 cm; 200 g
+        """
+        r = self.p.parse_product(
+            self._details_page([("Product Dimensions", "25 x 20 x 5 cm; 200 g")]),
+            "B0DIM00001", "K1V 7P8", "amazon.ca")
+        self.assertEqual(r["item_dimensions"], "25 x 20 x 5 cm")
+        self.assertEqual(r["item_weight"], "200 g", "重量那一半不许再丢")
+
+    def test_a_dedicated_weight_row_wins_over_the_embedded_one(self):
+        """页面上另有专门的重量行时，它更权威，不许被尺寸行里那个覆盖。"""
+        r = self.p.parse_product(
+            self._details_page([
+                ("Product Dimensions", "25 x 20 x 5 cm; 999 g"),
+                ("Item Weight", "200 g"),
+            ]), "B0DIM00002", "10001")
+        self.assertEqual(r["item_weight"], "200 g")
+
+    def test_package_dimensions_row_still_maps_to_package(self):
+        """回归：带 package 的尺寸行不能被上面的改动带偏。"""
+        r = self.p.parse_product(
+            self._details_page([("Package Dimensions", "30 x 20 x 10 cm; 1.5 kg")]),
+            "B0DIM00003", "10001")
+        self.assertEqual(r["package_dimensions"], "30 x 20 x 10 cm")
+        self.assertEqual(r["package_weight"], "1.5 kg")
+        self.assertEqual(r["item_dimensions"], "N/A",
+                         "package 行不许落进 item 字段")
+
+
 if __name__ == "__main__":
     unittest.main()

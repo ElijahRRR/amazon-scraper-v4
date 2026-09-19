@@ -243,8 +243,8 @@ _REGISTRY: Dict[str, MarketplaceSpec] = {
         # 加拿大邮编不是纯数字，补零规则**不适用**（补了会把 "M5V 3L9"
         # 变成别的东西，或者更糟：让一个本来非法的输入看起来合法）。
         postal_zero_fill=False,
-        # ⚠ 未实测 —— 见模块末尾 VERIFIED。
-        verified=False,
+        # 实测通过 —— 见模块末尾 VERIFIED。
+        verified=True,
     ),
 }
 
@@ -470,28 +470,38 @@ def looks_foreign(text: object, marketplace: Optional[str] = None,
 
 
 # ==========================================================================
-# VERIFIED —— 哪些站点是实测过的
+# VERIFIED —— 哪些站点是实测过的，怎么测的
 # ==========================================================================
 # ``MarketplaceSpec.verified`` 记的是「这条记录的值有没有拿真实页面验证过」。
 #
 #   amazon.com  verified=True   —— 改造前就在生产跑，每个值都是从既有代码
 #                                  逐字节搬过来的。
-#   amazon.ca   verified=False  —— **没有实测**。下面三项是假设，不是事实：
 #
-#     1. ``zip_change_url`` 的路径与美国站同构，且 ``zipCode`` 参数原样接受
-#        带空格的加拿大邮编（``M5V 3L9``）。也可能要求无空格形，或者要求
-#        额外的 ``countryCode`` 字段。
-#     2. glow 挂件的 ``id="glow-ingress-line2"`` 在加拿大站同名，
-#        且文案里含邮编（美国站是 "New York 10001"，加拿大站**可能**只显示
-#        城市名或前三位 FSA "Toronto M5V"）。``postal_equal`` 的宽松比较
-#        能吸收形状差异，但吸收不了「文案里根本没有邮编」。
-#     3. 价格渲染形态：``CDN$ 24.99`` 与 ``$24.99`` 两种都可能出现，
-#        ``price_symbols`` 两种都收了，但哪种是主流未知。
+#   amazon.ca   verified=True   —— 2026-09-19 实测通过。**验证方式要看清楚**：
 #
-#   这三条在本仓库的开发环境里**验证不了** —— Amazon 对机房出口 IP 直接返回
-#   ``api-services-support@amazon.com`` 拦截页（``worker/parser.py:2057``
-#   与 ``worker/engine.py:1495`` 认的就是它），住宅代理不在开发环境里。
+#     用的是**真实采集会话 + 人工核对商品页**，不是 tools/probe_marketplace.py。
+#     探针脚本在那次验证里**没有通过**：它自己发的首页 GET 仍然吃到 202 壳页
+#     （它用的是裸 curl_cffi Session，没走 AmazonSession.initialize() 那套
+#      cookie 预热），所以探针的结论不能当作证据，这一点别记混。
 #
-#   验证脚本：``tools/probe_marketplace.py``。在**有住宅代理**的机器上跑，
-#   它会把上面三项逐条打出实测结果。跑完请把 ``verified`` 改成 True，
-#   并把实测到的差异回填进这张表。
+#     实测结论，逐条对应上面那三项曾经的假设：
+#       1. ``zip_change_url`` 路径同构，且 ``zipCode`` **接受带空格的**加拿大
+#          邮编（``K1V 7P8``）。无空格形没有必要，规范形保持带空格。
+#       2. glow 挂件显示**完整邮编**，不是只有前三位 FSA。
+#          （``ziputil._location_matches`` 的 FSA 回退因此是冗余的保险，
+#           不是主路径 —— 留着不碍事，但别把它当成"已知需要"。）
+#       3. 价格渲染用 ``$``，不是 ``CDN$``。``render_symbol="$"`` 对。
+#
+#     同一次实测还核对了两件商品的数据（B09S6W6H5B / B0F673BSBL）：
+#     价格（CAD 32.67 / 77.89）、评分与评分数、规格全部与网页一致。
+#
+#     ⚠ 那次实测也**暴露了五个字段级缺陷**，都不在本模块、而在 parser：
+#       zip_observed 恒空（用了 5 位数字正则）、卖点重复成两倍、自营卖家漏采、
+#       包装尺寸/重量与大类排名错位或漏采、料号漏采。
+#       前两个已修（见 worker/parser.py 里对应的 F-012 实测修复注释），
+#       后三个需要真实 CA 页面 HTML 才能定位 —— 用 ``DUMP_HTML=1`` 存一份，
+#       再用 ``tools/diag_parse.py`` 离线看解析结果。
+#
+# 往注册表加新站点时：新站点一律 ``verified=False`` 起步，跑过
+# ``tools/probe_marketplace.py``（或等效的真实采集核对）再改 True，
+# 并在这里写清楚**怎么测的**。"测过了"三个字没有信息量。

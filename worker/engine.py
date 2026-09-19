@@ -441,6 +441,10 @@ class Worker:
 
         # 降级页样本采集（排查用，默认关，见 config.DUMP_DEGRADED_HTML）
         self._dump_degraded = getattr(config, "DUMP_DEGRADED_HTML", False)
+        # 成功页留档（F-012 实测之后补的：解析缺陷都发生在**成功页**上，
+        # 而 _dump_degraded_html 只在降级页触发，采成功的页一张也留不下来）
+        self._dump_ok = getattr(config, "DUMP_HTML", False)
+        self._ok_dump_count = 0
         self._degraded_dump_max = getattr(config, "DEGRADED_DUMP_MAX", 300)
         self._degraded_dump_count = 0
         self._degraded_dump_dir = os.path.join(
@@ -1234,6 +1238,37 @@ class Worker:
             return False
         return True
 
+    async def _dump_ok_html(self, asin: str, zip_code: str, marketplace: str,
+                            html: str):
+        """把**采集成功**的商品页原样存一份，供离线排查解析缺陷。
+
+        默认关（``DUMP_HTML=1`` 开启），与降级页 dump 共用数量上限。
+        文件名带站点，因为要排查的恰恰是站点差异。
+        任何异常都吞掉 —— 排查工具绝不能影响采集主流程。
+        """
+        if not self._dump_ok or not html:
+            return
+        if self._ok_dump_count >= self._degraded_dump_max:
+            return
+        try:
+            out_dir = os.path.join(self._degraded_dump_dir, "ok")
+            os.makedirs(out_dir, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            safe_zip = (zip_code or "na").replace(" ", "")
+            fname = f"{marketplace}_{asin}_{safe_zip}_{ts}.html"
+            path = os.path.join(out_dir, fname)
+            async with aiofiles.open(path, "w", encoding="utf-8") as f:
+                await f.write(html)
+            self._ok_dump_count += 1
+            if self._ok_dump_count == 1:
+                logger.info("🗂️ 成功页留档已开启（DUMP_HTML=1），写入 %s"
+                            " —— 排查完记得关，一张页 0.5-2MB", out_dir)
+            elif self._ok_dump_count == self._degraded_dump_max:
+                logger.info("🗂️ 成功页留档已达上限 %d，停止 dump",
+                            self._degraded_dump_max)
+        except Exception as e:
+            logger.debug(f"成功页 dump 失败 {asin}: {e}")
+
     async def _dump_degraded_html(self, asin: str, zip_code: str, html: str):
         """把疑似降级页的原始 HTML 存到独立目录（截图流程不碰它），供离线排查。
 
@@ -1721,6 +1756,7 @@ class Worker:
                     await self._dump_degraded_html(asin, zip_code, resp.text)
 
                 # 成功
+                await self._dump_ok_html(asin, target_zip, task_marketplace, resp.text)
                 self._controller.record_result(req_elapsed, True, False, resp_bytes)
                 # P4-1/P4-2/P4-9：把采集参数与质量元数据挂到提交体上（`_` 键，不落 asin_data）
                 self._attach_collection_meta(

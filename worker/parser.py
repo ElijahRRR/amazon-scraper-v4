@@ -164,6 +164,37 @@ def _sym_re(spec) -> str:
     return re.escape(_sym(spec))
 
 
+def _extract_postal(text: str, spec=None) -> Optional[str]:
+    """从一段文字里**抽出**该站点形状的投递地编码；抽不到返回 None。
+
+    与 ``common/core/marketplace.normalize_postal`` 的区别是「抽取 vs 校验」：
+    那个函数要求整串就是一个邮编，这里要从 ``"Ottawa K1V 7P8"`` 这种
+    glow 文案里把邮编捞出来。仓库里 ``_norm_zip`` 的 docstring 把这条差别
+    叫做「串内抽取」，本函数就是它的站点感知版。
+
+    实现是**用注册表的 postal_pattern 去扫每一个候选子串**，而不是给每个
+    站点再写一条「宽松版」正则：多写一条就多一个会和 postal_pattern 分叉的
+    地方，而它俩分叉的表现是"校验说合法、抽取抽不到"（或反过来），
+    没有任何东西会响。
+
+    候选切法按空白分词后再尝试相邻两词的拼接 —— 加拿大邮编规范形里**有一个
+    空格**（``K1V 7P8``），只按空白切会把它劈成两半，两半都不匹配。
+    """
+    from common.core import marketplace as _m
+    sp = _spec_or_default(spec)
+    if not text:
+        return None
+    words = str(text).replace(",", " ").split()
+    # 先试单词，再试相邻两词拼接（覆盖带空格的加拿大邮编）
+    candidates = list(words)
+    candidates += [f"{a} {b}" for a, b in zip(words, words[1:])]
+    for cand in candidates:
+        norm = _m.normalize_postal(cand, sp.id)
+        if norm is not None:
+            return norm
+    return None
+
+
 #: 页面上出现了**别的国家**的货币（串区 / 代理落错国家）。
 #:
 #: 逐字节等于改造前 _slx_parse_current_price 里那条内联正则 —— 它是"标记但仍
@@ -411,7 +442,7 @@ class AmazonParser:
 
         # P4-1 / P4-2：质量信号。放在拦截判定**之后** —— 验证码页上的
         # completeness 必须是 0（未测量），而不是「三个区块都缺」。
-        self._apply_quality_signals(result, tree, html_text, zip_code)
+        self._apply_quality_signals(result, tree, html_text, zip_code, spec)
 
         # variant 偏移检测：提取页面当前 active ASIN 供上层校验
         # 多属性产品偶发 default variant 偏移，写到 result["_page_asin"]
@@ -1125,7 +1156,32 @@ class AmazonParser:
                 if any(spam in b.lower() for spam in self.BULLET_BLACKLIST):
                     continue
                 clean.append(b)
-            return "\n".join(clean)
+
+            # F-012 实测修复：**按顺序去重**。
+            #
+            # 实测（加拿大站 Gildan 三件装）六条卖点被采成了十二条 —— 正好
+            # 两倍。根因是 `#feature-bullets` 里同时存在两份 `ul`：
+            # 可见的那份，加上 "See more" 展开区（`div.a-expander-content`）
+            # 里的同一份副本。上面那条选择器是 `... ul > li span.a-list-item`，
+            # 两份都命中。
+            #
+            # ⚠ 为什么是去重而不是"只取第一个 ul"：哪一份在前不由我们决定，
+            #   而且有的页面真的把卖点拆在两个 ul 里（不是副本）。
+            #   按顺序去重对"真两份"无损，对"副本"正好修掉。
+            #
+            # ⚠ 这条**对美国站也生效**，而且是一次行为改动：
+            #   `bullet_points` 在 `_HASH_FIELDS` 与 `_TITLE_BULLETS_FIELDS` 里，
+            #   所以任何一个"卖点本来就重复"的 ASIN，下一次采集会产出一条
+            #   **一次性的假变动**（title_bullets 变了）。那是修复的代价，
+            #   不是新缺陷 —— 重复的卖点从来就不是对的数据。
+            seen = set()
+            deduped = []
+            for b in clean:
+                if b in seen:
+                    continue
+                seen.add(b)
+                deduped.append(b)
+            return "\n".join(deduped)
         except Exception:
             return ""
 
@@ -1320,7 +1376,7 @@ class AmazonParser:
             return result
 
         # P4-1 / P4-2：与 selectolax 路径同一份逻辑、同一个位置。
-        self._apply_quality_signals(result, tree, html_text, zip_code)
+        self._apply_quality_signals(result, tree, html_text, zip_code, spec)
 
         # variant 偏移检测（同 selectolax 路径）：从 HTML 提取页面当前 active ASIN
         result["_page_asin"] = self._extract_page_asin(None, html_text)
@@ -2097,7 +2153,7 @@ class AmazonParser:
     # ==================== P4-1 邮编观测 / 判定 ====================
 
     @staticmethod
-    def _parse_zip_observed(html_text: str) -> Optional[str]:
+    def _parse_zip_observed(html_text: str, spec=None) -> Optional[str]:
         """从 glow 配送挂件的**第二行**抽出页面上实际生效的邮编；取不到返回 None。
 
         `_slx_parse_zip_code` / `_parse_zip_code` 读的是 ``glow-ingress-line1``，
@@ -2109,6 +2165,13 @@ class AmazonParser:
         这里**不做**「取不到就回退成请求值」的兜底：取不到就是 None。理由与
         ziputil.py:26-28 完全一致 —— 把请求值伪装成观测值，会让 zip_verify
         永远是 confirmed，等于把这个信号变成常量。
+
+        ⚠ F-012：抽取用的是**该站点的邮编形状**，不是写死的 5 位数字。
+        写死 ``_ZIP5_RE`` 的后果是加拿大站恒返回 None —— glow 显示的
+        "Ottawa K1V 7P8" 里根本没有 5 位连续数字，于是 zip_observed 恒空、
+        zip_verify 恒落 ``assumed``。这条是**实测**出来的：真实采集两件加拿大
+        商品，页面明明显示了完整邮编，库里两条的观测值都是空。
+        第一轮改造泛化了 ``worker/ziputil.py``，漏了 parser 里这份独立实现。
         """
         if not html_text:
             return None
@@ -2116,14 +2179,13 @@ class AmazonParser:
             m = _GLOW_INGRESS_LINE2_RE.search(html_text)
             if not m:
                 return None
-            z = _ZIP5_RE.search(m.group(1) or "")
-            return z.group(1) if z else None
+            return _extract_postal(m.group(1) or "", spec)
         except Exception:
             return None
 
     @staticmethod
-    def _norm_zip(z: Any) -> Optional[str]:
-        """邮编归一化到 5 位字符串；无法归一化返回 None。
+    def _norm_zip(z: Any, spec=None) -> Optional[str]:
+        """邮编归一化；无法归一化返回 None。（美国站是 5 位字符串）
 
         ⚠ P4.6：这是仓库里四份邮编归一化之一，**刻意不与另外三份合并**
         （``server/app.py:_normalize_zip``、``common/pgdb/relay.py`` 的
@@ -2135,21 +2197,29 @@ class AmazonParser:
         本函数的数字分支写的是 ``0 < len(head) <= 5``，比真源多允许 ``== 5``，
         而 ``"12345".zfill(5) == "12345"`` ⇒ **结果完全一致**。没有改写成调用
         真源，是因为那要动 worker 侧的解析逻辑（C3 / D-27），4.6 不做。
+
+        F-012：加了 ``spec``。美国站分支**逐字节不变**（下面第一段）；
+        其余站点走注册表的归一化 + 串内抽取。
+        不加的话 ``_judge_zip`` 对加拿大站两边都归不出来，zip_verify 恒落
+        ``unverified`` / ``assumed`` —— 与 zip_observed 恒空是同一个根因。
         """
         s = str(z).strip() if z is not None else ""
         if not s:
             return None
-        head = s.split("-")[0].strip()
-        if head.isdigit() and 0 < len(head) <= 5:
-            return head.zfill(5)
-        m = _ZIP5_RE.search(s)
-        return m.group(1) if m else None
+        if _spec_or_default(spec).postal_zero_fill:
+            # 美国站：原实现，一个字节没改。
+            head = s.split("-")[0].strip()
+            if head.isdigit() and 0 < len(head) <= 5:
+                return head.zfill(5)
+            m = _ZIP5_RE.search(s)
+            return m.group(1) if m else None
+        return _extract_postal(s, spec)
 
     @classmethod
-    def _judge_zip(cls, requested: Any, observed: Any) -> str:
+    def _judge_zip(cls, requested: Any, observed: Any, spec=None) -> str:
         """(请求值, 观测值) -> zip_verify 封闭集之一。"""
-        req = cls._norm_zip(requested)
-        obs = cls._norm_zip(observed)
+        req = cls._norm_zip(requested, spec)
+        obs = cls._norm_zip(observed, spec)
         if obs is None:
             # 页面没挂 glow 挂件：只能**假设**切邮编生效了。
             # 绝不在这里返回 confirmed —— 一个错的 confirmed 比一个诚实的
@@ -2160,11 +2230,11 @@ class AmazonParser:
         return ZIP_VERIFY_CONFIRMED if obs == req else ZIP_VERIFY_MISMATCH
 
     def _apply_quality_signals(self, result: Dict, tree, html_text: str,
-                               zip_code: str) -> None:
+                               zip_code: str, spec=None) -> None:
         """把 P4-1 / P4-2 的质量信号写进 result（两条引擎路径共用）。"""
-        observed = self._parse_zip_observed(html_text)
+        observed = self._parse_zip_observed(html_text, spec)
         result["_zip_observed"] = observed
-        result["_zip_verify"] = self._judge_zip(zip_code, observed)
+        result["_zip_verify"] = self._judge_zip(zip_code, observed, spec)
         result["_completeness"] = self._measure_completeness(tree)
 
     def _check_block(self, html_text: str, tree) -> Optional[str]:
@@ -2514,15 +2584,52 @@ class AmazonParser:
             d['upc'] = v
         elif 'weight' in k_lower and 'item' in k_lower:
             d['item_weight'] = v
-        elif 'weight' in k_lower and 'package' in k_lower:
-            _, w = self._split_dim_weight(v)
-            d['package_weight'] = w if w != "N/A" else "N/A"
+        elif 'weight' in k_lower and ('package' in k_lower
+                                      or 'shipping' in k_lower):
+            # F-012 实测修复：加上 ``shipping``。
+            #
+            # Amazon 这一行的标签有两种写法：``Package Weight`` 与
+            # ``Shipping Weight``。原判据只认前者，后者两个条件都不满足
+            # （既没有 "package" 也没有 "item"），于是**整条 elif 链走空**
+            # —— 不是存错位置，是一个字都没存。
+            # 实测（加拿大站 Gildan 三件装）报的"包装重量漏采"就是这条。
+            #
+            # ⚠ 这条**对美国站同样生效**：美国站页面上出现 "Shipping Weight"
+            #   时，改造前也是一个字没存。所以这是补一个一直空着的字段，
+            #   不是改一个已有的值 —— 但 package_weight 在 _HASH_FIELDS 里，
+            #   受影响的 ASIN 下次采集会产出一条一次性的假变动。
+            # ⚠ 这里**不能**直接用 _split_dim_weight 的第二半。
+            #   那个函数按分号拆 "尺寸; 重量"，而**重量行本身没有分号**：
+            #       Package Weight: 200 g        -> parts = ["200 g"]
+            #   于是 parts[1] 不存在、返回 "N/A"，真值 "200 g" 被扔在 parts[0]。
+            #   原实现写的是 ``_, w = split(v)`` 然后
+            #   ``w if w != "N/A" else "N/A"``（后半句恒等于 w，是句废话），
+            #   结果是**凡是不带分号的重量行一律存成 N/A**。
+            #   这条与站点无关，美国站一直也是这样 —— F-012 实测顺带发现。
+            dim_part, w = self._split_dim_weight(v)
+            d['package_weight'] = w if w != "N/A" else dim_part
         elif 'dimensions' in k_lower:
-            dim, _ = self._split_dim_weight(v)
+            # F-012 实测修复：**重量那一半不再丢掉**。
+            #
+            # Amazon 常把尺寸和重量塞进同一行，用分号分隔：
+            #     Product Dimensions: 25 x 20 x 5 cm; 200 g
+            # 原实现是 ``dim, _ = self._split_dim_weight(v)`` —— 下划线那半
+            # （``200 g``）被直接扔了。于是页面上明明写着重量，
+            # item_weight / package_weight 却是 N/A。
+            #
+            # 只在对应的重量字段**还空着**时才回填：页面上如果另有一行
+            # 专门的 "Item Weight"，那一行是更权威的来源，不能被这里覆盖。
+            # （字典迭代顺序 = 页面上的行序，所以"先到先得"不可靠，
+            #   必须显式判空。）
+            dim, w = self._split_dim_weight(v)
             if 'package' in k_lower:
                 d['package_dimensions'] = dim
+                if w != "N/A" and not d.get('package_weight'):
+                    d['package_weight'] = w
             else:
                 d['item_dimensions'] = dim
+                if w != "N/A" and not d.get('item_weight'):
+                    d['item_weight'] = w
 
     def _split_dim_weight(self, s: str) -> Tuple[str, str]:
         """拆分尺寸和重量（用分号分隔）"""
@@ -2808,7 +2915,18 @@ class AmazonParser:
                 if any(spam in txt.lower() for spam in self.BULLET_BLACKLIST):
                     continue
                 clean.append(txt)
-            return "\n".join(clean)
+
+            # 去重，语义与 selectolax 孪生实现 _slx_parse_bullet_points
+            # 完全一致（论证写在那边）。两条引擎路径必须给出同样的结果 ——
+            # EngineParity 那条用例会逐字段比对。
+            seen = set()
+            deduped = []
+            for b in clean:
+                if b in seen:
+                    continue
+                seen.add(b)
+                deduped.append(b)
+            return "\n".join(deduped)
         except Exception:
             return ""
 
