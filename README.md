@@ -335,18 +335,26 @@ curl -X POST http://<server>:8899/api/search-batches \
 供应商决定。用美国 IP 抓 `amazon.ca`，Amazon 会给出不同的价格/配送，甚至跳转，
 而数据一样入库、一样不报错。**这件事在代码之外，必须在代理侧配。**
 
-#### ⚠ 加拿大站的三项假设尚未实测
+#### 加拿大站的三项假设：已实测通过（2026-09-19）
 
-注册表里 `amazon.ca` 那条的 `verified=False`，三项是假设（都记在
-`common/core/marketplace.py` 末尾的 VERIFIED 一节）：地址切换接口的形状、
-glow 文案是否含完整邮编、价格渲染成 `$` 还是 `CDN$`。
+注册表里 `amazon.ca` 现在是 `verified=True`。三项原假设的实测结论：
 
-这三项在开发环境验证不了（Amazon 对机房出口 IP 直接返回拦截页）。
-在**有住宅代理**的机器上跑一次探针把它们定下来：
+| 假设 | 结论 |
+|---|---|
+| 地址切换接口路径同构、接受带空格邮编 | ✅ 是，`K1V 7P8` 原样被接受 |
+| glow 文案含完整邮编 | ✅ 是，不是只有前三位 FSA |
+| 价格渲染成 `$` 还是 `CDN$` | ✅ `$`，`render_symbol="$"` 对 |
+
+⚠ **验证方式是真实采集会话 + 人工核对商品页，不是 `tools/probe_marketplace.py`。**
+探针脚本在那次验证里自己吃到了 202 壳页（它用裸 curl_cffi session，没走
+`AmazonSession.initialize()` 那套 cookie 预热），所以探针的结论不能当证据。
+细节记在 `common/core/marketplace.py` 末尾的 VERIFIED 一节。
+
+加**新**站点时仍然从 `verified=False` 起步，实测过再改 True，并写清楚怎么测的：
 
 ```bash
 PROXY_URL='http://user:pass@host:port' \
-  python -m tools.probe_marketplace --marketplace amazon.ca
+  python -m tools.probe_marketplace --marketplace amazon.xx
 ```
 
 #### 默认邮编的作用
