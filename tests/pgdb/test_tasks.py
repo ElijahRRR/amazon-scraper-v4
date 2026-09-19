@@ -117,7 +117,10 @@ async def test_pull_tasks_shape_and_types(pgdb):
     t = tasks[0]
     assert set(t) == {"id", "batch_id", "batch_name", "asin", "zip_code",
                       "retry_count", "priority", "needs_screenshot",
-                      "lease_epoch", "task_type", "task_meta", "discover_mode"}
+                      "lease_epoch", "task_type", "task_meta", "discover_mode",
+                      # F-012：worker 靠它决定去哪个站点抓。
+                      "marketplace"}
+    assert t["marketplace"] == "amazon.com", "不传站点时必须是美国站（改造前的唯一行为）"
     assert t["needs_screenshot"] is False, "/api/tasks/pull 这里是 Python bool"
     assert t["task_type"] == "asin"
     assert t["batch_name"] == "gold"

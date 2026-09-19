@@ -147,12 +147,24 @@ class FakeWorker:
         self.created_sessions = []
         self.create_returns_none = False
         self._create_delay_seen = []
+        # F-012：每次建 session 时 slot 传下来的站点，供用例断言"换站点会重建"。
+        self._create_marketplace_seen = []
 
-    async def _create_session_with_retry(self, delay=5):
+    async def _create_session_with_retry(self, delay=5, marketplace=None,
+                                         zip_code=None):
+        """签名必须跟 worker/engine.py 里的真实方法一致。
+
+        ⚠ 这是一个测试替身：它与被替身对象之间**没有任何机制保证签名同步**，
+        真实签名加参数时这里会 TypeError。那正是 F-012 改造时发生的事
+        （40 条用例同时红），所以把这条写下来：改 _create_session_with_retry
+        的签名时，这里要跟着改。
+        """
         self._create_delay_seen.append(delay)
+        self._create_marketplace_seen.append(marketplace)
         if self.create_returns_none:
             return None
-        s = FakeSession(zip_code=self.zip_code)
+        s = FakeSession(zip_code=zip_code or self.zip_code)
+        s.marketplace = marketplace
         self.created_sessions.append(s)
         return s
 

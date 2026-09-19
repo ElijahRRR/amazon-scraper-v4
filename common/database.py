@@ -1204,7 +1204,7 @@ class Database:
                 base_sql = (
                     f"""SELECT t.id, t.batch_id, t.asin, t.zip_code, t.retry_count,
                                t.priority, t.needs_screenshot, t.lease_epoch,
-                               t.task_type, t.task_meta,
+                               t.task_type, t.task_meta, t.marketplace,
                                b.name as batch_name, b.discover_mode
                         FROM tasks t
                         JOIN batches b ON b.id = t.batch_id
@@ -1261,6 +1261,8 @@ class Database:
                         "task_type": row["task_type"] or "asin",
                         "task_meta": row["task_meta"],
                         "discover_mode": row["discover_mode"],
+                        # F-012：语义同 PG 侧 common/pgdb/tasks.py。
+                        "marketplace": row["marketplace"],
                     }
                     tasks.append(task)
                     ids.append(row["id"])

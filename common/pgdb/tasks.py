@@ -270,6 +270,17 @@ class TasksMixin:
                 # 排序策略：
                 #   1. prefer_zip 匹配优先（同 zip 任务先派发，节省 session 切换）
                 #   2. 同 zip 内按 id 升序（FIFO，先入先出）
+                #
+                # F-012：**排序里没有 marketplace，这是有意的，不是漏了。**
+                # session 现在绑的是 (marketplace, zip)，照说要按两者分组；
+                # 但按 zip 分组**已经蕴含**按站点分组 —— 两个站点的邮编形状
+                # 互斥，没有任何字符串能同时匹配美国的 ^\d{5}$ 和加拿大的
+                # ^[A-Z]\d[A-Z] ?\d[A-Z]\d$。所以同一个 zip_code 的任务必然
+                # 同站点，分组效果与显式加一层完全相同。
+                # 不加的收益是这条查询仍然直接吃 idx_tasks_pull 的有序输出
+                # （下面那段论证的前提），加一层排序键会让它重新落盘排序。
+                # ⚠ 这条推理依赖「任意两个站点的邮编正则互斥」。往注册表里加
+                #   新站点时必须复验，tests/test_marketplace.py 有一条用例守它。
                 # zip_code 可空 → 显式 NULLS FIRST，才等于 SQLite 的 ASC 排序
                 #
                 # prefer_zip 非空时**拆成两条查询**，等价于原先那条
@@ -287,7 +298,7 @@ class TasksMixin:
                 base_sql = (
                     f"""SELECT t.id, t.batch_id, t.asin, t.zip_code, t.retry_count,
                                t.priority, t.needs_screenshot, t.lease_epoch,
-                               t.task_type, t.task_meta,
+                               t.task_type, t.task_meta, t.marketplace,
                                b.name as batch_name, b.discover_mode
                         FROM tasks t
                         JOIN batches b ON b.id = t.batch_id
@@ -353,6 +364,9 @@ class TasksMixin:
                         "task_type": row["task_type"] or "asin",
                         "task_meta": row["task_meta"],
                         "discover_mode": row["discover_mode"],
+                        # F-012：worker 拿它决定去哪个站点抓（base URL、
+                        # 邮编切换端点、货币口径全看它）。
+                        "marketplace": row["marketplace"],
                     }
                     tasks.append(task)
                     ids.append(row["id"])
