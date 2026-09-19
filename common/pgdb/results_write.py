@@ -136,6 +136,9 @@ import logging
 import time
 from common import config
 from common.core.timeutil import now_ts
+# F-012：站点注册表。按模块导入（而不是 `from ... import get`）——
+# `get` 这个名字在本模块里太容易和 dict.get 混起来，读的人会看错。
+from common.core import marketplace as _marketplace
 from typing import List
 
 from common.pgdb._shared import (  # noqa: F401
@@ -528,6 +531,19 @@ class ResultsWriteMixin:
         if not asin:
             return False
 
+        # F-012：站点是唯一键 (asin, marketplace) 的一部分 —— 它**决定写哪一行**，
+        # 不只是行里的一个值。所以这里**故意不兜底**：站点不在注册表里就让
+        # ValueError 往上抛，整条提交失败。
+        #
+        # 反面做法（静默回退成 amazon.com）会把一条加拿大站的数据写进美国站
+        # 那一行、覆盖掉真的美国数据，而且不报错、值还长得像真的 ——
+        # 那正是 F-012 要消灭的那类故障，不能在修它的过程中重新引入一个。
+        #
+        # 缺键 / None 走 `get()` 的默认分支落到 amazon.com，那是**兼容老 worker**：
+        # 灰度期还在线的老 worker 根本不提交这个字段，而它们采的确实是美国站。
+        marketplace = _marketplace.get(data.get("marketplace")).id
+        data["marketplace"] = marketplace
+
         # 控制流仍用原始 batch_id（``if batch_id:`` 的真值语义与 SQLite 一致），
         # 只有绑到 bigint 列时才强转。
         bid = self.as_int(batch_id)
@@ -591,7 +607,7 @@ class ResultsWriteMixin:
             "SELECT screenshot_path, title, "
             "baseline_price, baseline_buybox_price, baseline_stock_count, "
             "baseline_stock_status, baseline_title_bullets_hash "
-            "FROM asin_data WHERE asin = ?", (asin,)
+            "FROM asin_data WHERE asin = ? AND marketplace = ?", (asin, marketplace)
         ) as c:
             existing = await c.fetchone()
 
@@ -663,7 +679,11 @@ class ResultsWriteMixin:
             update_fields = []
             update_values = []
             for f in ASIN_DATA_FIELDS:
-                if f in ("asin", "screenshot_path"):
+                # marketplace 与 asin 一样是**定位键**，不是被更新的值：
+                # 它在下面的 WHERE 里，写进 SET 是自我赋值（无害但误导），
+                # 而真要改它等于把这一行搬到另一个站点去 —— 那不是 UPDATE
+                # 该做的事，是一次数据迁移。
+                if f in ("asin", "screenshot_path", "marketplace"):
                     continue
                 # P4-3：404 一个目录层字段都不许写。新 worker 本来就不提交它们
                 # （缺键 ⇒ 下面 `is not None` 跳过），这一道拦的是**老 worker**
@@ -703,9 +723,11 @@ class ResultsWriteMixin:
             update_fields.append("updated_at = ?")
             update_values.append(now)
             update_values.append(asin)
+            update_values.append(marketplace)
 
             await self._db.execute(
-                f"UPDATE asin_data SET {', '.join(update_fields)} WHERE asin = ?",
+                f"UPDATE asin_data SET {', '.join(update_fields)} "
+                f"WHERE asin = ? AND marketplace = ?",
                 update_values
             )
         else:
@@ -713,6 +735,10 @@ class ResultsWriteMixin:
             insert_fields = ["asin"]
             insert_values = [asin]
             for f in ASIN_DATA_FIELDS:
+                # 这里**不**跳过 marketplace（与 UPDATE 分支不同）：新行必须把
+                # 站点写进去。它在上面被归一化过、必然非 None，所以下面那个
+                # `if val is not None` 一定放行 —— 列是 NOT NULL，漏了会当场
+                # NotNullViolation，不会静默落到默认值上。
                 if f in ("asin", "screenshot_path"):
                     continue
                 # P4-3：同 UPDATE 分支。这里没有旧值可保，但结果同样重要——

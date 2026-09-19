@@ -284,6 +284,10 @@ HEADER_MAP = {
     # 英文键名 `subtitle`（_get_export_headers 的 `HEADER_MAP.get(f, f)` 兜底）。
     "subtitle": "副标题",
     "offer_condition": "品相",
+    # F-012：采集来源站点。表头**不叫「站点」** —— 那个名字已经被上面的
+    # `site` 列占了（值是 "US"）。两列同名会让导出文件里出现两个「站点」，
+    # 而它们的值域还不一样。
+    "marketplace": "采集站点",
 }
 
 EXPORT_COLUMN_ORDER = [

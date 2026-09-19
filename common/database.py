@@ -25,6 +25,8 @@ from common.core.error_types import SERVER_REJECT
 # 关键词和落库的关键词会悄悄不同，而 search_discoveries 的主键含 keyword，
 # 结果是翻页去重失效、同一个词在库里裂成两行。
 from common.core.searchurl import normalize_keyword
+# F-012：站点注册表。按模块导入，理由同 PG 侧 results_write.py。
+from common.core import marketplace as _marketplace
 
 # ============================================================
 # 与 PG 后端共享的纯 Python 符号 —— 定义在 common/core/（Phase 4.1）。
@@ -280,7 +282,7 @@ class Database:
             -- ASIN 数据主表（每 ASIN 一行，存储最新状态）
             CREATE TABLE IF NOT EXISTS asin_data (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                asin TEXT NOT NULL UNIQUE,
+                asin TEXT NOT NULL,
                 title TEXT,
                 brand TEXT,
                 product_type TEXT,
@@ -340,9 +342,16 @@ class Database:
                 -- 会让新建库与升级库的物理列序分叉，而 `SELECT d.*` 没有
                 -- response_model，列序整个泄进 erpAPI 的响应。
                 subtitle TEXT,
-                -- 2026-09：buybox offer 的品相。**新的最后一列** —— 上面那段
+                -- 2026-09：buybox offer 的品相。
+                offer_condition TEXT,
+                -- F-012：采集来源站点。**新的最后一列** —— 上面那段
                 -- "必须是最后一列"的警告现在指向这一行。
-                offer_condition TEXT
+                -- 语义、取值域与「为什么不复用 site 列」的完整论证在
+                -- common/pgdb/schema.py 的同名列注释里（那边是正式后端）。
+                marketplace TEXT NOT NULL DEFAULT 'amazon.com',
+                -- F-012：唯一键从 (asin) 换成 (asin, marketplace)。同一个 ASIN
+                -- 在两个站点是两件不同的商品数据，单行唯一键会让它们互相覆盖。
+                UNIQUE(asin, marketplace)
             );
 
             -- 变动记录表（预计算，按类型索引，支持高效筛选）
@@ -380,6 +389,12 @@ class Database:
                 error_detail TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                -- ⚠ F-012 的 marketplace 列**不在这里**，走下面 init 里的 ALTER。
+                -- 理由：task_type / task_meta 也是 ALTER 加的，新库的物理列序
+                -- 因此是 ...updated_at, task_type, task_meta。把 marketplace
+                -- 写进 CREATE TABLE 会让它插到那两列**前面**，而 PG 侧
+                -- （正式后端）的 ADD COLUMN 只会追加到末尾 —— 两个后端的列序
+                -- 就此分叉，而 EXPECTED_COLUMNS 只能对上其中一种。
                 UNIQUE(batch_id, asin)
             );
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -516,9 +531,12 @@ class Database:
 
         # tasks.task_type: 'asin' (现有) | 'discover_seller'
         # tasks.task_meta: JSON, 仅 discover 任务用
+        # tasks.marketplace（F-012）：必须排在 task_type / task_meta **之后**，
+        # 新库的物理列序由这个顺序决定，而它要与 PG 侧的 EXPECTED_COLUMNS 对齐。
         for col_def in [
             ("task_type", "TEXT NOT NULL DEFAULT 'asin'"),
             ("task_meta", "TEXT"),
+            ("marketplace", "TEXT NOT NULL DEFAULT 'amazon.com'"),
         ]:
             col, ddl = col_def
             try:
@@ -550,6 +568,21 @@ class Database:
         for col in ["subtitle", "offer_condition"]:
             try:
                 await self._db.execute(f"ALTER TABLE asin_data ADD COLUMN {col} TEXT")
+                logger.info(f"数据库迁移: asin_data 表新增 {col} 列")
+            except Exception:
+                pass
+
+        # 迁移：asin_data.marketplace（F-012 多站点）。
+        # ⚠ SQLite **改不动唯一键** —— ALTER TABLE 不支持 ADD CONSTRAINT，
+        #   换键要整表重建。这条回滚路径上不做重建：SQLite 已经不是正式后端
+        #   （common/dbfactory.py 的 docstring），老 SQLite 库里本来就只有
+        #   美国站数据，(asin) 与 (asin, marketplace) 在那份数据上等价。
+        #   **新建**的 SQLite 库走 CREATE TABLE，唯一键是对的。
+        for col in ["marketplace"]:
+            try:
+                await self._db.execute(
+                    f"ALTER TABLE asin_data ADD COLUMN {col} "
+                    f"TEXT NOT NULL DEFAULT 'amazon.com'")
                 logger.info(f"数据库迁移: asin_data 表新增 {col} 列")
             except Exception:
                 pass
@@ -2217,6 +2250,11 @@ class Database:
         if not asin:
             return False
 
+        # F-012：语义与 PG 侧 results_write.py 的同名段落**完全一致**（那边是
+        # 正式后端，论证写在那里）。一句话：站点是唯一键的一部分，不兜底。
+        marketplace = _marketplace.get(data.get("marketplace")).id
+        data["marketplace"] = marketplace
+
         now = now_ts()
         data["content_hash"] = _compute_content_hash(data)
         data["title_bullets_hash"] = _compute_title_bullets_hash(data)
@@ -2238,7 +2276,7 @@ class Database:
             "SELECT screenshot_path, title, "
             "baseline_price, baseline_buybox_price, baseline_stock_count, "
             "baseline_stock_status, baseline_title_bullets_hash "
-            "FROM asin_data WHERE asin = ?", (asin,)
+            "FROM asin_data WHERE asin = ? AND marketplace = ?", (asin, marketplace)
         ) as c:
             existing = await c.fetchone()
 
@@ -2303,7 +2341,9 @@ class Database:
             update_fields = []
             update_values = []
             for f in ASIN_DATA_FIELDS:
-                if f in ("asin", "screenshot_path"):
+                # marketplace 是**定位键**，在 WHERE 里，不进 SET。
+                # 与 PG 侧 results_write.py 同一条口径。
+                if f in ("asin", "screenshot_path", "marketplace"):
                     continue
                 val = data.get(f)
                 if val is not None:
@@ -2332,9 +2372,11 @@ class Database:
             update_fields.append("updated_at = ?")
             update_values.append(now)
             update_values.append(asin)
+            update_values.append(marketplace)
 
             await self._db.execute(
-                f"UPDATE asin_data SET {', '.join(update_fields)} WHERE asin = ?",
+                f"UPDATE asin_data SET {', '.join(update_fields)} "
+                f"WHERE asin = ? AND marketplace = ?",
                 update_values
             )
         else:
