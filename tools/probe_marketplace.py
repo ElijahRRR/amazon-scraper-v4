@@ -4,40 +4,50 @@
 ------------------------------------------------------------------------
 为什么需要它
 ------------------------------------------------------------------------
-``common/core/marketplace.py`` 的注册表里，``amazon.com`` 那条的每个值都是
-从改造前的代码里逐字节搬来的（实测过的）。``amazon.ca`` 那条**不是** ——
-它有三项是假设：
+往 ``common/core/marketplace.py`` 的注册表里加一个新站点时，有几项是**猜的**，
+必须拿真实页面验证过才能把那条记录标 ``verified=True``：
 
-  1. ``zip_change_url`` 的路径与美国站同构，且 ``zipCode`` 参数原样接受
-     带空格的加拿大邮编（``M5V 3L9``）。也可能要求无空格形，或者要求额外的
-     ``countryCode`` 字段。
-  2. glow 挂件的 ``id="glow-ingress-line2"`` 在加拿大站同名，且文案里含邮编。
-     美国站是 "New York 10001"，加拿大站**可能**只显示前三位 FSA
-     （"Toronto M5V"）—— ``ziputil._location_matches`` 为此留了 FSA 回退，
-     但吸收不了"文案里根本没有邮编"。
-  3. 价格渲染形态：``CDN$ 24.99`` 与 ``$24.99`` 两种都可能出现，注册表两种
-     都收了，但哪种是主流未知。
+  1. ``zip_change_url`` 的路径是否与美国站同构，``zipCode`` 参数是否原样接受
+     该国的邮编形状（带空格？无空格？要不要额外的 countryCode 字段？）。
+  2. glow 挂件 ``id="glow-ingress-line2"`` 是否同名，文案里有没有完整邮编
+     （还是只有前段 —— 加拿大的 FSA 那种）。
+  3. 价格渲染成什么符号（``$`` / ``CDN$`` / ``US$`` …）。
 
-这三条在开发环境里**验证不了**：Amazon 对机房出口 IP 直接返回
-``api-services-support@amazon.com`` 拦截页（``worker/parser.py`` 与
-``worker/engine.py`` 认的就是它）。所以本脚本设计成「在有住宅代理的机器上
-单独跑一次」，把三项逐条打出实测结果。
+猜错的后果都不是报错，是**一批看着正常、实则不对**的数据 —— 这正是 F-012
+整个改造要消灭的故障形态，所以新站点一律从 ``verified=False`` 起步。
+
+------------------------------------------------------------------------
+⚠ 已知缺陷：这个脚本自己可能过不了连通性那一关
+------------------------------------------------------------------------
+它用的是**裸 curl_cffi Session**，没走 ``worker/session.py:AmazonSession``
+的 ``initialize()``（首页预热 + cookie 建立 + 指纹轮换）。实测下来，同一台机器
+同一个代理，**采集器跑得通、本脚本拿到 202 壳页**。
+
+2026-09-19 验证 amazon.ca 时就是这样：三项假设最后是靠**真实采集会话 + 人工
+核对商品页**定下来的，本脚本没能提供证据。注册表末尾的 VERIFIED 一节如实记了
+这一点。
+
+所以：**连通性那一关没过，不代表站点有问题，很可能只是这个脚本不够硬。**
+真过不去就退回「起一个真实采集批次 + 人工核对」那条路 —— 它更慢，但它是
+这个功能最终要跑的那条路，证据力更强。
+（修法是让它复用 AmazonSession，还没做。）
 
 ------------------------------------------------------------------------
 怎么用
 ------------------------------------------------------------------------
     # 用环境里已配的代理（与 worker 同一个 PROXY_URL）
-    PROXY_URL='http://user:pass@host:port' \\
+    PROXY_URL='http://user:pass@host:port' \
         python -m tools.probe_marketplace --marketplace amazon.ca
 
     # 指定邮编与 ASIN（默认用注册表的 default_postal 和一个通用 ASIN）
-    python -m tools.probe_marketplace --marketplace amazon.ca \\
-        --postal 'M5V 3L9' --asin B0CHX1W1XY
+    python -m tools.probe_marketplace --marketplace amazon.ca \
+        --postal 'K1V 7P8' --asin B09S6W6H5B
 
     # 不走代理（只有直连能过 Amazon 的机器上才有意义）
     python -m tools.probe_marketplace --marketplace amazon.ca --no-proxy
 
-跑完之后：把实测到的差异回填进注册表，并把那条记录的 ``verified`` 改成 True。
+跑完之后：把实测到的差异回填进注册表，把那条记录的 ``verified`` 改成 True，
+并在 VERIFIED 一节写清楚**怎么测的**。"测过了"三个字没有信息量。
 
 ------------------------------------------------------------------------
 它**不**做什么
@@ -45,6 +55,8 @@
 * 不写库、不建任务、不碰事件流 —— 它只发几个 GET/POST 然后打印。
 * 不改任何配置文件。结论要人读完自己回填，因为"页面长这样"这件事
   需要人看一眼再定，自动回填等于把一次误判固化进注册表。
+* **不排查字段级解析缺陷** —— 那是 ``tools/diag_parse.py`` 的活（配合
+  ``DUMP_HTML=1`` 留档）。本脚本只管"站点级假设"这三项。
 """
 from __future__ import annotations
 
@@ -72,7 +84,8 @@ _GLOW_RE = re.compile(r'id="glow-ingress-line2"[^>]*>\s*([^<]+)')
 _PRICE_RE = re.compile(r'(?:CDN\$|C\$|US\$|\$)\s?\d[\d,]*\.?\d*')
 
 #: 一个在多数站点都存在的通用 ASIN。只是默认值，跑的时候建议换成你真要采的。
-_DEFAULT_ASIN = "B0CHX1W1XY"
+#: 实测用过的加拿大站 ASIN。只是默认值，跑的时候建议换成你真要采的。
+_DEFAULT_ASIN = "B09S6W6H5B"
 
 
 def _ok(msg):
@@ -307,7 +320,16 @@ def main() -> int:
 
     sess = _session(spec, proxy)
     if not probe_reachable(sess, spec):
-        print("\n连通性这一关没过，后面的探针没有意义。先解决出口 IP。")
+        print("\n连通性这一关没过，后面的探针没有意义。")
+        print("⚠ 但**先别断定是出口 IP 的问题** —— 本脚本用的是裸 curl_cffi"
+              " session，\n  没走 AmazonSession.initialize() 那套预热，"
+              "实测出现过「采集器跑得通、\n  本脚本吃 202 壳页」的情况"
+              "（见本文件顶部「已知缺陷」）。")
+        print("\n两条路：")
+        print("  1) 换住宅代理再跑一次 —— 真是 IP 问题的话这样就过了；")
+        print("  2) 起一个真实采集批次 + 人工核对商品页 —— 更慢，但它就是这个"
+              "功能\n     最终要跑的那条路，证据力更强。amazon.ca 当初就是这么"
+              "验证的。")
         return 1
     probe_zip_change(sess, spec, postal)
     probe_glow_and_price(sess, spec, args.asin, postal)
