@@ -164,3 +164,53 @@ class OfferConditionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ------------------------------------------------------------ accordion 布局
+#
+# 2026-09 起部分商品的 buybox 变成多 offer 的 accordion：一张卡片里纵向堆
+# 会员价行 / 全新行 / 二手行，只有一行展开（a-accordion-active）。夹具按
+# B0GVNC5WHS 真实页面的 DOM 路径精简而来（id 与 class 逐字照抄）：
+#   #buybox > … > #buyBoxAccordion > #primeSavingsUpsellAccordionRow
+#                                  > #usedAccordionRow > #newAccordionRow_1
+#
+# 旧实现把整张 #buybox 当一个文本块匹配，于是折叠着的二手行标题被当成了
+# 主推 offer 的品相 —— B0GVNC5WHS 被错标成 "Used - Very Good"。
+
+def _accordion(active: str, with_used: bool = True) -> str:
+    def row(rid, caption, price):
+        cls = "a-box a-accordion-row" + (" a-accordion-active" if rid == active else "")
+        return (f'<div id="{rid}" class="{cls}"><div class="a-box-inner">'
+                f'<span>{caption}</span><span class="a-offscreen">{price}</span>'
+                f'</div></div>')
+    rows = [row("primeSavingsUpsellAccordionRow", "Prime Member Price", "$36.99")]
+    if with_used:
+        rows.append(row("usedAccordionRow", "Used - Very Good", "$37.49"))
+    rows.append(row("newAccordionRow_1", "Regular Price", "$49.99"))
+    return ('<div id="desktop_buybox"><div id="buybox"><div id="buyBoxAccordion">'
+            + "".join(rows) + '</div></div></div>')
+
+
+class AccordionLayoutTests(unittest.TestCase):
+
+    def test_collapsed_used_row_does_not_leak(self):
+        """B0GVNC5WHS 的回归：主推是会员价全新件，折叠的二手行不许串进来。"""
+        self.assertEqual(_cond(_accordion("primeSavingsUpsellAccordionRow")), "N/A")
+
+    def test_regular_row_active_is_not_used(self):
+        self.assertEqual(_cond(_accordion("newAccordionRow_1")), "N/A")
+
+    def test_used_row_active_is_detected(self):
+        """二手行真的是主推时必须识别出来 —— 否则修复就是空心的（恒返回 N/A）。"""
+        self.assertEqual(_cond(_accordion("usedAccordionRow")), "Used - Very Good")
+
+    def test_two_tier_without_used_row(self):
+        """B0BG4WNK3V 形态：只有会员价 + 全新两行。"""
+        self.assertEqual(
+            _cond(_accordion("primeSavingsUpsellAccordionRow", with_used=False)), "N/A")
+
+    def test_title_fallback_still_applies(self):
+        """accordion 里读不到品相时，翻新品标题兜底照旧生效。"""
+        self.assertEqual(
+            _cond(_accordion("primeSavingsUpsellAccordionRow"), "Phone 64GB (Renewed)"),
+            "Renewed")
