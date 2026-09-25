@@ -570,7 +570,7 @@ async def test_unbindable_error_type_on_the_stale_path_stays_a_200(db):
 
 
 async def test_golden_scenario_payload_round_trips(db):
-    """直接拿黄金场景那条 payload 过一遍钩子：46 个键一个不少、一个不多。"""
+    """直接拿黄金场景那条 payload 过一遍钩子：键一个不少、一个不多。"""
     from tests.golden.scenario import _product
 
     bid, t = await one_task(db, "golden", "B0GOLDEN01")
@@ -581,8 +581,19 @@ async def test_golden_scenario_payload_round_trips(db):
                                        data, bid)
     assert r == {"accepted": True, "saved": True}
     b = (await outbox(db))[0]
-    # data 被就地写回了两个 hash（database.py:1827-1828 的现状，照抄）
-    assert set(b["result"]) == set(submitted) | {"content_hash", "title_bullets_hash"}
+    # data 被就地写回了两个 hash（database.py:1827-1828 的现状，照抄），
+    # F-012 之后再加一个 marketplace。
+    #
+    # 为什么 marketplace 也要就地写回、而且必须写在 emit_result_event **之前**：
+    # 事件的 body 用的就是这份 data，而 scrape_events 有自己的 marketplace 列。
+    # 归一化晚于发事件的话，事件里带的是 worker 交上来的原始写法
+    # （'www.amazon.ca' / 'AMAZON.CA' / 缺席），而 asin_data 里落的是规范键
+    # —— 同一次采集在两张表里记成两个站点，而这两张表正是要靠 marketplace
+    # join 起来的。
+    expected_added = {"content_hash", "title_bullets_hash", "marketplace"}
+    assert set(b["result"]) == set(submitted) | expected_added
+    assert b["result"]["marketplace"] == "amazon.com", (
+        "老 worker 不提交这个字段，必须落到美国站默认值 —— 它们采的确实是美国站")
     for k, v in submitted.items():
         assert b["result"][k] == v, k
     assert b["result"]["crawl_time"] == "2026-08-04 17:11:02"

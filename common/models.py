@@ -97,6 +97,16 @@ class AsinData:
     # 落在末尾 = 导出多一列在最右边，既有列一列没动、没有重排。
     subtitle: str = ""
     offer_condition: str = ""
+    # F-012：采集来源站点（'amazon.com' / 'amazon.ca'）。同样落在末尾，
+    # 理由与 subtitle 那段一模一样：导出多一列在最右边，既有列一列没动。
+    #
+    # ⚠ 它与上面的 `site` **不是**重复列，两者的值域不同：
+    #     site        —— parser 写的 "US"（worker/parser.py:_default_result）
+    #     marketplace —— 注册表的规范键 "amazon.com" / "amazon.ca"
+    #   `site` 是已交付的导出列，本次不动它的值（worker/parser.py 的 P4-8
+    #   段落逐条论证过为什么不动）。新列与 `scrape_events.marketplace`
+    #   同名同值域，两者可以直接 join —— 那才是下游该读的那个。
+    marketplace: str = "amazon.com"
 
     def to_dict(self) -> dict:
         return asdict(self)

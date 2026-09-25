@@ -137,8 +137,17 @@ class FakeSlot:
     def __init__(self, session):
         self.session = session
         self.rotations = []
+        # F-012：记下每次 ensure_ready 收到的站点，供用例断言任务站点确实传到了 slot。
+        self.ensure_ready_calls = []
 
-    async def ensure_ready(self):
+    async def ensure_ready(self, marketplace=None, zip_code=None):
+        """签名必须跟 worker/engine.py:SessionSlot.ensure_ready 一致。
+
+        F-012 给真方法加了 (marketplace, zip_code) 两个参数；这个替身没跟上
+        就会 TypeError，而 _process_* 里对 ensure_ready 的失败处理是
+        「attempt += 1 后 continue」，于是表现成"一页都没采到"而不是报错。
+        """
+        self.ensure_ready_calls.append((marketplace, zip_code))
         return True
 
     def note_success(self):

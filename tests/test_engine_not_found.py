@@ -208,7 +208,12 @@ class NotFoundPayloadShapeTests(unittest.TestCase):
         """
         default = self.w.parser._default_result("B0DEADBEEF", "90210")
         for k, v in self.payload.items():
-            if k.startswith("_") or k == "batch_name":
+            # `marketplace`（F-012）不参与比对：它**不是解析出来的字段**，
+            # 而是 engine 从 task 挂上去的采集参数，parser 手里根本没有这个事实
+            # （所以 _default_result 里没有它，也不该有）。
+            # 它与 `_` 元数据的差别只在于「是不是 asin_data 的真列」，
+            # 与「是不是解析产物」无关 —— 两者在这条用例里都该跳过。
+            if k.startswith("_") or k in ("batch_name", "marketplace"):
                 continue
             self.assertIn(k, default)
             self.assertEqual(v, default[k], f"{k} 与 _default_result 不一致")
@@ -250,12 +255,24 @@ class UnderscoreKeyContractTests(unittest.TestCase):
         for k in self.ALL_META:
             self.assertNotIn(k, ASIN_DATA_FIELDS)
 
-    def test_attach_meta_adds_exactly_six_keys(self):
+    def test_attach_meta_adds_exactly_six_meta_keys_plus_marketplace(self):
+        """六个 `_` 元数据键 + 一个真列 `marketplace`，一个不多一个不少。
+
+        ⚠ `marketplace`（F-012）**刻意不带** `_` 前缀，这不是笔误：
+        那批 `_` 键的语义是「只进事件流、写库时被白名单丢弃」，而
+        marketplace 是 asin_data 的真列（还是唯一键的一部分）。
+        两者必须能被区分开 —— 上面 test_no_meta_key_is_an_asin_data_column
+        守的就是这条界线，本用例在这里把 marketplace 摆在界线的另一侧。
+        """
         result = {"asin": "B0X", "title": "t"}
         eng.Worker._attach_collection_meta(
             make_worker(), result, zip_requested="10001", outcome=eng.OUTCOME_OK)
         self.assertEqual(sorted(set(result) - {"asin", "title"}),
-                         sorted(self.ALL_META))
+                         sorted((*self.ALL_META, "marketplace")))
+        # 缺省参数下必须是美国站：老 server 不下发 marketplace 字段，
+        # 而它们派的确实是美国站任务。
+        self.assertEqual(result["marketplace"], "amazon.com")
+        self.assertIn("marketplace", ASIN_DATA_FIELDS)
 
     def test_attach_meta_never_touches_business_fields(self):
         before = dict(GOOD)
@@ -425,8 +442,17 @@ class FakeSlot:
     def __init__(self, session):
         self.session = session
         self.rotations = []
+        # F-012：记下每次 ensure_ready 收到的站点，供用例断言任务站点确实传到了 slot。
+        self.ensure_ready_calls = []
 
-    async def ensure_ready(self):
+    async def ensure_ready(self, marketplace=None, zip_code=None):
+        """签名必须跟 worker/engine.py:SessionSlot.ensure_ready 一致。
+
+        F-012 给真方法加了 (marketplace, zip_code) 两个参数；这个替身没跟上
+        就会 TypeError，而 _process_* 里对 ensure_ready 的失败处理是
+        「attempt += 1 后 continue」，于是表现成"一页都没采到"而不是报错。
+        """
+        self.ensure_ready_calls.append((marketplace, zip_code))
         return True
 
     async def ensure_zip(self, target_zip):

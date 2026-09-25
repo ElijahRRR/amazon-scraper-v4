@@ -83,9 +83,23 @@ async def test_alter_ladder_is_idempotent(pgdb):
     assert await _columns(pgdb._write_conn) == before
 
 
+#: 补列之后老行**不是** NULL 的那些列，以及它们应有的值。
+#:
+#: 绝大多数新列是可空的 text，老行补上去就是 NULL —— 「没观测到」。
+#: ``marketplace``（F-012）是例外，而且是**有意**的例外：
+#:
+#:   1. 它是唯一键 ``(asin, marketplace)`` 的一部分。PG 的 UNIQUE 下 NULL
+#:      互不相等，允许 NULL 就等于允许同一个 ASIN 插进任意多行「站点未知」
+#:      的快照 —— 把 F-012 要修的覆盖问题换成一个更难查的重复问题。
+#:   2. 对老行来说 ``'amazon.com'`` **不是猜的，是事实**：F-012 之前这个
+#:      采集器只能采美国站（worker/session.py 的 AMAZON_BASE 是类常量）。
+#:      所以这里填的是已知真值，不是占位符。
+_ALTER_DEFAULTS = {"marketplace": "amazon.com"}
+
+
 @pytest.mark.asyncio
 async def test_migration_preserves_existing_rows(pgdb):
-    """升级不许动老数据：补列之后老行还在，新列是 NULL。"""
+    """升级不许动老数据：补列之后老行还在，新列是 NULL（除非另有已知真值）。"""
     conn = pgdb._write_conn
     cols = _alter_added_columns()
     for col in cols:
@@ -100,7 +114,12 @@ async def test_migration_preserves_existing_rows(pgdb):
         "WHERE asin = 'B0OLDROW01'")
     assert row["title"] == "升级前就有的", "老行被改了"
     for col in cols:
-        assert row[col] is None, f"{col} 应当是 NULL（老行没有这个值）"
+        if col in _ALTER_DEFAULTS:
+            assert row[col] == _ALTER_DEFAULTS[col], (
+                f"{col} 应当是 {_ALTER_DEFAULTS[col]!r}（老行的已知真值，"
+                f"见 _ALTER_DEFAULTS 上方的说明）")
+        else:
+            assert row[col] is None, f"{col} 应当是 NULL（老行没有这个值）"
 
 
 async def _columns(conn):

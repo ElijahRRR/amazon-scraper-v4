@@ -153,12 +153,19 @@ class OfferConditionTests(unittest.TestCase):
         self.assertEqual(d["offer_condition"], "N/A")
 
     def test_column_is_last_and_exportable(self):
-        """列序是承重的（`SELECT d.*` 无 response_model，列序直通 erpAPI）。"""
+        """列序是承重的（`SELECT d.*` 无 response_model，列序直通 erpAPI）。
+
+        ⚠ F-012 之后 ``offer_condition`` **不再是最后一列** —— ``marketplace``
+        追加在它后面。这条断言的本意不是"offer_condition 永远垫底"，而是
+        "它必须落在末尾那一段、既有列一列没动"，所以改成按**相对位置**断言：
+        它的后面只允许有 F-012 追加的那一列。再有新列时同样往后挪一位。
+        """
         from common.core.asindata import ASIN_DATA_FIELDS
         from common.models import EXPORTABLE_FIELDS
         from common.pgdb.schema import EXPECTED_COLUMNS
-        self.assertEqual(ASIN_DATA_FIELDS[-1], "offer_condition")
-        self.assertEqual(EXPECTED_COLUMNS["asin_data"][-1], "offer_condition")
+        self.assertEqual(ASIN_DATA_FIELDS[-2:], ["offer_condition", "marketplace"])
+        self.assertEqual(EXPECTED_COLUMNS["asin_data"][-2:],
+                         ["offer_condition", "marketplace"])
         self.assertIn("offer_condition", EXPORTABLE_FIELDS)
 
 

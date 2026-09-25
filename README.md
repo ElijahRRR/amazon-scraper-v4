@@ -247,7 +247,7 @@ ASIN 只有一行，后采的覆盖先采的；而 `/api/results?batch_id=` 的 
 | 排序 | `relevance` / `price_asc` / `price_desc` / `newest` / `review_rank` / `featured` |
 | 翻页上限 | 每个关键词翻几页，默认 7，上限 20 |
 | 广告位 | 默认丢弃（`include_sponsored=false`） |
-| 站点 | 18 个 Amazon 站点 |
+| 站点 | `domain`，18 个 Amazon 站点（详情采集目前支持其中 2 个，见下一节 F-012） |
 | `rh_extra` | 逃生口：原样拼进 `rh=` 的 refinement 串，用于本项目没预置的筛选 |
 
 ```bash
@@ -290,6 +290,90 @@ SEARCH_DELIVERY_FILTERS='{"www.amazon.de": {"prime": "p_85:xxxxxxxxx"}}'
 
 `GET /api/search-options?domain=<站点>` 回的就是该站点**当前**可用的取值，
 控制台的下拉框读的也是它。
+
+### 多站点采集（F-012）
+
+目前**能完整采集详情**的站点是两个：`amazon.com`（美国站）与 `amazon.ca`
+（加拿大站）。关键词搜索的**发现**阶段仍支持 18 个站点（见上一节的 `domain`），
+但那 16 个站点只能 `discover_only`。
+
+站点的唯一真源是 `common/core/marketplace.py` 的注册表，一条记录描述一个站点的
+全部差异：base URL、货币、邮编规则、locale 头、glow 判定。server 与 worker
+都从这里取。
+
+```bash
+# 建一个加拿大站的关键词批次：domain 决定整条链路的站点
+curl -X POST http://<server>:8899/api/search-batches \
+  -H 'Content-Type: application/json' -d '{
+    "keywords": ["wireless mouse"],
+    "domain": "www.amazon.ca",
+    "zip_code": "M5V 3L9",
+    "discover_mode": "with_detail"
+  }'
+```
+
+| 维度 | 美国站 | 加拿大站 |
+|---|---|---|
+| 站点键 | `amazon.com` | `amazon.ca` |
+| 币种 | USD | CAD |
+| 邮编 | 5 位数字 `10001` | `K1V 7P8`（字母数字） |
+| 默认投递地 | `10001` | `K1V 7P8` |
+| `delivery` 筛选 | 4 个取值 | 需配 `SEARCH_DELIVERY_FILTERS` 或用 `rh_extra` |
+
+#### ⚠ 同一个 ASIN 在两个站点是**两行**
+
+`asin_data` 的唯一键是 `(asin, marketplace)`。美加两站的同一个 ASIN 是两件不同的
+商品数据（币种、卖家、库存、配送全不同），所以导出里会出现两行、价格还不一样
+—— 那是**正确结果**，不是重复数据。导出多了一列「采集站点」就是用来分辨它们的。
+
+（F-012 之前唯一键只有 `asin`，两个站点的数据会互相覆盖，后采的盖掉先采的，
+且不报错。）
+
+#### ⚠ 代理出口 IP 必须落在目标国家
+
+`worker/proxy.py` 里没有任何国家/地区配置 —— 出口 IP 落在哪个国家由你的代理
+供应商决定。用美国 IP 抓 `amazon.ca`，Amazon 会给出不同的价格/配送，甚至跳转，
+而数据一样入库、一样不报错。**这件事在代码之外，必须在代理侧配。**
+
+#### 加拿大站的三项假设：已实测通过（2026-09-19）
+
+注册表里 `amazon.ca` 现在是 `verified=True`。三项原假设的实测结论：
+
+| 假设 | 结论 |
+|---|---|
+| 地址切换接口路径同构、接受带空格邮编 | ✅ 是，`K1V 7P8` 原样被接受 |
+| glow 文案含完整邮编 | ✅ 是，不是只有前三位 FSA |
+| 价格渲染成 `$` 还是 `CDN$` | ✅ `$`，`render_symbol="$"` 对 |
+
+⚠ **验证方式是真实采集会话 + 人工核对商品页，不是 `tools/probe_marketplace.py`。**
+探针脚本在那次验证里自己吃到了 202 壳页（它用裸 curl_cffi session，没走
+`AmazonSession.initialize()` 那套 cookie 预热），所以探针的结论不能当证据。
+细节记在 `common/core/marketplace.py` 末尾的 VERIFIED 一节。
+
+加**新**站点时仍然从 `verified=False` 起步，实测过再改 True，并写清楚怎么测的：
+
+```bash
+PROXY_URL='http://user:pass@host:port' \
+  python -m tools.probe_marketplace --marketplace amazon.xx
+```
+
+#### 默认邮编的作用
+
+`default_postal` 与美国站的 `10001` 承担同一个职责：**把「页面按哪个地区渲染」钉死**。
+不指定的话 Amazon 会按出口 IP 自己挑一个地区，于是同一批任务采回来的价格、配送时长、
+库存来自不同地区 —— 而数据看起来完全正常。加拿大站当前是 `K1V 7P8`（渥太华）。
+
+
+探针只发几个 GET/POST 然后打印，不写库、不改配置。跑完把实测结果回填进注册表，
+再把 `verified` 改成 `True`。
+
+#### 加新站点
+
+往 `_REGISTRY` 里加一条记录即可，需要给全：`host`、`currency`、
+`render_symbol`、`postal_pattern`、`default_postal`、`accept_language`。
+加完必须跑 `tests/test_marketplace.py` —— 其中
+`PostalShapesAreDisjoint` 会检查新站点的邮编形状与既有站点互斥
+（`pull_tasks` 的任务分组依赖这一条），`SAMPLES` 字典也要补上新站点的样本。
 
 ### 浏览器插件采集（F-011）
 

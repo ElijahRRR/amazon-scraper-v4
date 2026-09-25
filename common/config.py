@@ -125,6 +125,17 @@ DELIVERY_RETRY_MAX = int(os.environ.get("DELIVERY_RETRY_MAX", "2"))
 # 降级页（可售但无配送区）的原始 HTML 另存到 worker/degraded_dump（截图流程不碰它），
 # 供离线分析、收紧检测条件。DEGRADED_DUMP_MAX 限制最多存多少张，防塞满磁盘。
 DUMP_DEGRADED_HTML = os.environ.get("DUMP_DEGRADED_HTML", "0") == "1"
+
+# 采集成功页的 HTML 留档（排查解析缺陷用，默认关）：DUMP_HTML=1 时，把**采集成功**
+# 的商品页原样存一份到 DEGRADED_DUMP_DIR/ok/。
+#
+# 与 DUMP_DEGRADED_HTML 的区别：那个只在「重采用尽仍判定为降级页」时触发，
+# 也就是说**采成功的页永远存不下来**。而解析缺陷恰恰都发生在成功页上
+# ——F-012 加拿大站实测时，五个字段级缺陷（卖家漏采、尺寸错位、料号漏采……）
+# 全部出现在两件采集成功的商品上，而当时没有任何办法把那两张页面留下来离线分析。
+#
+# 用完记得关：一张商品页 0.5-2MB，长期开着会把盘写满。DEGRADED_DUMP_MAX 同时约束两者。
+DUMP_HTML = os.environ.get("DUMP_HTML", "0") == "1"
 DEGRADED_DUMP_MAX = int(os.environ.get("DEGRADED_DUMP_MAX", "300"))
 
 # 变体自动展开安全阀：单个产品的候选同族变体数超过此值，视为巨型/定制类家族
@@ -284,6 +295,10 @@ HEADER_MAP = {
     # 英文键名 `subtitle`（_get_export_headers 的 `HEADER_MAP.get(f, f)` 兜底）。
     "subtitle": "副标题",
     "offer_condition": "品相",
+    # F-012：采集来源站点。表头**不叫「站点」** —— 那个名字已经被上面的
+    # `site` 列占了（值是 "US"）。两列同名会让导出文件里出现两个「站点」，
+    # 而它们的值域还不一样。
+    "marketplace": "采集站点",
 }
 
 EXPORT_COLUMN_ORDER = [

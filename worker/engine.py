@@ -28,6 +28,7 @@ import httpx
 from common import config
 from common.core import error_types
 from common.core import searchurl
+from common.core import marketplace as _marketplace
 from common.slowhash import SLOW_HASH_FIELDS
 from worker.proxy import get_proxy_manager
 from worker.session import AmazonSession
@@ -197,7 +198,8 @@ class SessionSlot:
     一个 slot 轮换只影响它自己，其它 slot 继续采集（故不再需要全局热备 hot-swap）。
     """
     __slots__ = ("_w", "session", "_success_since_rotate", "_empty_title_count",
-                 "_last_rotate_time", "_grace_until", "_restart_epoch")
+                 "_last_rotate_time", "_grace_until", "_restart_epoch",
+                 "_marketplace")
 
     def __init__(self, worker):
         self._w = worker
@@ -207,16 +209,34 @@ class SessionSlot:
         self._last_rotate_time = 0.0
         self._grace_until = 0.0
         self._restart_epoch = worker._restart_epoch
+        # F-012：本 slot 当前 session 绑的站点。None = 还没建过 session。
+        self._marketplace: Optional[str] = None
 
-    async def ensure_ready(self) -> bool:
-        """确保 slot 有可用 session；软重启 epoch 变化时强制重建。"""
+    async def ensure_ready(self, marketplace: str = None,
+                           zip_code: str = None) -> bool:
+        """确保 slot 有可用 session；软重启 epoch 变化时强制重建。
+
+        F-012：``marketplace`` 与当前 session 不同时**强制重建** —— session
+        的 base URL、locale 头、cookie jar 全是站点相关的，换站点不是改个
+        属性能了事的。这不是"轮换"（不 report_blocked、不触发防抖），
+        它只是一次普通的重建，代价是 5-10s 的 session 初始化。
+        server 按 zip 聚类派发任务（而 zip 形状天然按站点互斥），所以稳态下
+        同一个 slot 连续拿到的任务基本同站点，重建很少发生。
+        """
+        want = _marketplace.get(marketplace).id
         if self._restart_epoch != self._w._restart_epoch:
             self._restart_epoch = self._w._restart_epoch
+            await self._close()
+        elif self.session is not None and self._marketplace != want:
+            logger.info("🌐 slot 换站点：%s → %s，重建 session",
+                        self._marketplace, want)
             await self._close()
         if self.session is not None and self.session.is_ready():
             return True
         await self._close()
-        self.session = await self._w._create_session_with_retry(delay=3)
+        self.session = await self._w._create_session_with_retry(
+            delay=3, marketplace=want, zip_code=zip_code)
+        self._marketplace = want if self.session is not None else None
         self._success_since_rotate = 0
         self._empty_title_count = 0
         return self.session is not None and self.session.is_ready()
@@ -421,6 +441,10 @@ class Worker:
 
         # 降级页样本采集（排查用，默认关，见 config.DUMP_DEGRADED_HTML）
         self._dump_degraded = getattr(config, "DUMP_DEGRADED_HTML", False)
+        # 成功页留档（F-012 实测之后补的：解析缺陷都发生在**成功页**上，
+        # 而 _dump_degraded_html 只在降级页触发，采成功的页一张也留不下来）
+        self._dump_ok = getattr(config, "DUMP_HTML", False)
+        self._ok_dump_count = 0
         self._degraded_dump_max = getattr(config, "DEGRADED_DUMP_MAX", 300)
         self._degraded_dump_count = 0
         self._degraded_dump_dir = os.path.join(
@@ -909,7 +933,9 @@ class Worker:
             logger.warning(f"⚠️ 拉取初始设置异常（将使用本地配置）: {e}")
 
     async def _create_session_with_retry(self, max_attempts: int = 3,
-                                         delay: float = 5) -> Optional[AmazonSession]:
+                                         delay: float = 5,
+                                         marketplace: str = None,
+                                         zip_code: str = None) -> Optional[AmazonSession]:
         """创建并初始化 AmazonSession，失败时重试。成功返回 session，全部失败返回 None。
         优雅关停感知：shutdown_event 被 set 时立即放弃重试。
 
@@ -924,7 +950,12 @@ class Worker:
             async with self._session_init_sem:
                 if self._shutdown_event.is_set():
                     return None
-                session = AmazonSession(self.proxy_manager, self.zip_code)
+                # F-012：站点与邮编都由调用方给（slot 知道它这次要采哪个站点），
+                # 缺省回落到 worker 的全局配置 —— 那是改造前的唯一行为。
+                session = AmazonSession(
+                    self.proxy_manager,
+                    zip_code if zip_code is not None else self.zip_code,
+                    marketplace=marketplace)
                 if await session.initialize():
                     return session
                 logger.warning(f"⚠️ Session 初始化失败 (尝试 {attempt+1}/{max_attempts})")
@@ -1207,6 +1238,37 @@ class Worker:
             return False
         return True
 
+    async def _dump_ok_html(self, asin: str, zip_code: str, marketplace: str,
+                            html: str):
+        """把**采集成功**的商品页原样存一份，供离线排查解析缺陷。
+
+        默认关（``DUMP_HTML=1`` 开启），与降级页 dump 共用数量上限。
+        文件名带站点，因为要排查的恰恰是站点差异。
+        任何异常都吞掉 —— 排查工具绝不能影响采集主流程。
+        """
+        if not self._dump_ok or not html:
+            return
+        if self._ok_dump_count >= self._degraded_dump_max:
+            return
+        try:
+            out_dir = os.path.join(self._degraded_dump_dir, "ok")
+            os.makedirs(out_dir, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            safe_zip = (zip_code or "na").replace(" ", "")
+            fname = f"{marketplace}_{asin}_{safe_zip}_{ts}.html"
+            path = os.path.join(out_dir, fname)
+            async with aiofiles.open(path, "w", encoding="utf-8") as f:
+                await f.write(html)
+            self._ok_dump_count += 1
+            if self._ok_dump_count == 1:
+                logger.info("🗂️ 成功页留档已开启（DUMP_HTML=1），写入 %s"
+                            " —— 排查完记得关，一张页 0.5-2MB", out_dir)
+            elif self._ok_dump_count == self._degraded_dump_max:
+                logger.info("🗂️ 成功页留档已达上限 %d，停止 dump",
+                            self._degraded_dump_max)
+        except Exception as e:
+            logger.debug(f"成功页 dump 失败 {asin}: {e}")
+
     async def _dump_degraded_html(self, asin: str, zip_code: str, html: str):
         """把疑似降级页的原始 HTML 存到独立目录（截图流程不碰它），供离线排查。
 
@@ -1239,7 +1301,8 @@ class Worker:
 
     def _attach_collection_meta(self, result_data: Dict, *, zip_requested: str,
                                 outcome: str, glow_zip_effective=None,
-                                session_zip=None, parsed: bool = True) -> Dict:
+                                session_zip=None, parsed: bool = True,
+                                marketplace: str = None) -> Dict:
         """把六个 `_` 前缀的采集元数据定形并挂到提交体上（就地修改并返回同一个 dict）。
 
         与 parser 的接口（P4-1 / P4-2 / P4-9）：parser 在 result 里放
@@ -1251,11 +1314,20 @@ class Worker:
         `_zip_requested` 由 engine 定，不由 parser 定：真正发出去的请求用的是
         `target_zip`，而 parser 只知道它被喂进来的那个参数。这一个键是消费侧
         分组键 (asin, marketplace, zip_requested) 的一部分（契约 §5.5 硬规则 2）。
+
+        F-012：`marketplace` 同理，而且理由更强 —— 它是那个分组键里的**另一个**
+        成分，同时还是 asin_data 唯一键 (asin, marketplace) 的一部分。
+        它只有 engine 知道（来自 task），parser 手里没有这个事实。
+        ⚠ 它**不带** `_` 前缀：那批 `_` 键是"只进事件流、不落 asin_data"的元数据，
+          而 marketplace 是 asin_data 的真列，两种东西不能混。
         """
         result_data[META_OUTCOME] = (
             outcome if outcome in (OUTCOME_OK, OUTCOME_NOT_FOUND) else OUTCOME_OK
         )
         result_data[META_ZIP_REQUESTED] = (zip_requested or "").strip()
+        # F-012：站点。不合法就抛 —— 与写入侧、建任务侧同一条口径，
+        # 一条站点不明的商品数据没有意义，宁可失败也不要静默落进美国站。
+        result_data["marketplace"] = _marketplace.get(marketplace).id
 
         # zip_observed 只可能来自 parser（glow-ingress-line2）。engine **不合成**：
         # 手里唯一的邮编是请求值，拿它冒充观测值就是一个错的 confirmed。
@@ -1275,7 +1347,8 @@ class Worker:
         )
         return result_data
 
-    def _build_not_found_result(self, asin: str, zip_requested: str) -> Dict:
+    def _build_not_found_result(self, asin: str, zip_requested: str,
+                                marketplace: str = None) -> Dict:
         """404 的提交体（P4-3）：快变字段照旧写占位值，慢变/目录字段**一个都不提交**。
 
         为什么是"删键"而不是"写占位符"：服务端写入是逐字段的
@@ -1297,7 +1370,8 @@ class Worker:
         tests/test_engine_not_found.py 里有一条用真实 `_default_result` +
         真实 `_is_parse_failure` 的断言钉住这个耦合。
         """
-        full = self.parser._default_result(asin, zip_requested)
+        full = self.parser._default_result(
+            asin, zip_requested, _marketplace.get(marketplace))
         result = {k: v for k, v in full.items()
                   if k not in _NOT_FOUND_PRESERVED_FIELDS}
         # 404 没有商品页可测：completeness=0（UNMEASURED）、parse_engine=None、
@@ -1315,6 +1389,7 @@ class Worker:
             glow_zip_effective=None,
             session_zip=None,
             parsed=False,
+            marketplace=marketplace,
         )
 
     async def _process_task(self, task: Dict, slot: "SessionSlot") -> tuple:
@@ -1331,6 +1406,9 @@ class Worker:
         task_id = task["id"]
         lease_epoch = task.get("lease_epoch", 0)
         zip_code = task.get("zip_code", self.zip_code)
+        # F-012：任务自带站点。老 server 不下发这个字段 -> None -> 美国站，
+        # 与改造前完全一致（灰度期新 worker 连老 server 是合法组合）。
+        task_marketplace = _marketplace.get(task.get("marketplace")).id
         max_retries = self._max_retries
         resp_bytes = 0
         last_error_type = error_types.NETWORK
@@ -1345,7 +1423,12 @@ class Worker:
         while attempt < max_retries:
             try:
                 # === Session 获取（本协程私有 slot，独立 session）===
-                if not await slot.ensure_ready():
+                # F-012：站点先于邮编 —— 换站点会重建 session（连带重置邮编），
+                # 顺序反过来的话刚切好的邮编会被重建冲掉，白白多一次 POST。
+                # target_zip 也一并传进去：新建 session 直接就是目标邮编，
+                # 省掉建完再切的那一次往返。
+                target_zip = (zip_code or "").strip() or self.zip_code
+                if not await slot.ensure_ready(task_marketplace, target_zip):
                     attempt += 1
                     logger.warning(f"ASIN {asin} session 未就绪 (尝试 {attempt}/{max_retries})")
                     await asyncio.sleep(2)
@@ -1354,7 +1437,6 @@ class Worker:
 
                 # === per-ASIN 邮编切换 ===
                 # 只有本协程用这个 session，切邮编无需 drain 全局在飞请求（这是并行的关键）。
-                target_zip = (zip_code or "").strip() or self.zip_code
                 if not await slot.ensure_zip(target_zip):
                     # 切换失败：跳过此任务，由 server 超时回收重试（其他协程/其他 session）
                     last_error_type = error_types.ZIP_SWITCH_FAILED
@@ -1418,7 +1500,7 @@ class Worker:
 
                 # ── 404：商品不存在（P4-3）────────────────────────────────
                 # 不重试、不轮换 IP。四条理由（都能在本仓库里核对）：
-                #  1. 404 的来源是**可信的**：请求走 https://www.amazon.com/dp/...
+                #  1. 404 的来源是**可信的**：请求走 <站点 base>/dp/...
                 #     （worker/session.py:353），代理是 CONNECT 隧道，TLS 端到端。
                 #     中间人伪造不出 404 —— 这个状态码只可能来自 Amazon 自己。
                 #  2. 仓库自己的模型就是"404 不是软封锁"：
@@ -1440,7 +1522,8 @@ class Worker:
                 if session.is_404(resp):
                     self._controller.record_result(req_elapsed, True, False, resp_bytes)
                     logger.info(f"ASIN {asin} 商品不存在 (404)")
-                    result_data = self._build_not_found_result(asin, target_zip)
+                    result_data = self._build_not_found_result(
+                        asin, target_zip, task_marketplace)
                     result_data["batch_name"] = task.get("batch_name", "")
                     await self._submit_result(task_id, result_data, success=True, batch_id=task.get("batch_id"), lease_epoch=lease_epoch)
                     if task.get("needs_screenshot") and self._enable_screenshot:
@@ -1449,6 +1532,7 @@ class Worker:
                             batch_name=task.get("batch_name", ""),
                             batch_id=task.get("batch_id"),
                             html_content=self._build_missing_product_html(asin),
+                            marketplace=task_marketplace,
                         )
                     self._stats["success"] += 1
                     self._stats["not_found"] = self._stats.get("not_found", 0) + 1
@@ -1464,7 +1548,8 @@ class Worker:
                 # 更糟的是 None 会被 `if val is not None` 跳过，
                 # asin_data.zip_code 保留**上一次采集**的邮编（可能是别的邮编）。
                 t_parse_start = time.time()
-                result_data = self.parser.parse_product(resp.text, asin, target_zip)
+                result_data = self.parser.parse_product(
+                    resp.text, asin, target_zip, task_marketplace)
                 t_parse = time.time() - t_parse_start
                 result_data["batch_name"] = task.get("batch_name", "")
 
@@ -1577,7 +1662,8 @@ class Worker:
                 #   None  → 商品页未暴露 glow 邮编 → 无法判定，宽松放行（非美国区已被上面的货币校验拦掉）
                 if (getattr(config, "ZIP_VERIFY_MODE", "standalone") == "on_fetch"
                         and target_zip):
-                    zip_eff = zip_effective_in_html(target_zip, resp.text)
+                    zip_eff = zip_effective_in_html(target_zip, resp.text,
+                                                    task_marketplace)
                     zip_glow = zip_eff   # P4-1：喂给 derive_zip_verify
                     if zip_eff is False:
                         self._zip_onfetch["mismatch"] += 1
@@ -1615,10 +1701,25 @@ class Worker:
                 # v3: No Featured Offer 产品请求 AOD AJAX 端点补充价格/运费/配送/FBA
                 if result_data.get("current_price") == "No Featured Offer":
                     try:
-                        aod_url = f"https://www.amazon.com/gp/product/ajax/aodAjaxMain/ref=dp_aod_unknown_mbc?asin={asin}&m=&qid=&smid=&sourcecustomerorglistid=&sourcecustomerorglistitemid=&sr=&pc=dp"
+                        # F-012：AOD 端点**按站点**拼。
+                        #
+                        # 这条写死成 amazon.com 是本功能里最要命的一处遗漏：
+                        # 下面那几行会把 AOD 拿回来的 price / buybox_price /
+                        # is_fba / shipping / delivery **覆盖**进 result_data，
+                        # 也就是说一个加拿大站商品（current_price 是
+                        # "No Featured Offer"）会被写进**美国站的报价**，
+                        # 然后落进 (asin, amazon.ca) 那一行。
+                        # 同一个 ASIN 在美国站多半也存在，所以这个请求不会 404、
+                        # 不会报错，采回来的数字看着完全正常。
+                        aod_url = (
+                            f"{session.AMAZON_BASE}/gp/product/ajax/aodAjaxMain"
+                            f"/ref=dp_aod_unknown_mbc?asin={asin}&m=&qid=&smid="
+                            f"&sourcecustomerorglistid=&sourcecustomerorglistitemid="
+                            f"&sr=&pc=dp")
                         olp_resp = await session.fetch_product_page_by_url(aod_url)
                         if olp_resp and hasattr(olp_resp, 'text') and olp_resp.text:
-                            offer = self.parser.parse_offer_listing(olp_resp.text)
+                            offer = self.parser.parse_offer_listing(
+                                olp_resp.text, _marketplace.get(task_marketplace))
                             if offer and offer.get('price'):
                                 result_data["current_price"] = offer['price']
                                 result_data["buybox_price"] = offer['price']
@@ -1655,6 +1756,7 @@ class Worker:
                     await self._dump_degraded_html(asin, zip_code, resp.text)
 
                 # 成功
+                await self._dump_ok_html(asin, target_zip, task_marketplace, resp.text)
                 self._controller.record_result(req_elapsed, True, False, resp_bytes)
                 # P4-1/P4-2/P4-9：把采集参数与质量元数据挂到提交体上（`_` 键，不落 asin_data）
                 self._attach_collection_meta(
@@ -1664,6 +1766,7 @@ class Worker:
                     glow_zip_effective=zip_glow,
                     session_zip=getattr(session, "zip_code", None),
                     parsed=True,
+                    marketplace=task_marketplace,
                 )
                 await self._submit_result(task_id, result_data, success=True, batch_id=task.get("batch_id"), lease_epoch=lease_epoch)
                 self._stats["success"] += 1
@@ -1682,6 +1785,7 @@ class Worker:
                         batch_name=task.get("batch_name", ""),
                         batch_id=task.get("batch_id"),
                         html_content=resp.text,
+                        marketplace=task_marketplace,
                     )
 
                 # 主动轮换：每 N 次成功请求更换本 slot 的 session 防止被检测
@@ -1733,6 +1837,9 @@ class Worker:
         lease_epoch = task.get("lease_epoch", 0)
         batch_id = task.get("batch_id")
         max_retries = self._max_retries
+        # F-012：卖家店铺页也是站点相关的 —— /s?me=<id> 在 amazon.ca 上
+        # 列的是该卖家在加拿大站的在售商品，与美国站不是同一批。
+        task_marketplace = _marketplace.get(task.get("marketplace")).id
 
         all_items: List[Dict] = []
         seen_asins = set()
@@ -1746,7 +1853,8 @@ class Worker:
         while page <= self.SELLER_MAX_PAGES:
             try:
                 # 本协程私有 slot：卖家翻页复用同一个 session（无需切邮编）
-                if not await slot.ensure_ready():
+                if not await slot.ensure_ready(task_marketplace,
+                                               task.get("zip_code")):
                     attempt += 1
                     if attempt >= max_retries:
                         last_error_type = error_types.SESSION_NOT_READY
@@ -1965,6 +2073,11 @@ class Worker:
         except (TypeError, ValueError):
             max_pages = searchurl.DEFAULT_MAX_PAGES
         include_sponsored = bool(search_params.get("include_sponsored"))
+        # F-012：站点以**任务上的 marketplace 为准**，不读 search_params['domain']。
+        # 两者在建批次时由同一处推导（create_search_batch），正常情况下一致；
+        # 不一致时任务列是权威的 —— 它是 server 落库的事实，而 task_meta 里的
+        # search 块可能来自一次老的、或者被手工改过的批次。
+        task_marketplace = _marketplace.get(task.get("marketplace")).id
 
         all_items: List[Dict] = []
         seen_asins = set()
@@ -1978,7 +2091,8 @@ class Worker:
         attempt = 0
         while page <= max_pages:
             try:
-                if not await slot.ensure_ready():
+                if not await slot.ensure_ready(task_marketplace,
+                                               task.get("zip_code")):
                     attempt += 1
                     if attempt >= max_retries:
                         last_error_type = error_types.SESSION_NOT_READY
@@ -2605,9 +2719,41 @@ class Worker:
         logger.info("=" * 60)
 
 
+    @staticmethod
+    def _inject_base_href(html: str, marketplace: str) -> str:
+        """给截图用的 HTML 注入 ``<base href>``（F-012：按站点）。
+
+        为什么在这里注入、而不是留给截图子进程：**子进程不知道站点**。
+        它只从磁盘读 ``<批次名>/<asin>.html``，文件里没有任何站点信息，
+        于是它只能写死一个 —— 改造前写死的就是 ``https://www.amazon.com/``。
+
+        影响面小但方向确定：``<base>`` 决定页面里**相对** URL 的解析基点。
+        Amazon 的图片/CSS 绝大多数是绝对 URL（``m.media-amazon.com``），
+        所以错一个 host 多半看不出来；但"多半看不出来"不是"对"，
+        而这里把它改对的成本只有几行。
+
+        判据与 ``worker/screenshot.py`` 那条**保持一致**（``"<base " not in``
+        前 2000 字符），所以两边不会重复注入：engine 注入过的，子进程看到
+        已经有 ``<base >`` 就不再动；没经过 engine 的老文件仍走子进程的兜底。
+        """
+        lower = html[:2000].lower()
+        if "<base " in lower:
+            return html
+        pos = lower.find("<head")
+        if pos == -1:
+            return html
+        try:
+            close = html.index(">", pos) + 1
+        except ValueError:
+            return html
+        base = _marketplace.get(marketplace).base_url
+        return html[:close] + f'<base href="{base}/">' + html[close:]
+
     async def _enqueue_screenshot_html(self, asin: str, batch_name: str,
-                                       batch_id: Optional[int], html_content: str):
+                                       batch_id: Optional[int], html_content: str,
+                                       marketplace: str = None):
         """将截图 HTML 写入隔离缓存目录并确保截图子进程已启动。"""
+        html_content = self._inject_base_href(html_content, marketplace)
         html_dir = os.path.join(self._screenshot_html_dir, batch_name)
         os.makedirs(html_dir, exist_ok=True)
         html_path = os.path.join(html_dir, f"{asin}.html")

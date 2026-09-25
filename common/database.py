@@ -25,6 +25,8 @@ from common.core.error_types import SERVER_REJECT
 # 关键词和落库的关键词会悄悄不同，而 search_discoveries 的主键含 keyword，
 # 结果是翻页去重失效、同一个词在库里裂成两行。
 from common.core.searchurl import normalize_keyword
+# F-012：站点注册表。按模块导入，理由同 PG 侧 results_write.py。
+from common.core import marketplace as _marketplace
 
 # ============================================================
 # 与 PG 后端共享的纯 Python 符号 —— 定义在 common/core/（Phase 4.1）。
@@ -280,7 +282,7 @@ class Database:
             -- ASIN 数据主表（每 ASIN 一行，存储最新状态）
             CREATE TABLE IF NOT EXISTS asin_data (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                asin TEXT NOT NULL UNIQUE,
+                asin TEXT NOT NULL,
                 title TEXT,
                 brand TEXT,
                 product_type TEXT,
@@ -340,9 +342,16 @@ class Database:
                 -- 会让新建库与升级库的物理列序分叉，而 `SELECT d.*` 没有
                 -- response_model，列序整个泄进 erpAPI 的响应。
                 subtitle TEXT,
-                -- 2026-09：buybox offer 的品相。**新的最后一列** —— 上面那段
+                -- 2026-09：buybox offer 的品相。
+                offer_condition TEXT,
+                -- F-012：采集来源站点。**新的最后一列** —— 上面那段
                 -- "必须是最后一列"的警告现在指向这一行。
-                offer_condition TEXT
+                -- 语义、取值域与「为什么不复用 site 列」的完整论证在
+                -- common/pgdb/schema.py 的同名列注释里（那边是正式后端）。
+                marketplace TEXT NOT NULL DEFAULT 'amazon.com',
+                -- F-012：唯一键从 (asin) 换成 (asin, marketplace)。同一个 ASIN
+                -- 在两个站点是两件不同的商品数据，单行唯一键会让它们互相覆盖。
+                UNIQUE(asin, marketplace)
             );
 
             -- 变动记录表（预计算，按类型索引，支持高效筛选）
@@ -380,6 +389,12 @@ class Database:
                 error_detail TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                -- ⚠ F-012 的 marketplace 列**不在这里**，走下面 init 里的 ALTER。
+                -- 理由：task_type / task_meta 也是 ALTER 加的，新库的物理列序
+                -- 因此是 ...updated_at, task_type, task_meta。把 marketplace
+                -- 写进 CREATE TABLE 会让它插到那两列**前面**，而 PG 侧
+                -- （正式后端）的 ADD COLUMN 只会追加到末尾 —— 两个后端的列序
+                -- 就此分叉，而 EXPECTED_COLUMNS 只能对上其中一种。
                 UNIQUE(batch_id, asin)
             );
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -516,9 +531,12 @@ class Database:
 
         # tasks.task_type: 'asin' (现有) | 'discover_seller'
         # tasks.task_meta: JSON, 仅 discover 任务用
+        # tasks.marketplace（F-012）：必须排在 task_type / task_meta **之后**，
+        # 新库的物理列序由这个顺序决定，而它要与 PG 侧的 EXPECTED_COLUMNS 对齐。
         for col_def in [
             ("task_type", "TEXT NOT NULL DEFAULT 'asin'"),
             ("task_meta", "TEXT"),
+            ("marketplace", "TEXT NOT NULL DEFAULT 'amazon.com'"),
         ]:
             col, ddl = col_def
             try:
@@ -550,6 +568,21 @@ class Database:
         for col in ["subtitle", "offer_condition"]:
             try:
                 await self._db.execute(f"ALTER TABLE asin_data ADD COLUMN {col} TEXT")
+                logger.info(f"数据库迁移: asin_data 表新增 {col} 列")
+            except Exception:
+                pass
+
+        # 迁移：asin_data.marketplace（F-012 多站点）。
+        # ⚠ SQLite **改不动唯一键** —— ALTER TABLE 不支持 ADD CONSTRAINT，
+        #   换键要整表重建。这条回滚路径上不做重建：SQLite 已经不是正式后端
+        #   （common/dbfactory.py 的 docstring），老 SQLite 库里本来就只有
+        #   美国站数据，(asin) 与 (asin, marketplace) 在那份数据上等价。
+        #   **新建**的 SQLite 库走 CREATE TABLE，唯一键是对的。
+        for col in ["marketplace"]:
+            try:
+                await self._db.execute(
+                    f"ALTER TABLE asin_data ADD COLUMN {col} "
+                    f"TEXT NOT NULL DEFAULT 'amazon.com'")
                 logger.info(f"数据库迁移: asin_data 表新增 {col} 列")
             except Exception:
                 pass
@@ -1063,10 +1096,13 @@ class Database:
 
     async def create_tasks(self, batch_id: int, asins: List[str], zip_code: str = "10001",
                            needs_screenshot: bool = False,
-                           per_asin_zip: Dict[str, str] = None) -> int:
+                           per_asin_zip: Dict[str, str] = None,
+                           marketplace: str = None) -> int:
         """批量创建采集任务，同时维护 batch_asins 关联。
 
         per_asin_zip: 可选 {asin: zip} 映射；某个 asin 在其中则用该 zip，否则回落到 zip_code。
+        marketplace:  采集来源站点（F-012）。``None`` -> 美国站。语义与 PG 侧
+                      ``common/pgdb/tasks.py`` 同名方法逐字一致。
         """
         clean_asins = []
         seen = set()
@@ -1081,6 +1117,7 @@ class Database:
             return 0
 
         per_asin_zip = per_asin_zip or {}
+        mkt = _marketplace.get(marketplace).id
 
         async with self._write_lock:
             await self._db.execute("BEGIN")
@@ -1088,16 +1125,20 @@ class Database:
                 # 插入任务（每个 asin 用各自指定的 zip，未指定则用批次默认）
                 before_tasks = self._db.total_changes
                 await self._db.executemany(
-                    "INSERT OR IGNORE INTO tasks (batch_id, asin, zip_code, needs_screenshot) VALUES (?, ?, ?, ?)",
-                    [(batch_id, asin, per_asin_zip.get(asin) or zip_code, ss_val)
+                    "INSERT OR IGNORE INTO tasks "
+                    "(batch_id, asin, zip_code, needs_screenshot, marketplace) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    [(batch_id, asin, per_asin_zip.get(asin) or zip_code, ss_val, mkt)
                      for asin in clean_asins]
                 )
                 task_inserted = self._db.total_changes - before_tasks
 
                 # 维护 batch_asins（判断是否新 ASIN）
                 for asin in clean_asins:
+                    # F-012：按 (asin, marketplace) 判新旧，口径同 PG 侧。
                     async with self._db.execute(
-                        "SELECT 1 FROM asin_data WHERE asin = ?", (asin,)
+                        "SELECT 1 FROM asin_data WHERE asin = ? AND marketplace = ?",
+                        (asin, mkt)
                     ) as c:
                         exists = await c.fetchone()
                     is_new = 0 if exists else 1
@@ -1163,7 +1204,7 @@ class Database:
                 base_sql = (
                     f"""SELECT t.id, t.batch_id, t.asin, t.zip_code, t.retry_count,
                                t.priority, t.needs_screenshot, t.lease_epoch,
-                               t.task_type, t.task_meta,
+                               t.task_type, t.task_meta, t.marketplace,
                                b.name as batch_name, b.discover_mode
                         FROM tasks t
                         JOIN batches b ON b.id = t.batch_id
@@ -1220,6 +1261,8 @@ class Database:
                         "task_type": row["task_type"] or "asin",
                         "task_meta": row["task_meta"],
                         "discover_mode": row["discover_mode"],
+                        # F-012：语义同 PG 侧 common/pgdb/tasks.py。
+                        "marketplace": row["marketplace"],
                     }
                     tasks.append(task)
                     ids.append(row["id"])
@@ -1577,7 +1620,8 @@ class Database:
     async def create_seller_batch(self, name: str, seller_ids: List[str],
                                    discover_mode: str = "with_detail",
                                    zip_code: str = "10001",
-                                   needs_screenshot: bool = False) -> Tuple[int, int]:
+                                   needs_screenshot: bool = False,
+                                   marketplace: str = None) -> Tuple[int, int]:
         """创建一个 seller_discovery 类型的批次，并为每个 seller_id 插入一个 discover_seller 任务。
 
         - 衍生的 ASIN 详情任务在 discover 任务完成时由 accept_seller_discovery_result 动态插入。
@@ -1599,6 +1643,8 @@ class Database:
             return (0, 0)
 
         ss_val = 1 if needs_screenshot else 0
+        # F-012：不合法就抛，不静默回退（口径见 create_tasks）。
+        mkt = _marketplace.get(marketplace).id
         async with self._write_lock:
             await self._db.execute("BEGIN")
             try:
@@ -1617,9 +1663,9 @@ class Database:
                 before = self._db.total_changes
                 await self._db.executemany(
                     "INSERT OR IGNORE INTO tasks "
-                    "(batch_id, asin, zip_code, needs_screenshot, task_type) "
-                    "VALUES (?, ?, ?, 0, 'discover_seller')",
-                    [(batch_id, sid, zip_code) for sid in clean_ids]
+                    "(batch_id, asin, zip_code, needs_screenshot, task_type, marketplace) "
+                    "VALUES (?, ?, ?, 0, 'discover_seller', ?)",
+                    [(batch_id, sid, zip_code, mkt) for sid in clean_ids]
                 )
                 inserted = self._db.total_changes - before
                 await self._db.execute("COMMIT")
@@ -1701,24 +1747,29 @@ class Database:
                 if discover_mode == "with_detail" and seen_asins:
                     # 取该 task 的 zip_code 复用
                     async with self._db.execute(
-                        "SELECT zip_code FROM tasks WHERE id=?", (task_id,)
+                        "SELECT zip_code, marketplace FROM tasks WHERE id=?", (task_id,)
                     ) as c:
                         zrow = await c.fetchone()
                     zip_code = zrow["zip_code"] if zrow else "10001"
+                    # F-012：站点从 discover 任务继承（同 PG 侧）。
+                    mkt = (zrow["marketplace"] if zrow
+                           else _marketplace.DEFAULT_MARKETPLACE)
 
                     before = self._db.total_changes
                     await self._db.executemany(
                         "INSERT OR IGNORE INTO tasks "
-                        "(batch_id, asin, zip_code, needs_screenshot, task_type) "
-                        "VALUES (?, ?, ?, ?, 'asin')",
-                        [(batch_id, a, zip_code, ss_val) for a in seen_asins]
+                        "(batch_id, asin, zip_code, needs_screenshot, task_type, "
+                        " marketplace) "
+                        "VALUES (?, ?, ?, ?, 'asin', ?)",
+                        [(batch_id, a, zip_code, ss_val, mkt) for a in seen_asins]
                     )
                     detail_inserted = self._db.total_changes - before
 
                     # 维护 batch_asins 关联（is_new 判定参考 create_tasks）
                     for a in seen_asins:
                         async with self._db.execute(
-                            "SELECT 1 FROM asin_data WHERE asin=?", (a,)
+                            "SELECT 1 FROM asin_data WHERE asin=? AND marketplace=?",
+                            (a, mkt)
                         ) as c:
                             exists = await c.fetchone()
                         await self._db.execute(
@@ -1832,6 +1883,8 @@ class Database:
 
         meta_json = json.dumps({"search": search_params or {}}, ensure_ascii=False)
         ss_val = 1 if needs_screenshot else 0
+        # F-012：站点从搜索参数的 domain 推导，语义见 PG 侧同名方法的注释。
+        mkt = _marketplace.get((search_params or {}).get("domain")).id
         async with self._write_lock:
             await self._db.execute("BEGIN")
             try:
@@ -1850,9 +1903,10 @@ class Database:
                 before = self._db.total_changes
                 await self._db.executemany(
                     "INSERT OR IGNORE INTO tasks "
-                    "(batch_id, asin, zip_code, needs_screenshot, task_type, task_meta) "
-                    "VALUES (?, ?, ?, 0, 'discover_search', ?)",
-                    [(batch_id, kw, zip_code, meta_json) for kw in clean_kws]
+                    "(batch_id, asin, zip_code, needs_screenshot, task_type, task_meta, "
+                    " marketplace) "
+                    "VALUES (?, ?, ?, 0, 'discover_search', ?, ?)",
+                    [(batch_id, kw, zip_code, meta_json, mkt) for kw in clean_kws]
                 )
                 inserted = self._db.total_changes - before
                 await self._db.execute("COMMIT")
@@ -1954,23 +2008,28 @@ class Database:
                 detail_inserted = 0
                 if discover_mode == "with_detail" and seen_asins:
                     async with self._db.execute(
-                        "SELECT zip_code FROM tasks WHERE id=?", (task_id,)
+                        "SELECT zip_code, marketplace FROM tasks WHERE id=?", (task_id,)
                     ) as c:
                         zrow = await c.fetchone()
                     zip_code = zrow["zip_code"] if zrow else "10001"
+                    # F-012：站点从 discover 任务继承（同 PG 侧）。
+                    mkt = (zrow["marketplace"] if zrow
+                           else _marketplace.DEFAULT_MARKETPLACE)
 
                     before = self._db.total_changes
                     await self._db.executemany(
                         "INSERT OR IGNORE INTO tasks "
-                        "(batch_id, asin, zip_code, needs_screenshot, task_type) "
-                        "VALUES (?, ?, ?, ?, 'asin')",
-                        [(batch_id, a, zip_code, ss_val) for a in seen_asins]
+                        "(batch_id, asin, zip_code, needs_screenshot, task_type, "
+                        " marketplace) "
+                        "VALUES (?, ?, ?, ?, 'asin', ?)",
+                        [(batch_id, a, zip_code, ss_val, mkt) for a in seen_asins]
                     )
                     detail_inserted = self._db.total_changes - before
 
                     for a in seen_asins:
                         async with self._db.execute(
-                            "SELECT 1 FROM asin_data WHERE asin=?", (a,)
+                            "SELECT 1 FROM asin_data WHERE asin=? AND marketplace=?",
+                            (a, mkt)
                         ) as c:
                             exists = await c.fetchone()
                         await self._db.execute(
@@ -2217,6 +2276,11 @@ class Database:
         if not asin:
             return False
 
+        # F-012：语义与 PG 侧 results_write.py 的同名段落**完全一致**（那边是
+        # 正式后端，论证写在那里）。一句话：站点是唯一键的一部分，不兜底。
+        marketplace = _marketplace.get(data.get("marketplace")).id
+        data["marketplace"] = marketplace
+
         now = now_ts()
         data["content_hash"] = _compute_content_hash(data)
         data["title_bullets_hash"] = _compute_title_bullets_hash(data)
@@ -2238,7 +2302,7 @@ class Database:
             "SELECT screenshot_path, title, "
             "baseline_price, baseline_buybox_price, baseline_stock_count, "
             "baseline_stock_status, baseline_title_bullets_hash "
-            "FROM asin_data WHERE asin = ?", (asin,)
+            "FROM asin_data WHERE asin = ? AND marketplace = ?", (asin, marketplace)
         ) as c:
             existing = await c.fetchone()
 
@@ -2303,7 +2367,9 @@ class Database:
             update_fields = []
             update_values = []
             for f in ASIN_DATA_FIELDS:
-                if f in ("asin", "screenshot_path"):
+                # marketplace 是**定位键**，在 WHERE 里，不进 SET。
+                # 与 PG 侧 results_write.py 同一条口径。
+                if f in ("asin", "screenshot_path", "marketplace"):
                     continue
                 val = data.get(f)
                 if val is not None:
@@ -2332,9 +2398,11 @@ class Database:
             update_fields.append("updated_at = ?")
             update_values.append(now)
             update_values.append(asin)
+            update_values.append(marketplace)
 
             await self._db.execute(
-                f"UPDATE asin_data SET {', '.join(update_fields)} WHERE asin = ?",
+                f"UPDATE asin_data SET {', '.join(update_fields)} "
+                f"WHERE asin = ? AND marketplace = ?",
                 update_values
             )
         else:

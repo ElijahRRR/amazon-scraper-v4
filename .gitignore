@@ -37,3 +37,7 @@ env/
 # PostgreSQL 时的处理同款），所以这里只忽略安装产物，不往仓库里加 package.json。
 node_modules/
 package-lock.json
+
+# F-012 排查留档：DUMP_HTML=1 存的成功页。体积大（0.5-2MB/张），不进仓库。
+# 要当测试夹具就裁剪后放 tests/fixtures/（见那里的 README）。
+worker/degraded_dump/

@@ -89,6 +89,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from common import config
 from common.core.searchurl import normalize_keyword
+from common.core import marketplace as _marketplace
 from common.pgdb._shared import _normalize_screenshot_path
 
 logger = logging.getLogger(__name__)
@@ -165,7 +166,8 @@ class MediaMixin:
     async def create_seller_batch(self, name: str, seller_ids: List[str],
                                   discover_mode: str = "with_detail",
                                   zip_code: str = "10001",
-                                  needs_screenshot: bool = False) -> Tuple[int, int]:
+                                  needs_screenshot: bool = False,
+                                  marketplace: str = None) -> Tuple[int, int]:
         """创建一个 seller_discovery 类型的批次，并为每个 seller_id 插入一个 discover_seller 任务。
 
         - 衍生的 ASIN 详情任务在 discover 任务完成时由 accept_seller_discovery_result 动态插入。
@@ -190,6 +192,8 @@ class MediaMixin:
         name_p = self.text_affinity(name)
         mode_p = self.text_affinity(discover_mode)
         zip_p = self.text_affinity(zip_code)
+        # F-012：不合法就抛，不静默回退（口径见 create_tasks）。
+        mkt_p = self.text_affinity(_marketplace.get(marketplace).id)
         async with self._write_lock:
             await self._db.execute("BEGIN")
             try:
@@ -212,11 +216,11 @@ class MediaMixin:
                 # unnest 的源行数 = 尝试插入次数，烧号与逐行 INSERT OR IGNORE 一致。
                 cursor = await self._db.execute(
                     "INSERT INTO tasks "
-                    "(batch_id, asin, zip_code, needs_screenshot, task_type) "
-                    "SELECT ?::bigint, u.asin, ?::text, 0, 'discover_seller' "
+                    "(batch_id, asin, zip_code, needs_screenshot, task_type, marketplace) "
+                    "SELECT ?::bigint, u.asin, ?::text, 0, 'discover_seller', ?::text "
                     "  FROM unnest(?::text[]) AS u(asin) "
                     "ON CONFLICT DO NOTHING",
-                    (batch_id, zip_p, clean_ids)
+                    (batch_id, zip_p, mkt_p, clean_ids)
                 )
                 inserted = cursor.rowcount
                 await self._db.execute("COMMIT")
@@ -305,11 +309,15 @@ class MediaMixin:
                 detail_inserted = 0
                 if discover_mode == "with_detail" and seen_asins:
                     # 取该 task 的 zip_code 复用
+                    # F-012：站点与邮编一样，从 discover 任务**继承**下来。
+                    # 漏了它，加拿大站发现出来的 ASIN 会被派成美国站详情任务。
                     async with self._db.execute(
-                        "SELECT zip_code FROM tasks WHERE id=?", (tid,)
+                        "SELECT zip_code, marketplace FROM tasks WHERE id=?", (tid,)
                     ) as c:
                         zrow = await c.fetchone()
                     zip_code = zrow["zip_code"] if zrow else "10001"
+                    mkt = zrow["marketplace"] if zrow else _marketplace.DEFAULT_MARKETPLACE
+                    mkt_p = self.text_affinity(mkt)
 
                     # total_changes 差值 → set-based INSERT + 命令标签。
                     # seen_asins 是 set，原版 executemany 也按 set 迭代序插入，
@@ -317,18 +325,21 @@ class MediaMixin:
                     detail_asins = list(seen_asins)
                     cursor = await self._db.execute(
                         "INSERT INTO tasks "
-                        "(batch_id, asin, zip_code, needs_screenshot, task_type) "
-                        "SELECT ?::bigint, u.asin, ?::text, ?::int, 'asin' "
+                        "(batch_id, asin, zip_code, needs_screenshot, task_type, "
+                        " marketplace) "
+                        "SELECT ?::bigint, u.asin, ?::text, ?::int, 'asin', ?::text "
                         "  FROM unnest(?::text[]) AS u(asin) "
                         "ON CONFLICT DO NOTHING",
-                        (bid, self.text_affinity(zip_code), ss_val, detail_asins)
+                        (bid, self.text_affinity(zip_code), ss_val, mkt_p, detail_asins)
                     )
                     detail_inserted = cursor.rowcount
 
                     # 维护 batch_asins 关联（is_new 判定参考 create_tasks）
                     for a in seen_asins:
+                        # F-012：按 (asin, marketplace) 判新旧，口径同 create_tasks。
                         async with self._db.execute(
-                            "SELECT 1 FROM asin_data WHERE asin=?", (a,)
+                            "SELECT 1 FROM asin_data WHERE asin=? AND marketplace=?",
+                            (a, mkt_p)
                         ) as c:
                             exists = await c.fetchone()
                         await self._db.execute(
@@ -441,6 +452,14 @@ class MediaMixin:
         mode_p = self.text_affinity(discover_mode)
         zip_p = self.text_affinity(zip_code)
         meta_p = self.text_affinity(meta_json)
+        # F-012：站点**从搜索参数的 domain 推导**，这是本次改造要补的那条断点。
+        #
+        # 改造前：`domain=www.amazon.ca` 只影响 worker 翻搜索结果页的 URL，
+        # 派生出来的详情任务没有任何站点字段，于是详情全部去 amazon.com 抓 ——
+        # 批次名/进度/发现数全部正常，只有数据是另一个国家的。
+        # 现在 domain 决定整条链路的站点，发现与详情不可能再走岔。
+        mkt_p = self.text_affinity(
+            _marketplace.get((search_params or {}).get("domain")).id)
         async with self._write_lock:
             await self._db.execute("BEGIN")
             try:
@@ -461,11 +480,12 @@ class MediaMixin:
 
                 cursor = await self._db.execute(
                     "INSERT INTO tasks "
-                    "(batch_id, asin, zip_code, needs_screenshot, task_type, task_meta) "
-                    "SELECT ?::bigint, u.kw, ?::text, 0, 'discover_search', ?::text "
+                    "(batch_id, asin, zip_code, needs_screenshot, task_type, task_meta, "
+                    " marketplace) "
+                    "SELECT ?::bigint, u.kw, ?::text, 0, 'discover_search', ?::text, ?::text "
                     "  FROM unnest(?::text[]) AS u(kw) "
                     "ON CONFLICT DO NOTHING",
-                    (batch_id, zip_p, meta_p, clean_kws)
+                    (batch_id, zip_p, meta_p, mkt_p, clean_kws)
                 )
                 inserted = cursor.rowcount
                 await self._db.execute("COMMIT")
@@ -565,26 +585,33 @@ class MediaMixin:
                 # Step 4: 若 with_detail，为每个 ASIN 插入详情任务（同 batch_id）
                 detail_inserted = 0
                 if discover_mode == "with_detail" and seen_asins:
+                    # F-012：站点与邮编一样，从 discover 任务**继承**下来。
+                    # 漏了它，加拿大站发现出来的 ASIN 会被派成美国站详情任务。
                     async with self._db.execute(
-                        "SELECT zip_code FROM tasks WHERE id=?", (tid,)
+                        "SELECT zip_code, marketplace FROM tasks WHERE id=?", (tid,)
                     ) as c:
                         zrow = await c.fetchone()
                     zip_code = zrow["zip_code"] if zrow else "10001"
+                    mkt = zrow["marketplace"] if zrow else _marketplace.DEFAULT_MARKETPLACE
+                    mkt_p = self.text_affinity(mkt)
 
                     detail_asins = list(seen_asins)
                     cursor = await self._db.execute(
                         "INSERT INTO tasks "
-                        "(batch_id, asin, zip_code, needs_screenshot, task_type) "
-                        "SELECT ?::bigint, u.asin, ?::text, ?::int, 'asin' "
+                        "(batch_id, asin, zip_code, needs_screenshot, task_type, "
+                        " marketplace) "
+                        "SELECT ?::bigint, u.asin, ?::text, ?::int, 'asin', ?::text "
                         "  FROM unnest(?::text[]) AS u(asin) "
                         "ON CONFLICT DO NOTHING",
-                        (bid, self.text_affinity(zip_code), ss_val, detail_asins)
+                        (bid, self.text_affinity(zip_code), ss_val, mkt_p, detail_asins)
                     )
                     detail_inserted = cursor.rowcount
 
                     for a in seen_asins:
+                        # F-012：按 (asin, marketplace) 判新旧，口径同 create_tasks。
                         async with self._db.execute(
-                            "SELECT 1 FROM asin_data WHERE asin=?", (a,)
+                            "SELECT 1 FROM asin_data WHERE asin=? AND marketplace=?",
+                            (a, mkt_p)
                         ) as c:
                             exists = await c.fetchone()
                         await self._db.execute(

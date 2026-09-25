@@ -50,6 +50,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Request
 
 from common import config
+from common.core import marketplace
 from common.core import searchurl
 
 
@@ -128,13 +129,38 @@ async def api_create_search_batch(request: Request):
         raise HTTPException(400, f"非法 discover_mode: {discover_mode}")
 
     _s = _srv()
+
+    # F-012：站点由 `domain` 决定（normalize_search_params 已经校验过它在
+    # searchurl.SUPPORTED_DOMAINS 里），而**邮编必须按那个站点校验** ——
+    # 给加拿大站批次配一个美国 5 位邮编，POST 给 Amazon 之后不是报错而是
+    # 静默落到默认地区，采回来一批"看着正常、其实不是你要的地区"的数据。
+    try:
+        mkt = marketplace.get(search_params.get("domain"))
+    except ValueError as e:
+        # domain 在 searchurl 白名单里、却没有详情采集规则（18 个站点里的
+        # 另外 16 个）。这时候**只能翻搜索页、不能采详情**，所以 with_detail
+        # 直接拒掉，discover_only 放行。
+        if discover_mode == "with_detail":
+            raise HTTPException(
+                400,
+                f"{e}。该站点目前只支持 discover_only（只翻搜索结果页）——"
+                f"详情采集需要该站点的邮编与货币规则，"
+                f"补进 common/core/marketplace.py 的注册表后即可开启。")
+        mkt = marketplace.get(None)
+
     zip_raw = body.get("zip_code")
     if zip_raw:
-        zc = _s._normalize_zip(zip_raw)
+        zc = _s._normalize_zip(zip_raw, mkt.id)
         if not zc:
-            raise HTTPException(400, f"非法邮编: {zip_raw!r}")
+            raise HTTPException(
+                400, f"非法邮编: {zip_raw!r}（{mkt.label}需要 "
+                     f"{mkt.default_postal!r} 这种形状）")
     else:
-        zc = _s._runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE)
+        # 默认邮编也要按站点取：全局设置里存的是美国邮编，拿它去加拿大站
+        # 是上面那条「静默落到默认地区」的另一个入口。
+        default_zip = _s._runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE)
+        zc = (default_zip if _s._normalize_zip(default_zip, mkt.id)
+              else mkt.default_postal)
 
     batch_name = body.get("batch_name")
     if not batch_name:
