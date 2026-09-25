@@ -1548,14 +1548,39 @@ class AmazonParser:
             * 第一次上线后请拿一个已知二手 ASIN 实测一次（README 有命令）；
             * 结构变了只会退回 "N/A"（静默变空），不会串味成别的品相。
         """
-        # 1) DOM：只在白名单容器里找
-        for css, xp in self._CONDITION_SCOPES:
-            blob = (self._uni_first_text(tree, css, xp) or "").lower()
-            if not blob:
-                continue
+        # 1) DOM
+        #
+        # 1a) 多 offer 的 buybox（2026-09 起的 accordion 布局）：一张卡片里纵向
+        #     堆着 #primeSavingsUpsellAccordionRow（会员价）/ #newAccordionRow_N
+        #     （全新）/ #usedAccordionRow（二手）等若干行，**只有一行是展开的**
+        #     （a-accordion-active）—— 那一行才是页面主推、current_price 取到的
+        #     offer。品相只能从这一行读。
+        #
+        #     ⚠ 以前这里会落到下面的 #desktop_buybox / #buybox 作用域，把整张卡片
+        #       当一个文本块去匹配，于是折叠着的二手行标题 "Used - Very Good" 被
+        #       当成了本 offer 的品相。实例 B0GVNC5WHS：主推是会员价 $36.99 的
+        #       全新件，却被标成二手（二手行是另一个 offer，$37.49）。
+        #       有 accordion 时**不再回落**到整卡作用域 —— 回落就是那个 bug。
+        if self._uni_first_text(tree, '#buyBoxAccordion',
+                                '//*[@id="buyBoxAccordion"]') is not None:
+            active = (self._uni_first_text(
+                tree,
+                '#buyBoxAccordion div.a-accordion-active[id*="AccordionRow"]',
+                '//*[@id="buyBoxAccordion"]//div[contains(@id, "AccordionRow")'
+                ' and contains(concat(" ", normalize-space(@class), " "),'
+                ' " a-accordion-active ")]') or "").lower()
             for canonical, pat in self._CONDITION_PATTERNS:
-                if re.search(pat, blob):
+                if active and re.search(pat, active):
                     return canonical
+        else:
+            # 1b) 传统单 offer buybox：白名单容器里找
+            for css, xp in self._CONDITION_SCOPES:
+                blob = (self._uni_first_text(tree, css, xp) or "").lower()
+                if not blob:
+                    continue
+                for canonical, pat in self._CONDITION_PATTERNS:
+                    if re.search(pat, blob):
+                        return canonical
 
         # 2) 标题：翻新品的独立 ASIN。放在 DOM 之后 —— DOM 说的是本次 offer，
         #    比标题这个产品级标记更具体。
