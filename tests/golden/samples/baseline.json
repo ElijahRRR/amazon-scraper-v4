@@ -350,6 +350,11 @@
                     "title": "Interval Days",
                     "type": "integer"
                   },
+                  "marketplace": {
+                    "default": "",
+                    "title": "Marketplace",
+                    "type": "string"
+                  },
                   "name": {
                     "default": "",
                     "title": "Name",
@@ -362,6 +367,11 @@
                   },
                   "time": {
                     "title": "Time",
+                    "type": "string"
+                  },
+                  "zip_code": {
+                    "default": "",
+                    "title": "Zip Code",
                     "type": "string"
                   }
                 },
@@ -407,6 +417,10 @@
                   "file": {
                     "contentMediaType": "application/octet-stream",
                     "title": "File",
+                    "type": "string"
+                  },
+                  "marketplace": {
+                    "title": "Marketplace",
                     "type": "string"
                   },
                   "needs_screenshot": {
@@ -615,7 +629,7 @@
                 "summary": "Api Batches"
               },
               "post": {
-                "description": "**推送采集任务（JSON）** —— 和 `POST /api/upload` 等价，只是不用传文件。\n\n给程序化调用方用：上游系统手里本来就是一个 ASIN 列表，为了调这个接口先拼\n一个 xlsx 再 multipart 上传是纯粹的仪式。响应体、409 撞名语义、回调注册，\n与 `/api/upload` **完全一致**（同一份实现）。\n\n请求体：\n\n    {\n      \"asins\": [\"B0XXXXXXX1\", \"B0XXXXXXX2\"],   // 与 items 二选一\n      \"items\": [                                // 需要逐个 ASIN 指定邮编时用\n        {\"asin\": \"B0XXXXXXX1\", \"zip_code\": \"10001\"},\n        {\"asin\": \"B0XXXXXXX2\"}                  // 不写 -> 用下面的 zip_code\n      ],\n      \"zip_code\":         \"90001\",   // 可选。不传 = 用服务端默认邮编\n      \"needs_screenshot\": false,     // 可选，默认 false\n      \"batch_name\":       null,      // 可选，不传则自动生成\n      \"callback_url\":     null,      // 可选，批次完成时 POST 通知\n      \"external_id\":      null,      // 可选，原样回传\n      \"expand_variants\":  false      // 可选\n    }\n\n两个「自由选择」按调用方要的语义来：\n\n* **邮编**：三档独立。`items[].zip_code`（这一个 ASIN）> 顶层 `zip_code`\n  （这一批）> 服务端默认。想跟随服务端默认就整个不传这个键——传 `null` 也\n  当没传，但**不要**传 `\"\"` 去表达「用默认」，空串这里按缺省处理、别的地方\n  未必，少一层歧义是一层。\n* **截图**：`needs_screenshot` 是**批次级**开关（底层 `batches` 表就一列，\n  截图任务是按批派生的）。不传即 false，也就是**默认不截图**。想要一半截图\n  一半不截，推两个批次——不要指望 items 里逐个开关，那个粒度库里不存在。\n\n`asins` 与 `items` 可以同时给（合并，`items` 的邮编优先）。ASIN 去重保序，\n非法 ASIN 直接丢弃；一个都不剩 -> 400。非法邮编不拦请求，计入响应的\n`invalid_zip_rows`，那些 ASIN 退回用批次邮编。",
+                "description": "**推送采集任务（JSON）** —— 和 `POST /api/upload` 等价，只是不用传文件。\n\n给程序化调用方用：上游系统手里本来就是一个 ASIN 列表，为了调这个接口先拼\n一个 xlsx 再 multipart 上传是纯粹的仪式。响应体、409 撞名语义、回调注册，\n与 `/api/upload` **完全一致**（同一份实现）。\n\n请求体：\n\n    {\n      \"asins\": [\"B0XXXXXXX1\", \"B0XXXXXXX2\"],   // 与 items 二选一\n      \"items\": [                                // 需要逐个 ASIN 指定邮编时用\n        {\"asin\": \"B0XXXXXXX1\", \"zip_code\": \"10001\"},\n        {\"asin\": \"B0XXXXXXX2\"}                  // 不写 -> 用下面的 zip_code\n      ],\n      \"zip_code\":         \"90001\",   // 可选。不传 = 用服务端默认邮编\n      \"needs_screenshot\": false,     // 可选，默认 false\n      \"batch_name\":       null,      // 可选，不传则自动生成\n      \"callback_url\":     null,      // 可选，批次完成时 POST 通知\n      \"external_id\":      null,      // 可选，原样回传\n      \"expand_variants\":  false,     // 可选\n      \"marketplace\":      null       // 可选。不传 = 美国站 amazon.com\n    }\n\n两个「自由选择」按调用方要的语义来：\n\n* **邮编**：三档独立。`items[].zip_code`（这一个 ASIN）> 顶层 `zip_code`\n  （这一批）> 服务端默认。想跟随服务端默认就整个不传这个键——传 `null` 也\n  当没传，但**不要**传 `\"\"` 去表达「用默认」，空串这里按缺省处理、别的地方\n  未必，少一层歧义是一层。邮编形状随站点（美国站 5 位数字，加拿大站\n  `K1V 7P8` 这种）。\n* **站点**：`marketplace`，一个批次只属于一个站点。不传 / `null` / `\"\"` =\n  美国站，与加这个键之前完全一致；`amazon.ca`（也收 `www.amazon.ca`、\n  `https://www.amazon.ca/`，大小写不限）= 加拿大站；不在站点注册表里 ->\n  400，不静默回退、不建批次。非美国站的服务端默认邮编是该站点自己的\n  （加拿大站 `K1V 7P8`），200 响应里额外带 `marketplace`。\n* **截图**：`needs_screenshot` 是**批次级**开关（底层 `batches` 表就一列，\n  截图任务是按批派生的）。不传即 false，也就是**默认不截图**。想要一半截图\n  一半不截，推两个批次——不要指望 items 里逐个开关，那个粒度库里不存在。\n\n`asins` 与 `items` 可以同时给（合并，`items` 的邮编优先）。ASIN 去重保序，\n非法 ASIN 直接丢弃；一个都不剩 -> 400。非法邮编不拦请求，计入响应的\n`invalid_zip_rows`，那些 ASIN 退回用批次邮编。",
                 "operationId": "api_create_batch_api_batches_post",
                 "responses": {
                   "200": {
@@ -1217,7 +1231,7 @@
             },
             "/api/extension/collect": {
               "post": {
-                "description": "插件推送：一批 ASIN + 一批卖家 ID。\n\nBody（全部可选，但 `asins` 与 `seller_ids` 至少要有一个非空）:\n\n| 字段 | 默认 | 说明 |\n|---|---|---|\n| `asins` | `[]` | 要采详情的 ASIN |\n| `seller_ids` | `[]` | 要整店发现的卖家 ID |\n| `batch_name` | 自动生成 `ext_<ts>` | **同名 = 追加**（见模块头注） |\n| `zip_code` | 服务端默认 | 配送邮编 |\n| `needs_screenshot` | `false` | 详情阶段是否截图 |\n| `seller_discover_mode` | `with_detail` | 卖家批次的采集深度 |\n| `source` / `page_url` | — | 仅记录用途，不影响行为 |\n\n响应里 `asin_batch` / `seller_batch` 两块各自独立，某一块没提交就是 `null`。",
+                "description": "插件推送：一批 ASIN + 一批卖家 ID。\n\nBody（全部可选，但 `asins` 与 `seller_ids` 至少要有一个非空）:\n\n| 字段 | 默认 | 说明 |\n|---|---|---|\n| `asins` | `[]` | 要采详情的 ASIN |\n| `seller_ids` | `[]` | 要整店发现的卖家 ID |\n| `batch_name` | 自动生成 `ext_<ts>` | **同名 = 追加**（见模块头注） |\n| `marketplace` | `amazon.com` | 站点（`amazon.ca` 等）。不在注册表里 -> 400；不从 `page_url` 推导 |\n| `zip_code` | 服务端按站点取默认 | 配送邮编，按站点校验 |\n| `needs_screenshot` | `false` | 详情阶段是否截图 |\n| `seller_discover_mode` | `with_detail` | 卖家批次的采集深度 |\n| `source` / `page_url` | — | 仅记录用途，不影响行为 |\n\n响应里 `asin_batch` / `seller_batch` 两块各自独立，某一块没提交就是 `null`。\n非美国站时两块各多一个 `marketplace` 键。同名批次已属于另一个站点 -> 409。",
                 "operationId": "api_extension_collect_api_extension_collect_post",
                 "responses": {
                   "200": {
@@ -1251,7 +1265,7 @@
             },
             "/api/extension/resolve-sellers": {
               "post": {
-                "description": "按 ASIN 反查**已采到的**卖家（`asin_data.seller_id`）。\n\n用途：商品详情页上读不到三方卖家时（Amazon 改版、自营页、异步渲染没跑完），\n插件拿这个补全，用户就还能勾\"采集该卖家全部商品\"。\n\n**只回库里已经有的**，查不到就不回 —— 这是补全，不是推测。\n返回一个猜的卖家会让用户采回一整店无关商品，而且完全看不出是错的。",
+                "description": "按 ASIN 反查**已采到的**卖家（`asin_data.seller_id`）。\n\n用途：商品详情页上读不到三方卖家时（Amazon 改版、自营页、异步渲染没跑完），\n插件拿这个补全，用户就还能勾\"采集该卖家全部商品\"。\n\n**只回库里已经有的**，查不到就不回 —— 这是补全，不是推测。\n返回一个猜的卖家会让用户采回一整店无关商品，而且完全看不出是错的。\n\nBody：`asins`（数组）+ 可选 `marketplace`（缺省 `amazon.com`，不在注册表里 -> 400）。\n**只查该站点的行**：同一个 ASIN 在美国站和加拿大站可以是不同的卖家。",
                 "operationId": "api_extension_resolve_sellers_api_extension_resolve_sellers_post",
                 "responses": {
                   "200": {
@@ -1493,6 +1507,17 @@
                       "title": "Asin",
                       "type": "string"
                     }
+                  },
+                  {
+                    "description": "采集站点（如 amazon.ca）。不传 = 优先美国站那一行。",
+                    "in": "query",
+                    "name": "marketplace",
+                    "required": false,
+                    "schema": {
+                      "description": "采集站点（如 amazon.ca）。不传 = 优先美国站那一行。",
+                      "title": "Marketplace",
+                      "type": "string"
+                    }
                   }
                 ],
                 "responses": {
@@ -1534,7 +1559,7 @@
                 "summary": "Api List Schedules"
               },
               "post": {
-                "description": "创建定时采集任务。\n\n`file` 可选：\n  * **带文件** —— 定时采集文件里的那批 ASIN；\n  * **不带文件** —— 定时采集**全库** ASIN（`source_file` 存空串，\n    调度时现取 `db.get_all_asins()`）。\n\n不带文件这条路以前是另一个端点 `POST /api/auto-scrape/schedules`\n（`api_legacy_add_schedule`）。那个端点与本端点写的是同一份\n`_runtime_settings[\"auto_scrape_schedules\"]`，只是不收 `name` /\n`interval_days` / `needs_screenshot`，于是前端被迫先 POST 旧端点、\n再立刻 PUT 本端点把这几个字段补回去。现在合成一个，旧端点已删除。",
+                "description": "创建定时采集任务。\n\n`file` 可选：\n  * **带文件** —— 定时采集文件里的那批 ASIN；\n  * **不带文件** —— 定时采集**全库** ASIN（`source_file` 存空串，\n    调度时现取该站点的 `db.get_all_asins(marketplace=...)`）。\n\n`marketplace` 可选：不传 / 空 = 美国站 `amazon.com`（与加这个字段之前一致）；\n`amazon.ca`（也收 `www.amazon.ca` 等写法）= 加拿大站；不在站点注册表里 -> 400。\n`zip_code` 可选：本定时任务固定用的邮编，必须是该站点的形状，否则 400；\n不传则每次执行时取该站点的默认邮编。两个字段都只在传了时才存进定时任务。\n\n不带文件这条路以前是另一个端点 `POST /api/auto-scrape/schedules`\n（`api_legacy_add_schedule`）。那个端点与本端点写的是同一份\n`_runtime_settings[\"auto_scrape_schedules\"]`，只是不收 `name` /\n`interval_days` / `needs_screenshot`，于是前端被迫先 POST 旧端点、\n再立刻 PUT 本端点把这几个字段补回去。现在合成一个，旧端点已删除。",
                 "operationId": "api_create_schedule_api_schedules_post",
                 "requestBody": {
                   "content": {
@@ -2385,7 +2410,7 @@
             },
             "/api/upload": {
               "post": {
-                "description": "上传 ASIN 文件创建批次。\n\n支持 xlsx / csv / txt 三种格式：\n- **xlsx / csv**：A 列 = ASIN，B 列（可选）= 该 ASIN 单独的采集邮编（5 位数字）\n  B 列为空 → 用本次上传指定的 batch zip（或服务端默认）\n- **txt**：每行一个 ASIN（无邮编列）\n\n可选 callback：\n- `callback_url`：批次完成时（含截图）POST 到此 URL 通知调用方\n- `external_id`：调用方自己的批次 ID，原样回传，便于追踪\n\n批次名冲突 → **409 Conflict**，绝不静默合并进已有批次。409 的响应体里带\n`detail.batch_id` / `detail.batch_name` / `detail.status_url`，调用方可以\n直接拿去接着轮询。\n\n由此得到的三条性质（调用方可以依赖）：\n- **本端点可以安全重试**：网络超时后重发，若上一次其实成功了，拿到的是\n  409 + 那个既有 batch_id，而不是又建一个批次、也不会悄悄并进去。\n- 批次名不需要毫秒精度去躲开合并。\n- **200 恒等于「新建了一个批次」**，`inserted` 因此不再有歧义。\n\n200 响应里的 `external_id` / `callback_url` 回显的是**批次实际存下来的**值\n（读回后再回显），不是请求里的值。",
+                "description": "上传 ASIN 文件创建批次。\n\n支持 xlsx / csv / txt 三种格式：\n- **xlsx / csv**：A 列 = ASIN，B 列（可选）= 该 ASIN 单独的采集邮编，形状随站点\n  （美国站 5 位数字，如 `10001`；加拿大站 `K1V 7P8` 这种，大小写与空格不限）。\n  B 列为空或不符合该站点形状 → 用本次上传指定的 batch zip（或该站点默认），\n  不符合的行数计入响应的 `invalid_zip_rows`\n- **txt**：每行一个 ASIN（无邮编列）\n\n可选站点 `marketplace`（一个批次只属于一个站点）：\n- 不传 / 空 → 美国站 `amazon.com`，行为与加这个字段之前完全一致\n- `amazon.ca`（也收 `www.amazon.ca`、`https://www.amazon.ca/`，大小写不限）→ 加拿大站\n- 不在站点注册表里 → **400**，不会静默回退到美国站，也不会建出批次\n- 非美国站：`zip_code` 必须是该站点的邮编形状，否则 400；不传则用该站点默认\n  （全局设置里的邮编对该站点不合法时用注册表默认，加拿大站是 `K1V 7P8`），\n  200 响应里额外带 `marketplace`\n\n可选 callback：\n- `callback_url`：批次完成时（含截图）POST 到此 URL 通知调用方\n- `external_id`：调用方自己的批次 ID，原样回传，便于追踪\n\n批次名冲突 → **409 Conflict**，绝不静默合并进已有批次。409 的响应体里带\n`detail.batch_id` / `detail.batch_name` / `detail.status_url`，调用方可以\n直接拿去接着轮询。\n\n由此得到的三条性质（调用方可以依赖）：\n- **本端点可以安全重试**：网络超时后重发，若上一次其实成功了，拿到的是\n  409 + 那个既有 batch_id，而不是又建一个批次、也不会悄悄并进去。\n- 批次名不需要毫秒精度去躲开合并。\n- **200 恒等于「新建了一个批次」**，`inserted` 因此不再有歧义。\n\n200 响应里的 `external_id` / `callback_url` 回显的是**批次实际存下来的**值\n（读回后再回显），不是请求里的值。",
                 "operationId": "api_upload_api_upload_post",
                 "requestBody": {
                   "content": {
@@ -6402,7 +6427,7 @@
           "__html__": {
             "has_jinja_error": false,
             "has_traceback": false,
-            "size_bucket": 45
+            "size_bucket": 47
           }
         },
         "content_type": "text/html",
@@ -6468,7 +6493,7 @@
           "__html__": {
             "has_jinja_error": false,
             "has_traceback": false,
-            "size_bucket": 44
+            "size_bucket": 46
           }
         },
         "content_type": "text/html",

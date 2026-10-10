@@ -136,15 +136,16 @@ journalctl -u amazon-scraper -f
 
 - 支持格式：`.xlsx` / `.csv` / `.txt`
 - 自动提取 `B[0-9A-Z]{9}` 格式的 ASIN 并去重
-- 可选：指定批次名、邮编、是否截图、**是否自动采集多属性变体**
+- 可选：指定**站点**（默认美国站，可选加拿大站，见「多站点采集（F-012）」）、批次名、邮编、是否截图、**是否自动采集多属性变体**
 - **🔗 自动采集多属性变体**（开关，默认关）：开启后，采完上传的 ASIN 会把它们的同款全部变体（不同颜色/尺寸等）也采进【同一批次】，详见「多属性变体提取 + 自动展开」
-- **per-ASIN 邮编**：仅 `.xlsx` / `.csv` 的 B 列填 5 位邮编可为单个 ASIN 指定邮编（同一 batch 内不同邮编自动切换 session）；**`.txt` 上传不支持这一列**，会被忽略
+- **per-ASIN 邮编**：仅 `.xlsx` / `.csv` 的 B 列填邮编可为单个 ASIN 指定邮编（同一 batch 内不同邮编自动切换 session）；邮编形状随站点（美国站 5 位数字，加拿大站 `K1V 7P8` 这种），不符合该站点形状的行计入 `invalid_zip_rows` 并退回批次邮编；**`.txt` 上传不支持这一列**，会被忽略
 - 上传大小上限 50MB
 - **批次名撞名返回 `409 Conflict`**（不再静默合并）：响应体带 `detail.batch_id` / `detail.status_url`，可直接轮询该批次状态。旧行为是把新 ASIN 悄悄合并进同名批次、并悄悄丢弃这次请求带的 `external_id`/`callback_url`——如果你的调用方依赖旧的"重名即合并"语义，需要改成先处理 409、按需换个批次名重传
 - **API 调用**：可直接 `POST /api/upload`（multipart），支持以下额外字段：
   - `external_id`：调用方自己的批次 ID，原样回传，便于追踪
   - `callback_url`：采集完成时 POST 到此地址通知（详见下方 Webhook）
   - `expand_variants`：`true`/`false`，是否自动展开变体（同上方开关）
+  - `marketplace`：站点。不传 / 空 = 美国站 `amazon.com`（与加这个字段之前完全一致）；`amazon.ca` = 加拿大站（也收 `www.amazon.ca`、`https://www.amazon.ca/`，大小写不限）；不在站点注册表里 → `400`，不会静默回退美国站、也不会建出批次。非美国站时 `zip_code` 必须是该站点的形状（否则 `400`），不传则用该站点的默认邮编，200 响应里多一个 `marketplace` 键
 
 ### 推送采集任务（JSON API）
 
@@ -172,6 +173,7 @@ curl -X POST http://<server>:8899/api/batches \
 | `callback_url` | `null` | 完成回调，同 `/api/upload` |
 | `external_id` | `null` | 原样回传 |
 | `expand_variants` | `false` | 自动展开变体 |
+| `marketplace` | `amazon.com` | 站点，规则同 `/api/upload` 的 `marketplace`；邮编按该站点校验与取默认 |
 
 响应体、撞名 `409` 语义、回调注册与 `POST /api/upload` **完全一致**（同一份实现）。
 ASIN 去重保序；非法 ASIN 丢弃，一个都不剩 → `400`。整批邮编非法 → `400`；
@@ -320,6 +322,33 @@ curl -X POST http://<server>:8899/api/search-batches \
 | 默认投递地 | `10001` | `K1V 7P8` |
 | `delivery` 筛选 | 4 个取值 | 需配 `SEARCH_DELIVERY_FILTERS` 或用 `rh_extra` |
 
+#### 用 ASIN 清单采加拿大站
+
+所有「给一批 ASIN 建批次」的入口都认站点；**不指定站点 = 美国站**，与 F-012 之前逐字节一致。
+
+| 入口 | 怎么指定加拿大站 |
+|---|---|
+| 网页「任务管理」上传表单 | 「站点」下拉选加拿大站（切过去会清掉预填的美国邮编，留空 = 用加拿大站默认 `K1V 7P8`） |
+| `POST /api/upload` | form 字段 `marketplace=amazon.ca`；B 列写加拿大邮编 |
+| `POST /api/batches` | JSON 键 `"marketplace": "amazon.ca"` |
+| 定时任务（设置页 / `POST /api/schedules`） | 「站点」下拉 / form 字段 `marketplace`，可选固定 `zip_code`；「全库」模式只取**该站点**已采过的 ASIN |
+| 浏览器插件 | 插件 1.2.0 起按**当前页面**的站点推送；加拿大站邮编在插件设置里单独填 |
+
+```bash
+curl -X POST http://<server>:8899/api/upload \
+  -F file=@ca_asins.xlsx -F marketplace=amazon.ca -F zip_code='M5V 3L9'
+```
+
+一个批次只属于一个站点。批次结果、批次导出、截图都按**任务行的站点**取对应那一行
+`asin_data`（同一个 ASIN 美加各有一行时，加拿大批次只出加拿大行，美国批次只出美国行）；
+`GET /api/results/{asin}` 不带站点时优先给美国行，带 `?marketplace=amazon.ca` 取加拿大行。
+
+⚠ **采加拿大站之前先把所有 worker 升级到含 F-012 的版本。** 老 worker 不认任务的站点，
+领到加拿大任务会去美国站采；服务端现在会拒收这种结果（任务记为失败，
+`error_type=server_reject`，`error_detail` 以 `marketplace_mismatch` 开头），
+不会让它覆盖美国行 —— 在失败明细里看到这一条，就是还有老 worker 在跑。
+浏览器插件同理：1.1.0 在加拿大页面上推的仍是美国站任务，要在 `chrome://extensions` 里重新加载 1.2.0。
+
 #### ⚠ 同一个 ASIN 在两个站点是**两行**
 
 `asin_data` 的唯一键是 `(asin, marketplace)`。美加两站的同一个 ASIN 是两件不同的
@@ -390,13 +419,16 @@ Server 采集，自动识别当前是商品列表页 / 卖家店铺页 / 商品�
 |---|---|
 | `GET /api/extension/ping` | 测试连接（版本 / 默认邮编 / 在线 worker 数） |
 | `POST /api/extension/collect` | 推 ASIN 与卖家 ID |
-| `POST /api/extension/resolve-sellers` | 按 ASIN 反查**已采到的**卖家 |
+| `POST /api/extension/resolve-sellers` | 按 ASIN 反查**已采到的**卖家（按 `marketplace` 只查该站点的行，缺省美国站） |
 
 **`/api/extension/collect` 的同名批次是「追加」，不是 409** —— 与
 `/api/upload` / `/api/batches` 的撞名语义相反。这是插件翻页采集的前提：
 一次「翻 10 页」是 10 次推送，必须落进同一个批次，否则控制台里会多出 10 个批次，
 导出/进度/回调全部没法看。两条语义共存是有意的，理由见
 `server/api/extension.py` 的模块文档。
+**例外（F-012）**：同名批次里已有**另一个站点**的任务 → `409`，什么都不写（一个批次只属于一个站点）。
+插件推送时带 `marketplace`（取自当前页面），不带 = 美国站；邮编按站点校验，非美国站的
+响应里 `asin_batch` / `seller_batch` 各多一个 `marketplace` 键。
 
 插件没有、也不需要服务端放 CORS 头：它的请求全部从 service worker 发出，
 凭 `host_permissions` 就不受 CORS 约束。**别"顺手"给这些端点加 CORS** ——

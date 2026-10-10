@@ -102,7 +102,8 @@ WARNING 日志。
 
 - **`marketplace` 是「上架目的地」，不是「采集来源站点」。** 契约里恒 `"US"`，
   与你们 `(marketplace, asin)` 复合主键对齐。采集侧内部另有一个同名概念指
-  **从哪个亚马逊站点采的**（当前恒 `amazon.com`）。今天一一对应；等你们开
+  **从哪个亚马逊站点采的**（F-012 起可能是 `amazon.com` 或 `amazon.ca`，见
+  `scrape_params.source_marketplace`；同一个 ASIN 两站各一条记录）。今天一一对应；等你们开
   Walmart CA，很可能**仍从 amazon.com 采、却上架到 CA**，那时两者分叉。
   所以我没改内部值名，而是显式映射，并把来源站点原样放进
   `scrape_params.source_marketplace`——**两个概念从第一天就是两个字段。**
