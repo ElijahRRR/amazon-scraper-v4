@@ -19,7 +19,7 @@ from typing import Optional, Dict, Set
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 import openpyxl
@@ -1096,6 +1096,39 @@ def _normalize_zip(val, marketplace: str = None) -> Optional[str]:
     凭空造出的 mismatch）。
     """
     return _marketplace.normalize_postal(val, marketplace)
+
+
+def _resolve_marketplace(raw) -> "_marketplace.MarketplaceSpec":
+    """HTTP 边界上的站点参数 -> 注册表 spec（F-012 blocker 3）。
+
+    ``None`` / 空串 / 纯空白 -> 美国站：老客户端不传这个字段，行为必须与
+    F-012 之前逐字节一致。收的写法同 ``marketplace.normalize_id``
+    （``amazon.ca`` / ``www.amazon.ca`` / ``https://www.amazon.ca/`` / 大小写）。
+
+    不在注册表里 -> **400**，绝不静默回退到美国站：调用方以为在采加拿大、
+    实际采的是美国，而任何一侧都不会响 —— 这正是 blocker 3 本身的形状。
+    """
+    if raw is None or not str(raw).strip():
+        return _marketplace.get(None)
+    try:
+        return _marketplace.get(raw)
+    except ValueError as e:
+        raise HTTPException(400, f"{e}。ASIN 清单只能建在可采详情的站点上") from None
+
+
+def _site_default_zip(spec: "_marketplace.MarketplaceSpec") -> str:
+    """调用方没给邮编时，某个站点的批次默认邮编（F-012 blocker 3）。
+
+    * 美国站：原样返回全局设置里的 ``zip_code``，**不校验** —— 与 F-012 之前
+      ``zip_code or _runtime_settings.get(...)`` 逐字节一致（golden 钉着）。
+    * 其它站点：全局设置里存的是美国邮编，拿它去加拿大站 Amazon 不会报错，
+      而是静默落到默认地区。所以全局值对该站点合法才用，否则用注册表的
+      ``default_postal``。口径同 ``server/api/searches.py`` 的关键词批次。
+    """
+    zc = _runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE)
+    if spec.id == _marketplace.DEFAULT_MARKETPLACE:
+        return zc
+    return _normalize_zip(zc, spec.id) or spec.default_postal
 
 
 def _safe_fs_component(name: str) -> Optional[str]:

@@ -3286,10 +3286,19 @@ class Database:
         async with self.read() as rc, rc.execute("SELECT COUNT(*) FROM asin_data") as c:
             return (await c.fetchone())[0]
 
-    async def get_all_asins(self) -> List[str]:
-        """获取所有已知 ASIN（用于自动采集）"""
+    async def get_all_asins(self, marketplace: str = None) -> List[str]:
+        """获取某个站点全部已知 ASIN（用于定时任务的「全库」模式）。
+
+        F-012：``asin_data`` 的唯一键是 ``(asin, marketplace)``，不按站点过滤的话
+        同一个 ASIN 两站各一行会返回两次，而且调用方（定时任务）会把加拿大独有的
+        ASIN 当成美国任务去采。``marketplace=None`` -> 美国站，返回的正是 F-012
+        之前那份列表（那时库里只有美国行）。不认识的站点抛 ValueError。
+        """
+        mkt = _marketplace.get(marketplace).id
         result = []
-        async with self.read() as rc, rc.execute("SELECT asin FROM asin_data ORDER BY id") as c:
+        async with self.read() as rc, rc.execute(
+                "SELECT asin FROM asin_data WHERE marketplace = ? ORDER BY id",
+                (mkt,)) as c:
             async for row in c:
                 result.append(row["asin"])
         return result
