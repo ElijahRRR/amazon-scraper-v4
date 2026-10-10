@@ -1509,12 +1509,12 @@
                     }
                   },
                   {
-                    "description": "采集站点（如 amazon.ca）。不传 = 优先美国站那一行。",
+                    "description": "采集站点（如 amazon.ca）。不传 = 美国站那一行（没有就 404）。",
                     "in": "query",
                     "name": "marketplace",
                     "required": false,
                     "schema": {
-                      "description": "采集站点（如 amazon.ca）。不传 = 优先美国站那一行。",
+                      "description": "采集站点（如 amazon.ca）。不传 = 美国站那一行（没有就 404）。",
                       "title": "Marketplace",
                       "type": "string"
                     }
@@ -6427,7 +6427,7 @@
           "__html__": {
             "has_jinja_error": false,
             "has_traceback": false,
-            "size_bucket": 47
+            "size_bucket": 48
           }
         },
         "content_type": "text/html",

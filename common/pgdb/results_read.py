@@ -826,24 +826,19 @@ class ResultsReadMixin:
         """单个 ASIN 的结果行（``GET /api/results/{asin}``）。
 
         F-012：同一个 ASIN 可以在两个站点各有一行。
-          * ``marketplace=None``（老调用方）-> **优先美国行**，没有美国行再给别的
-            站点的那行。原来是裸 ``WHERE asin = ?`` + fetchone，取哪行由索引顺序
-            决定 —— (asin, marketplace) 索引里 'amazon.ca' 排在 'amazon.com'
-            前面，于是不传站点的老调用方**拿到加拿大数据**。现在美国行存在时
-            答案与 F-012 之前逐字相同；只在加拿大才有的 ASIN 仍然返回（不 404）。
+          * ``marketplace=None``（老调用方）-> **只要美国行**，没有就 None（404）。
+            原来是裸 ``WHERE asin = ?`` + fetchone，取哪行由索引顺序决定 ——
+            (asin, marketplace) 索引里 'amazon.ca' 排在 'amazon.com' 前面，于是不传
+            站点的老调用方**拿到加拿大数据**。也**不**退而给别的站点的行：只在加拿大
+            才有的 ASIN，对不传站点的调用方在加拿大数据入库前是 404，入库后若变成
+            200 + 加元价格/加拿大卖家，调用方会把它当美国数据用。现在不传站点的答案
+            与 F-012 之前（库里只有美国行）逐字相同。
           * 给了站点 -> 只要那个站点的行，没有就 None。不认识的站点抛 ValueError
             （端点层先拦过一道）。
-        排序里的 ``id`` 是同站点内的决胜键 —— 唯一键保证同站点至多一行，它只是让
-        ORDER BY 在语法上是全序。
         """
         # 注意：先释放读连接再 _hydrate（其内部还要借读连接），避免池内嵌套借用导致死锁
-        if marketplace is None:
-            sql = ("SELECT * FROM asin_data WHERE asin = ? "
-                   f"ORDER BY (marketplace = {DEFAULT_MARKETPLACE_SQL}) DESC, id LIMIT 1")
-            params = (text_affinity(asin),)
-        else:
-            sql = "SELECT * FROM asin_data WHERE asin = ? AND marketplace = ?"
-            params = (text_affinity(asin), text_affinity(_marketplace.get(marketplace).id))
+        sql = "SELECT * FROM asin_data WHERE asin = ? AND marketplace = ?"
+        params = (text_affinity(asin), text_affinity(_marketplace.get(marketplace).id))
         async with self.read() as rc, rc.execute(sql, params) as c:
             row = await c.fetchone()
         if not row:

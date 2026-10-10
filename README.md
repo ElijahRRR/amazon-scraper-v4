@@ -341,7 +341,7 @@ curl -X POST http://<server>:8899/api/upload \
 
 一个批次只属于一个站点。批次结果、批次导出、截图都按**任务行的站点**取对应那一行
 `asin_data`（同一个 ASIN 美加各有一行时，加拿大批次只出加拿大行，美国批次只出美国行）；
-`GET /api/results/{asin}` 不带站点时优先给美国行，带 `?marketplace=amazon.ca` 取加拿大行。
+`GET /api/results/{asin}` 不带站点时只给美国行（与加站点之前一致，只在加拿大有的 ASIN 返回 404），带 `?marketplace=amazon.ca` 取加拿大行。
 
 ⚠ **采加拿大站之前先把所有 worker 升级到含 F-012 的版本。** 老 worker 不认任务的站点，
 领到加拿大任务会去美国站采；服务端现在会拒收这种结果（任务记为失败，

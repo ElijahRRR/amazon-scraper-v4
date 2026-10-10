@@ -126,42 +126,13 @@ def _site_of(body: Dict[str, Any]) -> "_marketplace.MarketplaceSpec":
     return _srv()._resolve_marketplace(raw)
 
 
-async def _existing_batch_site(name: str) -> Optional[str]:
-    """同名批次已有任务的站点；批次不存在或还没有任务 -> None。
-
-    `LIMIT 1` 就够：本模块保证经它写进去的批次只有一个站点（见模块头注
-    「站点」一节），其它入口（上传 / JSON / 定时任务 / 关键词 / 变体展开）
-    也都是一次一个站点。走 `(batch_id, asin)` 唯一键的前缀索引，追加推送
-    多这一次只读查询的代价可以忽略。
-
-    只读 raw SQL，与下面 resolve-sellers 同一个先例（模块头注：不新增 DB 方法）。
-    `COALESCE` 是给 F-012 之前的老行兜底：那一列在两个后端都是
-    `NOT NULL DEFAULT 'amazon.com'`，按理不会是 NULL，兜底不花钱。
-    """
-    sql = (
-        "SELECT COALESCE(t.marketplace, 'amazon.com') AS marketplace "
-        "FROM tasks t JOIN batches b ON b.id = t.batch_id "
-        "WHERE b.name = ? LIMIT 1"
-    )
-    async with _srv().db.read() as rc, rc.execute(sql, (name,)) as c:
-        row = await c.fetchone()
-    return dict(row)["marketplace"] if row else None
-
-
 async def _reject_cross_site_append(name: str, spec) -> None:
-    """同名批次已属于另一个站点 -> 409（理由见模块头注「站点」一节）。"""
-    existing = await _existing_batch_site(name)
-    if existing is None or existing == spec.id:
-        return
-    try:
-        existing_label = _marketplace.get(existing).label
-    except ValueError:
-        existing_label = existing
-    raise HTTPException(
-        409,
-        f"批次 {name!r} 已经是{existing_label}（{existing}）的批次，不能追加"
-        f"{spec.label}（{spec.id}）的任务：一个批次只能属于一个站点。"
-        f"换一个批次名重新推送。")
+    """同名批次已属于另一个站点 -> 409（理由见模块头注「站点」一节）。
+
+    判定本身在 ``server/app.py::_reject_cross_site_batch``：关键词批次与卖家
+    文件上传也是「同名 = 合并」，三个入口共用同一条规则。
+    """
+    await _srv()._reject_cross_site_batch(name, spec)
 
 
 router = APIRouter()

@@ -1164,6 +1164,39 @@ def _site_zip_error(raw, spec: "_marketplace.MarketplaceSpec") -> HTTPException:
         400, f"非法邮编: {raw!r}（{spec.label}需要 {spec.default_postal!r} 这种形状）")
 
 
+async def _reject_cross_site_batch(name: str, spec: "_marketplace.MarketplaceSpec") -> None:
+    """同名批次里已有**别的站点**的任务 -> 409（F-012 blocker 3）。
+
+    给「同名 = 合并 / 追加」的入口用（插件推送、关键词批次、卖家文件上传）：
+    一个批次只能属于一个站点 —— tasks 是 UNIQUE(batch_id, asin)，批次结果 /
+    导出 / 变体展开都按任务行的站点取数据、按「整批同一站点」挑查询形状。
+    把两个站点混进一个批次，这些读路径就只能走慢的逐行兜底，变体展开取哪条
+    任务行的站点也说不准。
+
+    问的是「有没有任何一条任务不属于这个站点」，而不是「第一条任务是哪个站点」：
+    只看 ``LIMIT 1`` 的话，一个已经混了站点的老批次（或两个入口并发写同名批次）
+    会因为恰好先读到同站点那条而放行，越混越多。批次不存在 / 还没有任务 -> 放行。
+    """
+    sql = (
+        "SELECT t.marketplace FROM tasks t JOIN batches b ON b.id = t.batch_id "
+        "WHERE b.name = ? AND COALESCE(t.marketplace, 'amazon.com') <> ? LIMIT 1"
+    )
+    async with db.read() as rc, rc.execute(sql, (name, spec.id)) as c:
+        row = await c.fetchone()
+    if not row:
+        return
+    existing = dict(row)["marketplace"] or _marketplace.DEFAULT_MARKETPLACE
+    try:
+        existing_label = _marketplace.get(existing).label
+    except ValueError:
+        existing_label = existing
+    raise HTTPException(
+        409,
+        f"批次 {name!r} 已经是{existing_label}（{existing}）的批次，不能追加"
+        f"{spec.label}（{spec.id}）的任务：一个批次只能属于一个站点。"
+        f"换一个批次名重新推送。")
+
+
 def _safe_fs_component(name: str) -> Optional[str]:
     """校验一个字符串是否可安全用作文件系统路径组件（目录名 / 文件名前缀）。
 

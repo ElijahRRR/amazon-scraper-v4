@@ -338,7 +338,7 @@ class BatchSitePinTests(unittest.TestCase):
 # ============================================================ 单 ASIN 详情
 
 class ResultDetailTests(unittest.TestCase):
-    """C3：``GET /api/results/{asin}`` 不传站点 -> 优先美国行；传了 -> 精确匹配。"""
+    """C3：``GET /api/results/{asin}`` 不传站点 -> 只要美国行；传了 -> 精确匹配。"""
 
     def test_detail_prefers_us_row_and_honours_marketplace(self):
         with isolated_server() as (client, _ctx):
@@ -358,10 +358,12 @@ class ResultDetailTests(unittest.TestCase):
                     self.assertEqual(r.status_code, 200, r.text)
                     self.assertEqual(r.json()["data"]["marketplace"], CA)
                     self.assertEqual(r.json()["data"]["current_price"], "$13.50")
-            # 只在加拿大才有的 ASIN：不传站点仍然 200（不是 404）
+            # 只在加拿大才有的 ASIN：不传站点 = 美国站 -> 404，与加拿大数据入库前
+            # 一样；不能变成 200 + 加元价格，让老调用方当美国数据用
             r = detail(Z)
-            self.assertEqual(r.status_code, 200, r.text)
-            self.assertEqual(r.json()["data"]["marketplace"], CA)
+            self.assertEqual((r.status_code, r.json()["detail"]),
+                             (404, f"ASIN {Z} 不存在"))
+            self.assertEqual(detail(Z, marketplace=CA).json()["data"]["marketplace"], CA)
             # 空串 = 没传
             self.assertEqual(detail(X, marketplace="").json()["data"]["marketplace"], US)
             # 指定站点没有那一行 -> 404
@@ -387,8 +389,8 @@ class ResultDetailTests(unittest.TestCase):
             self.assertEqual(client.get(f"/api/results/{X}").json(), before)
             got = client.get(f"/api/results/{X}", params={"marketplace": CA}).json()
             self.assertEqual({c["batch_id"] for c in got["changes"]}, {ca})
-            # 只在加拿大才有的 ASIN：不传站点返回加拿大行，changes 也是加拿大的
-            got = client.get(f"/api/results/{Z}").json()
+            # 只在加拿大才有的 ASIN：按加拿大站取，changes 也是加拿大的
+            got = client.get(f"/api/results/{Z}", params={"marketplace": CA}).json()
             self.assertEqual({c["batch_id"] for c in got["changes"]}, {ca})
 
 

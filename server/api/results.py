@@ -300,7 +300,7 @@ async def api_results(batch_id: int = None,
 async def api_result_detail(asin: str,
                             marketplace: str = Query(
                                 None,
-                                description="采集站点（如 amazon.ca）。不传 = 优先美国站那一行。")):
+                                description="采集站点（如 amazon.ca）。不传 = 美国站那一行（没有就 404）。")):
     db = _srv().db
     mkt = None
     if marketplace is not None and marketplace.strip():

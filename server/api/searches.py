@@ -155,12 +155,16 @@ async def api_create_search_batch(request: Request):
             raise HTTPException(
                 400, f"非法邮编: {zip_raw!r}（{mkt.label}需要 "
                      f"{mkt.default_postal!r} 这种形状）")
-    else:
-        # 默认邮编也要按站点取：全局设置里存的是美国邮编，拿它去加拿大站
-        # 是上面那条「静默落到默认地区」的另一个入口。
+    elif mkt.id == marketplace.DEFAULT_MARKETPLACE:
+        # 美国站：与 F-012 之前逐字节一致（全局值合法就原样用，否则 10001）。
         default_zip = _s._runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE)
         zc = (default_zip if _s._normalize_zip(default_zip, mkt.id)
               else mkt.default_postal)
+    else:
+        # 默认邮编也要按站点取：全局设置里存的是美国邮编，拿它去加拿大站
+        # 是上面那条「静默落到默认地区」的另一个入口。与上传 / JSON / 插件 /
+        # 定时任务同一条规则（含把全局值归一成该站点的规范形）。
+        zc = _s._site_default_zip(mkt)
 
     batch_name = body.get("batch_name")
     if not batch_name:
@@ -168,6 +172,9 @@ async def api_create_search_batch(request: Request):
         batch_name = _s._batch_name("keywords")
 
     needs_screenshot = bool(body.get("needs_screenshot", False))
+
+    # 关键词批次「同名 = 合并」；合并进一个别的站点的批次会让它变成混合站点批次。
+    await _s._reject_cross_site_batch(batch_name, mkt)
 
     # 站点**显式**传给库层，不让它再从 search_params['domain'] 推导一遍：
     # 上面对注册表之外的 16 个搜索站点有意放行了 discover_only（站点落到美国），

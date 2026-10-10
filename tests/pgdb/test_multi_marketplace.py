@@ -307,7 +307,8 @@ async def test_result_by_asin_prefers_the_us_row(pgdb):
     await _two_sites(pgdb)
     assert (await pgdb.get_result_by_asin(_X))["marketplace"] == _US
     assert (await pgdb.get_result_by_asin(_X, marketplace=_CA))["current_price"] == "$13.50"
-    assert (await pgdb.get_result_by_asin(_Z))["marketplace"] == _CA   # 加拿大独有仍返回
+    assert await pgdb.get_result_by_asin(_Z) is None   # 不传站点 = 美国站，加拿大独有不返回
+    assert (await pgdb.get_result_by_asin(_Z, marketplace=_CA))["marketplace"] == _CA
     assert await pgdb.get_result_by_asin(_Y, marketplace=_CA) is None
     with pytest.raises(ValueError):
         await pgdb.get_result_by_asin(_X, marketplace="amazon.xx")

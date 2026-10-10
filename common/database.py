@@ -3132,20 +3132,16 @@ class Database:
         return screenshot_files
 
     async def get_result_by_asin(self, asin: str, marketplace: str = None) -> Optional[Dict]:
-        """单个 ASIN 的结果行。``marketplace=None`` -> 优先美国行（没有再给别的站点
-        的那行）；给了站点 -> 只要那一行。语义与 PG 侧同名方法逐字一致，理由见那边。
+        """单个 ASIN 的结果行。``marketplace=None`` -> 只要美国行（没有就 None，
+        不退而给别的站点的行）；给了站点 -> 只要那一行。语义与 PG 侧同名方法逐字
+        一致，理由见那边。
 
         老 SQLite 库的唯一键仍是 (asin)（init_tables 的迁移改不动唯一键），
-        那份数据里只有美国行，两种写法给出同一行。
+        那份数据里只有美国行（列默认值 amazon.com），答案与改动前相同。
         """
         # 注意：先释放读连接再 _hydrate（其内部还要借读连接），避免池内嵌套借用导致死锁
-        if marketplace is None:
-            sql = ("SELECT * FROM asin_data WHERE asin = ? "
-                   f"ORDER BY (marketplace = {DEFAULT_MARKETPLACE_SQL}) DESC, id LIMIT 1")
-            params = (asin,)
-        else:
-            sql = "SELECT * FROM asin_data WHERE asin = ? AND marketplace = ?"
-            params = (asin, _marketplace.get(marketplace).id)
+        sql = "SELECT * FROM asin_data WHERE asin = ? AND marketplace = ?"
+        params = (asin, _marketplace.get(marketplace).id)
         async with self.read() as rc, rc.execute(sql, params) as c:
             row = await c.fetchone()
         if not row:

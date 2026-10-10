@@ -139,6 +139,9 @@ async def api_upload_sellers(request: Request,
         batch_name = _srv()._batch_name("sellers")
 
     zc = zip_code or _srv()._runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE)
+    # 本入口只建美国站卖家批次；「同名 = 合并」不能把美国任务并进一个别的站点的
+    # 批次（F-012：一个批次只属于一个站点）。美国批次之间的合并语义不变。
+    await _srv()._reject_cross_site_batch(batch_name, _srv()._resolve_marketplace(None))
     batch_id, inserted = await _srv().db.create_seller_batch(
         name=batch_name,
         seller_ids=seller_ids,

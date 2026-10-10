@@ -331,6 +331,19 @@ document.getElementById('upMarketplace').addEventListener('change', (e) => {
 
 document.getElementById('uploadForm').addEventListener('submit', async (e) => {
     e.preventDefault();
+    {# 站点下拉默认是美国站。用户要采加拿大却忘了切站点、只在邮编框里填了加拿大邮编：
+       服务端对美国站的批次邮编是原样透传（历史行为，API 调用方依赖它），批次照样
+       建成美国站 —— 加拿大邮编被送去 amazon.com，数据从美国站来，而成功提示看起来
+       一切正常。美国邮编里不会有字母，所以这里只认「含字母」这一条，不在页面里再
+       抄一份各站点的邮编规则。只拦网页表单，API 行为不变。 #}
+    const upMkt = document.getElementById('upMarketplace').value;
+    const upZipVal = document.getElementById('upZip').value.trim();
+    if (upMkt === DEFAULT_MKT && /[A-Za-z]/.test(upZipVal) &&
+        !confirm(`邮编 ${upZipVal} 不是美国邮编，但站点选的是美国站。\n` +
+                 `如果这是加拿大邮编，请点「取消」，把站点切换为加拿大站后再上传。\n` +
+                 `仍要按美国站上传吗？`)) {
+        return;
+    }
     const btn = document.getElementById('uploadBtn');
     const resultDiv = document.getElementById('uploadResult');
     btn.disabled = true;
@@ -356,11 +369,13 @@ document.getElementById('uploadForm').addEventListener('submit', async (e) => {
                 `，共 ${parseInt(data.total_asins)} 个 ASIN，插入 ${parseInt(data.inserted)} 个任务`);
             // 非美国站批次服务端才回显 marketplace；B 列邮编按站点校验，不合格的行
             // 退回批次邮编 —— 不提示的话，填错站点的那一列邮编就无声无息地没生效。
-            // 只对非美国站提示：美国站的成功提示保持改造前原样。
-            if (data.marketplace) {
-                alertDiv.append(`，站点 ${data.marketplace}`);
-                const badZip = parseInt(data.invalid_zip_rows) || 0;
-                if (badZip > 0) alertDiv.append(`（${badZip} 行 B 列邮编不符合该站点形状，已改用批次邮编）`);
+            // 美国站只在真有行被退回时才多这一句（没有退回时提示与改造前逐字相同）：
+            // 最常见的原因正是「B 列填的加拿大邮编、站点却没切」。
+            if (data.marketplace) alertDiv.append(`，站点 ${data.marketplace}`);
+            const badZip = parseInt(data.invalid_zip_rows) || 0;
+            if (badZip > 0) {
+                alertDiv.append(`（${badZip} 行 B 列邮编不符合该站点形状，已改用批次邮编` +
+                    (data.marketplace ? '）' : '；如果那是加拿大邮编，请改选加拿大站重新上传）'));
             }
             resultDiv.appendChild(alertDiv);
             setTimeout(() => location.reload(), 1500);
@@ -727,10 +742,18 @@ function localizeErrorDetail(etype, detail) {
     if (m) {
         return `实际页面 ASIN：<code>${m[1]}</code>，请求的是：<code>${m[2]}</code>（亚马逊返回了同 parent 下的兄弟变体）`;
     }
-    // zip_switch："current=10001 target=90210"（保险起见 esc）
-    m = d.match(/^current=(\S*)\s+target=(\S+)$/);
+    // zip_switch："current=10001 target=90210"（保险起见 esc）。加拿大邮编中间有空格
+    // （形如 "A1A 1A1"），所以两段都不能用 \S+；美国邮编结果不变。
+    m = d.match(/^current=(.*?)\s+target=(.+)$/);
     if (m) {
         return `当前 Session 邮编：<code>${esc(m[1]) || '未知'}</code>，目标邮编：<code>${esc(m[2])}</code>`;
+    }
+    // F-012：结果的站点与任务的站点不一致，服务端拒收（典型是没升级的老 worker
+    // 领到了加拿大任务、去美国站采了回来）。原文只会被当成「结果不合格」读，
+    // 真正要做的是升级那台 worker。
+    m = d.match(/^marketplace_mismatch task=(\S+) payload=(\S+)/);
+    if (m) {
+        return `任务站点 <code>${esc(m[1])}</code>，worker 按 <code>${esc(m[2])}</code> 采集，结果已拒收（未写入任何数据）—— 这台 worker 需要升级到多站点版本`;
     }
     // 兜底：原始 detail 必须 esc 后返回避免 XSS；超长截断 300 字符 + tooltip 看全文
     if (d.length > 300) {
