@@ -26,11 +26,37 @@
  * service worker 自己也随时会被浏览器回收（MV3 没有常驻后台），所以状态
  * **不能**放在模块级变量里 —— 必须每次从 storage 读。下面所有状态访问都是
  * 现读现写，看着啰嗦，但那是 MV3 唯一正确的写法。
+ *
+ * ──────────────────────────────────────────────────────────────
+ * 站点（F-012）：每一次推送都带上 `marketplace`
+ * ──────────────────────────────────────────────────────────────
+ * 服务端缺省按美国站建任务（老插件不发这个字段，行为必须不变），所以插件
+ * 这边不说清楚站点，加拿大页面上采的东西就会**静默**变成美国站任务 ——
+ * 批次名、进度、发现数全正常，只有数据是另一个国家的。
+ *
+ * 规则都在 page.js 的「站点」一节（纯函数，content script 与这里共用、
+ * 可在 Node 里单测），这里只负责把它们接到每一条推送路径上：
+ *   单页采集 / 整店采集  站点取自页面 URL
+ *   翻页采集            站点在 START_RUN 时定下，一次 run 只属于一个站点
+ *   详情队列            键是 (asin, 站点)，提交时按站点分组、一个站点一个批次
+ *   邮编                美国站读老键 zipCode，其它站点读 zipCodes[站点]，
+ *                       绝不把美国邮编发给别的站点
  */
+
+// page.js 是纯函数层（无 chrome.*）。本文件是 module service worker
+// （manifest 的 background.type = "module"），import 进来求值一次，
+// 它会把 AmzPage 挂到 globalThis 上 —— 与 content script 用的是同一份。
+import './page.js';
+
+const P = globalThis.AmzPage;
 
 const DEFAULTS = {
   serverUrl: '',
+  // 美国站邮编。键名沿用 v1.1.0 的 `zipCode`，升级后不用重填。
   zipCode: '',
+  // 其它站点的邮编：{ 'amazon.ca': 'M5V 3L9' }。留空 = 由服务端按站点取默认。
+  // 单独一个对象而不是复用 zipCode：见 page.js 的 zipFor。
+  zipCodes: {},
   needsScreenshot: false,
   includeSponsored: false,
   autoPaginate: false,
@@ -58,7 +84,11 @@ async function setSettings(patch) {
 
 async function getQueue() {
   const stored = await chrome.storage.local.get('queue');
-  return stored.queue || [];
+  // v1.1.0 存下来的条目没有 marketplace —— 读出来时就补上（按条目的 url 推，
+  // 见 page.js 的 resolveMarketplace）。下游（去重键、按站点分组、popup 上的
+  // 站点标记）于是只需要认一种形状。
+  return (stored.queue || []).map((q) =>
+    (q && q.marketplace) ? q : { ...q, marketplace: P.queueItemMarketplace(q) });
 }
 
 async function setQueue(queue) {
@@ -155,16 +185,24 @@ async function callServer(path, { method = 'GET', body = null } = {}) {
   return data;
 }
 
-/** 把一批 ASIN / 卖家推给 Server。批次名相同 = 追加进同一批次。 */
-async function pushCollect({ asins = [], sellerIds = [], batchName = null, source = 'extension', pageUrl = '' }) {
+/**
+ * 把一批 ASIN / 卖家推给 Server。批次名相同 = 追加进同一批次。
+ *
+ * `marketplace` 由调用方给（它知道这批东西来自哪个页面 / 哪组队列）；
+ * 没给就从 pageUrl 推。站点不支持（amazon.de 等）由服务端回 400，
+ * callServer 把 detail 原样抛出来，popup 显示给用户 —— 插件不自己判。
+ */
+async function pushCollect({ asins = [], sellerIds = [], batchName = null, source = 'extension', pageUrl = '', marketplace = null }) {
   const settings = await getSettings();
+  const mkt = P.resolveMarketplace(marketplace, pageUrl);
   return callServer('/api/extension/collect', {
     method: 'POST',
     body: {
       batch_name: batchName,
       asins,
       seller_ids: sellerIds,
-      zip_code: settings.zipCode || null,
+      marketplace: mkt,
+      zip_code: P.zipFor(settings, mkt),
       needs_screenshot: !!settings.needsScreenshot,
       seller_discover_mode: settings.sellerDiscoverMode || 'with_detail',
       source,
@@ -217,28 +255,34 @@ const handlers = {
 
   async ADD_TO_QUEUE({ item }) {
     const queue = await getQueue();
-    const idx = queue.findIndex((q) => q.asin === item.asin);
+    // 站点在入队时就钉死在条目上（popup 给的是页面识别出的站点，没给就按 url 推）
+    const it = { ...item, marketplace: P.queueItemMarketplace(item) };
+    // 去重键是 (asin, 站点)：同一个 ASIN 的美国站与加拿大站是两条，见 page.js sameQueueItem
+    const idx = queue.findIndex((q) => P.sameQueueItem(q, it));
     if (idx >= 0) {
       // 已在队列里：合并而不是新增。用户重新打开同一个商品页勾上
       // "采集该卖家全部商品" 时，那个勾选要生效。
-      queue[idx] = { ...queue[idx], ...item };
+      queue[idx] = { ...queue[idx], ...it };
       await setQueue(queue);
       return { queue, added: false, updated: true };
     }
-    queue.push(item);
+    queue.push(it);
     await setQueue(queue);
     return { queue, added: true, updated: false };
   },
 
-  async REMOVE_FROM_QUEUE({ asin }) {
-    const queue = (await getQueue()).filter((q) => q.asin !== asin);
+  /** 按 (asin, 站点) 删一条。没给站点就删掉这个 ASIN 的全部条目（v1.1.0 的语义）。 */
+  async REMOVE_FROM_QUEUE({ asin, marketplace }) {
+    const queue = (await getQueue()).filter(
+      (q) => !(q.asin === asin && (!marketplace || q.marketplace === marketplace)));
     await setQueue(queue);
     return { queue };
   },
 
-  async SET_QUEUE_ITEM({ asin, patch }) {
+  async SET_QUEUE_ITEM({ asin, marketplace, patch }) {
     const queue = await getQueue();
-    const idx = queue.findIndex((q) => q.asin === asin);
+    const idx = queue.findIndex(
+      (q) => q.asin === asin && (!marketplace || q.marketplace === marketplace));
     if (idx >= 0) {
       queue[idx] = { ...queue[idx], ...patch };
       await setQueue(queue);
@@ -252,29 +296,67 @@ const handlers = {
   },
 
   /**
-   * 提交整个队列。
+   * 提交整个队列：**按站点分组，一个站点一个批次**。
    *
    * 勾了"采集该卖家全部商品"的条目，其 sellerId 会去重后一并送出 ——
    * 服务端把它们放进一个**独立的**卖家批次（`<批次名>_sellers`），
    * 不和商品批次混在一起。理由见 server/api/extension.py 的说明。
+   * 卖家也按站点分：加拿大商品页上勾的卖家，翻的是他的加拿大店铺。
+   *
+   * 为什么必须拆批次：一个批次只能属于一个站点（tasks 的唯一键是
+   * (batch_id, asin)，下游按任务行的站点取数据），混着推服务端会 409。
+   * 只有美国站条目时，行为与 v1.1.0 相同：一次推送、批次名 `ext_queue_<时间戳>`。
+   *
+   * 中途某一组失败：**已推成功的组从队列里移除，失败的及之后的组留着**，
+   * 再把错误抛给 popup。全留着的话重试会把成功的那组再推进一个新批次
+   * （批次名带时间戳，每次都不同），全清掉的话失败的那组就丢了。
    */
   async SUBMIT_QUEUE() {
     const queue = await getQueue();
     if (!queue.length) throw new Error('队列是空的');
 
-    const asins = queue.map((q) => q.asin);
-    const sellerIds = [...new Set(
-      queue.filter((q) => q.expandSeller && q.sellerId).map((q) => q.sellerId)
-    )];
+    // 名字一次性先定好：同一秒内生成，各组只差站点标记，
+    // 控制台里一眼能看出这几个批次是同一次提交。
+    const plans = P.groupByMarketplace(queue).map(([mkt, items]) => ({
+      mkt, items, batchName: makeBatchName(P.siteKind('queue', mkt)),
+    }));
 
-    const result = await pushCollect({
-      asins,
-      sellerIds,
-      batchName: makeBatchName('queue'),
-      source: 'detail_queue',
-    });
-    await setQueue([]);
-    return { result, submitted: asins.length, sellers: sellerIds.length };
+    const results = [];
+    let submitted = 0;
+    let sellers = 0;
+    for (const plan of plans) {
+      const asins = plan.items.map((q) => q.asin);
+      const sellerIds = [...new Set(
+        plan.items.filter((q) => q.expandSeller && q.sellerId).map((q) => q.sellerId)
+      )];
+
+      let result;
+      try {
+        result = await pushCollect({
+          asins,
+          sellerIds,
+          batchName: plan.batchName,
+          source: 'detail_queue',
+          marketplace: plan.mkt,
+        });
+      } catch (e) {
+        if (!results.length) throw e;
+        const done = results.map((r) => `${r.marketplace} -> ${r.result?.asin_batch?.batch_name || '?'}`);
+        throw new Error(
+          `已提交 ${done.join('、')}；${plan.mkt} 这一组推送失败，` +
+          `它和后面的条目仍留在队列里：${e.message}`);
+      }
+
+      // 只移除推成功的这一组。重新读一次队列而不是拿开头那份：推送期间
+      // 用户可能又加了条目，拿旧快照写回去会把它们弄丢。
+      const sent = new Set(plan.items.map((q) => `${q.asin}|${plan.mkt}`));
+      await setQueue((await getQueue()).filter((q) => !sent.has(`${q.asin}|${q.marketplace}`)));
+
+      results.push({ marketplace: plan.mkt, result, submitted: asins.length, sellers: sellerIds.length });
+      submitted += asins.length;
+      sellers += sellerIds.length;
+    }
+    return { results, submitted, sellers };
   },
 
   /**
@@ -286,48 +368,65 @@ const handlers = {
    */
   async RESOLVE_SELLERS() {
     const queue = await getQueue();
-    const unknown = queue.filter((q) => !q.sellerId).map((q) => q.asin);
+    const unknown = queue.filter((q) => !q.sellerId);
     if (!unknown.length) return { resolved: 0, queue };
 
-    const data = await callServer('/api/extension/resolve-sellers', {
-      method: 'POST',
-      body: { asins: unknown },
-    });
-    const found = data.sellers || {};
+    // 按站点分开问：同一个 ASIN 在美国站和加拿大站可以是不同的卖家。
+    // 混在一起问的话，加拿大条目会拿到美国卖家，再拿它去建加拿大站的
+    // 整店任务 —— 翻的是另一个国家的店铺，而界面上一切正常。
     let resolved = 0;
-    for (const item of queue) {
-      if (!item.sellerId && found[item.asin]) {
-        item.sellerId = found[item.asin].seller_id;
-        item.sellerName = found[item.asin].seller_name || item.sellerName;
-        resolved += 1;
+    try {
+      for (const [mkt, items] of P.groupByMarketplace(unknown)) {
+        const data = await callServer('/api/extension/resolve-sellers', {
+          method: 'POST',
+          body: { asins: items.map((q) => q.asin), marketplace: mkt },
+        });
+        const found = data.sellers || {};
+        for (const item of items) {   // items 里的对象就是 queue 里的那些，原地补
+          if (!item.sellerId && found[item.asin]) {
+            item.sellerId = found[item.asin].seller_id;
+            item.sellerName = found[item.asin].seller_name || item.sellerName;
+            resolved += 1;
+          }
+        }
       }
+    } finally {
+      // 某个站点问失败了（比如服务端不支持那个站点）也把已经补上的存下来，
+      // 再把错误交给 popup —— 不能因为一组失败把别的组的结果也丢掉。
+      await setQueue(queue);
     }
-    await setQueue(queue);
     return { resolved, queue };
   },
 
   // ---------- 单页采集（不翻页）----------
 
-  async COLLECT_PAGE({ asins, sellerIds, kind, pageUrl }) {
+  async COLLECT_PAGE({ asins, sellerIds, kind, pageUrl, marketplace }) {
+    // 站点取自页面：加拿大店铺页上点"整店采集"，翻的必须是加拿大店铺。
+    const mkt = P.resolveMarketplace(marketplace, pageUrl);
     const result = await pushCollect({
       asins: asins || [],
       sellerIds: sellerIds || [],
-      batchName: makeBatchName(kind || 'page'),
+      batchName: makeBatchName(P.siteKind(kind || 'page', mkt)),
       source: kind || 'list',
       pageUrl,
+      marketplace: mkt,
     });
-    return { result };
+    return { result, marketplace: mkt };
   },
 
   // ---------- 翻页任务 ----------
 
-  async START_RUN({ tabId, kind, maxPages, pageUrl }) {
+  async START_RUN({ tabId, kind, maxPages, pageUrl, marketplace }) {
     const settings = await getSettings();
+    // 一次翻页任务只属于一个站点，在这里定下来；后面每一页都按它推，
+    // 页面离开了这个站点就停（见 CONTENT_READY / PAGE_COLLECTED）。
+    const mkt = P.resolveMarketplace(marketplace, pageUrl);
     const run = {
       active: true,
       tabId,
       kind,                                   // 'list' | 'seller'
-      batchName: makeBatchName(kind),
+      marketplace: mkt,
+      batchName: makeBatchName(P.siteKind(kind, mkt)),
       pagesDone: 0,
       maxPages: Math.max(1, parseInt(maxPages || settings.maxPages, 10) || 5),
       pushedAsins: 0,
@@ -362,9 +461,15 @@ const handlers = {
    * 而 URL 每页都在变；反过来用户在**另一个**标签页打开亚马逊时，
    * 不该被卷进这次采集。
    */
-  async CONTENT_READY({ tabId }) {
+  async CONTENT_READY({ tabId, pageUrl }) {
     const run = await getRun();
     if (!run || !run.active || run.tabId !== tabId) return { shouldCollect: false };
+    // 归属只看 tabId，所以用户在跑批的标签页里手动切到另一个站点时，
+    // 这里会说"该采"。先拦一道，省得那一页白滚一遍（PAGE_COLLECTED 还有一道）。
+    if (P.pageLeavesRunSite(run, pageUrl)) {
+      await stopForSiteChange(run, pageUrl);
+      return { shouldCollect: false, run };
+    }
     return { shouldCollect: true, run };
   },
 
@@ -380,6 +485,14 @@ const handlers = {
     const run = await getRun();
     if (!run || !run.active || run.tabId !== tabId) return { next: 'stop', reason: 'no_active_run' };
 
+    // 推送前的最后一道站点闸：这一页不属于这次 run 的站点就不推、直接停。
+    // 推过去服务端也会 409（一个批次一个站点），但那会表现成"推送失败"，
+    // 而真实原因是用户切了站点 —— 这里给出说得清的停止原因。
+    if (P.pageLeavesRunSite(run, pageUrl)) {
+      await stopForSiteChange(run, pageUrl);
+      return { next: 'stop', reason: 'marketplace_changed' };
+    }
+
     const settings = await getSettings();
 
     if (asins && asins.length) {
@@ -389,6 +502,9 @@ const handlers = {
           batchName: run.batchName,
           source: run.kind,
           pageUrl,
+          // 用 run 的站点而不是这一页的：两者已经由上面那道闸保证相同，
+          // 而 v1.1.0 存下来的 run 没有 marketplace 字段，要按 startUrl 推。
+          marketplace: P.runMarketplace(run),
         });
         // 记的是 `inserted_tasks`（**真正新建的任务数**），不是这一页读到的
         // ASIN 数。翻页时前后页会有重叠、也可能撞上批次里已有的 ASIN，
@@ -425,6 +541,15 @@ const handlers = {
     return { next: 'continue', delayMs: settings.pageDelayMs };
   },
 };
+
+/** 翻页任务的标签页离开了任务的站点：停下并记清楚原因（popup 会显示）。 */
+async function stopForSiteChange(run, pageUrl) {
+  run.active = false;
+  run.finishedReason = 'marketplace_changed';
+  run.lastError = `本次翻页属于 ${P.runMarketplace(run)}，` +
+    `标签页切到了 ${P.marketplaceFromUrl(pageUrl)}`;
+  await setRun(run);
+}
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const handler = handlers[msg?.type];

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Amazon Scraper v4 采集助手",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "在亚马逊页面上一键采集：页内常驻悬浮球 + 右侧面板，实时识别产品列表 / 卖家店铺 / 产品详情，把 ASIN 推送到自建 Server 由 worker 采详情。",
   "permissions": [
     "storage",

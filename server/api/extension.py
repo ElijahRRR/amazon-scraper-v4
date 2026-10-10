@@ -45,6 +45,28 @@
 所以拆成 `<name>` 与 `<name>_sellers` 两个，各自有各自的进度端点。
 
 ------------------------------------------------------------------------
+站点（F-012 blocker 3）：只认**显式**的 `marketplace` 字段
+------------------------------------------------------------------------
+`collect` / `resolve-sellers` 的请求体都可以带 `marketplace`（`amazon.ca` /
+`www.amazon.ca` / `https://www.amazon.ca/` 都收），缺省 = 美国站。
+
+* **不从 `page_url` 推导**。v1.1.0 及更早的插件不发这个字段，它们推过来的
+  一律按美国站处理 —— 与改造前逐字节一致。从 `page_url` 推导看着更聪明，
+  但老插件的队列提交根本不带 `page_url`（只有列表/翻页才带），于是同一个
+  老插件的两种推送会落到两个站点上，比"一律美国站"更难解释。
+* 不在注册表里的站点（`amazon.de` 等）一律 **400**，绝不静默回落到美国站：
+  插件以为在采德国站、实际采的是美国站，而任何一侧都不会响。插件把
+  服务端的 detail 原样弹给用户，所以站点白名单只在服务端这一份。
+* 邮编按站点校验与取默认（`_normalize_zip(zip, spec.id)` /
+  `_site_default_zip(spec)`），美国站的报错文案与默认值逐字节不变。
+* **一个批次只属于一个站点**。`tasks` 的唯一键是 `(batch_id, asin)`，
+  下游（进度、导出、截图目录、回调）都以批次为单位、按任务行的站点取数据；
+  同名追加如果把两个站点混进一个批次，这四处都会变成说不清的东西。
+  所以追加时若同名批次里已有**另一个站点**的任务 -> **409**，什么都不写。
+  商品批次 `<name>` 与卖家批次 `<name>_sellers` 都查，而且**先查完再写**：
+  不能出现"商品批次写进去了、卖家批次被拒"的半截推送。
+
+------------------------------------------------------------------------
 承重约束（与 sellers.py / searches.py 同款）
 ------------------------------------------------------------------------
 1. 模块级可变全局一个都不搬，一律 `_srv().xxx`。
@@ -82,11 +104,64 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Request
 
 from common import config
+from common.core import marketplace as _marketplace
 
 
 def _srv():
     from server import app as _s
     return _s
+
+
+def _site_of(body: Dict[str, Any]) -> "_marketplace.MarketplaceSpec":
+    """请求体里的 `marketplace` -> 注册表 spec。缺省 / 空串 -> 美国站。
+
+    解析与报错委托给 `server/app.py:_resolve_marketplace`（ASIN 清单入口的
+    唯一站点解析点，不在注册表里 -> 400）。这里只多挡一种形状：非字符串。
+    不挡的话 `["amazon.ca"]` 会被 `str()` 成 `"['amazon.ca']"` 再报"不支持的
+    站点"，报错说的是一个调用方从没发过的值。
+    """
+    raw = body.get("marketplace")
+    if raw is not None and not isinstance(raw, str):
+        raise HTTPException(400, f"marketplace 必须是字符串，收到 {type(raw).__name__}")
+    return _srv()._resolve_marketplace(raw)
+
+
+async def _existing_batch_site(name: str) -> Optional[str]:
+    """同名批次已有任务的站点；批次不存在或还没有任务 -> None。
+
+    `LIMIT 1` 就够：本模块保证经它写进去的批次只有一个站点（见模块头注
+    「站点」一节），其它入口（上传 / JSON / 定时任务 / 关键词 / 变体展开）
+    也都是一次一个站点。走 `(batch_id, asin)` 唯一键的前缀索引，追加推送
+    多这一次只读查询的代价可以忽略。
+
+    只读 raw SQL，与下面 resolve-sellers 同一个先例（模块头注：不新增 DB 方法）。
+    `COALESCE` 是给 F-012 之前的老行兜底：那一列在两个后端都是
+    `NOT NULL DEFAULT 'amazon.com'`，按理不会是 NULL，兜底不花钱。
+    """
+    sql = (
+        "SELECT COALESCE(t.marketplace, 'amazon.com') AS marketplace "
+        "FROM tasks t JOIN batches b ON b.id = t.batch_id "
+        "WHERE b.name = ? LIMIT 1"
+    )
+    async with _srv().db.read() as rc, rc.execute(sql, (name,)) as c:
+        row = await c.fetchone()
+    return dict(row)["marketplace"] if row else None
+
+
+async def _reject_cross_site_append(name: str, spec) -> None:
+    """同名批次已属于另一个站点 -> 409（理由见模块头注「站点」一节）。"""
+    existing = await _existing_batch_site(name)
+    if existing is None or existing == spec.id:
+        return
+    try:
+        existing_label = _marketplace.get(existing).label
+    except ValueError:
+        existing_label = existing
+    raise HTTPException(
+        409,
+        f"批次 {name!r} 已经是{existing_label}（{existing}）的批次，不能追加"
+        f"{spec.label}（{spec.id}）的任务：一个批次只能属于一个站点。"
+        f"换一个批次名重新推送。")
 
 
 router = APIRouter()
@@ -141,12 +216,14 @@ async def api_extension_collect(request: Request):
     | `asins` | `[]` | 要采详情的 ASIN |
     | `seller_ids` | `[]` | 要整店发现的卖家 ID |
     | `batch_name` | 自动生成 `ext_<ts>` | **同名 = 追加**（见模块头注） |
-    | `zip_code` | 服务端默认 | 配送邮编 |
+    | `marketplace` | `amazon.com` | 站点（`amazon.ca` 等）。不在注册表里 -> 400；不从 `page_url` 推导 |
+    | `zip_code` | 服务端按站点取默认 | 配送邮编，按站点校验 |
     | `needs_screenshot` | `false` | 详情阶段是否截图 |
     | `seller_discover_mode` | `with_detail` | 卖家批次的采集深度 |
     | `source` / `page_url` | — | 仅记录用途，不影响行为 |
 
     响应里 `asin_batch` / `seller_batch` 两块各自独立，某一块没提交就是 `null`。
+    非美国站时两块各多一个 `marketplace` 键。同名批次已属于另一个站点 -> 409。
     """
     body = await request.json()
     if not isinstance(body, dict):
@@ -186,14 +263,27 @@ async def api_extension_collect(request: Request):
             detail += f"（收到 {len(invalid_asins)} 个非法 ASIN，如 {invalid_asins[:3]}）"
         raise HTTPException(400, detail)
 
+    # ---- 站点（F-012）：放在上面那几条 400 之后，老调用方的报错顺序不变；
+    #      放在任何写库之前，站点非法时不会留下一个空批次 ----
+    spec = _site_of(body)
+    is_us = spec.id == _marketplace.DEFAULT_MARKETPLACE
+
     # ---- 邮编 / 截图 / 批次名 ----
     zip_raw = body.get("zip_code")
     if zip_raw:
-        zc = _s._normalize_zip(zip_raw)
+        zc = _s._normalize_zip(zip_raw, spec.id)
         if not zc:
-            raise HTTPException(400, f"非法邮编: {zip_raw!r}")
+            if is_us:
+                # 美国站文案逐字节不变（tests/test_extension_api 钉着 "非法邮编"）。
+                raise HTTPException(400, f"非法邮编: {zip_raw!r}")
+            raise HTTPException(
+                400, f"非法邮编: {zip_raw!r}（{spec.label}需要 "
+                     f"{spec.default_postal!r} 这种形状）")
     else:
-        zc = _s._runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE)
+        # 美国站：全局设置原样透传，不校验（与改造前逐字节一致）；
+        # 其它站点：全局值对该站合法才用，否则注册表默认 —— 全局设置里存的
+        # 是美国邮编，拿它去加拿大站不会报错，而是静默落到默认地区。
+        zc = _s._site_default_zip(spec)
 
     needs_screenshot = bool(body.get("needs_screenshot", False))
 
@@ -212,6 +302,12 @@ async def api_extension_collect(request: Request):
         raise HTTPException(
             400, f"batch_name 含有不能用作路径的字符（/ \\ .. 或控制字符）: {batch_name!r}")
 
+    # ---- 一个批次一个站点：两个批次都先查完，再动手写（见模块头注）----
+    if asins:
+        await _reject_cross_site_append(batch_name, spec)
+    if seller_ids:
+        await _reject_cross_site_append(f"{batch_name}_sellers", spec)
+
     out: Dict[str, Any] = {
         "asin_batch": None,
         "seller_batch": None,
@@ -225,7 +321,8 @@ async def api_extension_collect(request: Request):
             name=batch_name, needs_screenshot=needs_screenshot)
         if not batch_id:
             raise HTTPException(500, f"创建批次失败: {batch_name}")
-        inserted = await _s.db.create_tasks(batch_id, asins, zc, needs_screenshot)
+        inserted = await _s.db.create_tasks(batch_id, asins, zc, needs_screenshot,
+                                            marketplace=spec.id)
         out["asin_batch"] = {
             "batch_id": batch_id,
             "batch_name": batch_name,
@@ -235,6 +332,10 @@ async def api_extension_collect(request: Request):
             "zip_code": zc,
             "status_url": f"/api/batches/{batch_name}/status",
         }
+        # 只在非美国站时多回一个键：老插件（不带 marketplace）拿到的响应
+        # 与改造前逐字节一致，与 /api/upload 的口径相同。
+        if not is_us:
+            out["asin_batch"]["marketplace"] = spec.id
 
     # ---- 卖家批次：独立批次，见模块头注 ----
     if seller_ids:
@@ -245,6 +346,10 @@ async def api_extension_collect(request: Request):
             discover_mode=discover_mode,
             zip_code=zc,
             needs_screenshot=needs_screenshot,
+            # 整店发现任务带上站点：worker 按任务行的站点去翻**这个站点**的
+            # 店铺，派生出来的详情任务再继承它（common/pgdb/media.py）。
+            # 不带的话加拿大店铺页上点"整店采集"，翻的是同一个卖家的美国店。
+            marketplace=spec.id,
         )
         if not sb_id:
             raise HTTPException(500, f"创建卖家批次失败: {seller_batch_name}")
@@ -256,6 +361,8 @@ async def api_extension_collect(request: Request):
             "inserted_tasks": sb_inserted,
             "status_url": f"/api/seller-batches/{sb_id}/progress",
         }
+        if not is_us:
+            out["seller_batch"]["marketplace"] = spec.id
 
     return out
 
@@ -269,6 +376,9 @@ async def api_extension_resolve_sellers(request: Request):
 
     **只回库里已经有的**，查不到就不回 —— 这是补全，不是推测。
     返回一个猜的卖家会让用户采回一整店无关商品，而且完全看不出是错的。
+
+    Body：`asins`（数组）+ 可选 `marketplace`（缺省 `amazon.com`，不在注册表里 -> 400）。
+    **只查该站点的行**：同一个 ASIN 在美国站和加拿大站可以是不同的卖家。
     """
     body = await request.json()
     raw = (body or {}).get("asins") or []
@@ -278,6 +388,11 @@ async def api_extension_resolve_sellers(request: Request):
         raise HTTPException(400, f"单次最多查询 {MAX_RESOLVE_ASINS} 个 ASIN，收到 {len(raw)}")
 
     _s = _srv()
+    # F-012：按站点查。`asin_data` 的唯一键是 `(asin, marketplace)`，不过滤
+    # 的话同一个 ASIN 两个站点的行都会回来、后一行覆盖前一行 —— 加拿大队列
+    # 条目拿到美国卖家，再拿它去建加拿大站的整店任务。缺省按美国站过滤：
+    # F-012 之前库里只有美国行，对老数据结果不变。
+    spec = _site_of(body or {})
     asins: List[str] = []
     seen = set()
     for a in raw:
@@ -293,10 +408,11 @@ async def api_extension_resolve_sellers(request: Request):
     placeholders = ",".join("?" for _ in asins)
     sql = (
         "SELECT asin, seller_id, seller_name FROM asin_data "
-        f"WHERE asin IN ({placeholders}) AND seller_id IS NOT NULL AND seller_id != ''"
+        f"WHERE asin IN ({placeholders}) AND marketplace = ? "
+        "AND seller_id IS NOT NULL AND seller_id != ''"
     )
     sellers: Dict[str, Dict[str, Optional[str]]] = {}
-    async with _srv().db.read() as rc, rc.execute(sql, asins) as c:
+    async with _srv().db.read() as rc, rc.execute(sql, asins + [spec.id]) as c:
         async for r in c:
             row = dict(r)
             sid = (row.get("seller_id") or "").strip()

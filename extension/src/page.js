@@ -15,6 +15,16 @@
  *
  * 详情页排在最前：`/dp/ASIN` 是无歧义的，且详情页上也有
  * "相关商品" 之类的 `[data-asin]` 卡片，先判列表会把详情页认成列表。
+ *
+ * ──────────────────────────────────────────────────────────────
+ * 站点（F-012）的纯函数也住在这里，service worker 同样 import 本文件
+ * ──────────────────────────────────────────────────────────────
+ * 「这个页面 / 这条队列条目 / 这次翻页属于哪个站点」「推这个站点该带哪个
+ * 邮编」这几条规则，content script（识别页面）和 background（推送、队列、
+ * 翻页状态机）都要用。各写一份的话迟早分叉 —— 分叉的症状是加拿大页面上
+ * 识别出来是 amazon.ca，推过去却是美国站，没有任何一侧会报错。
+ * 所以只写这一份：background.js 顶部 `import './page.js'`（它是 module
+ * service worker），本文件作为模块求值时同样把 AmzPage 挂到 globalThis 上。
  */
 
 (function () {
@@ -41,6 +51,24 @@
     'ATVPDKIKX0DER',   // amazon.com
     'A3P5ROKL5A1OLE',  // amazon.com（部分类目）
   ]);
+
+  /** 美国站的站点键。与服务端 `common/core/marketplace.DEFAULT_MARKETPLACE` 同值。 */
+  const DEFAULT_MARKETPLACE = 'amazon.com';
+
+  /**
+   * 亚马逊主机名 -> 站点键的**形状**规则：`amazon.<2-3 个字母>`，后面可选再跟
+   * 一段 2 个字母的国家码（`co.uk` / `com.au` / `com.br` / `co.jp`），前面可以有
+   * 任意子域（`www.` / `smile.`）。站点键与服务端注册表同形：不带 `www.`。
+   *
+   * ⚠ 这**不是**站点白名单，也不该变成白名单：哪些站点能采是服务端注册表
+   *   （`common/core/marketplace.py`）说了算。插件里再抄一份的话两边必然分叉 ——
+   *   服务端新开一个站点，插件这边却还把它当美国站推。不支持的站点推过去，
+   *   服务端回 400，popup 把 detail 原样弹给用户，当场看得见。
+   *
+   * 末尾锚定 `$` 是承重的：`www.amazon.ca.evil.com` 必须认不出来，而不是被
+   * 认成 amazon.ca；`(?:^|\.)` 挡掉 `notamazon.ca` 这种前缀拼接。
+   */
+  const AMAZON_HOST_RE = /(?:^|\.)(amazon\.[a-z]{2,3}(?:\.[a-z]{2})?)$/;
 
   const PAGE_TYPES = {
     DETAIL: 'detail',
@@ -87,6 +115,22 @@
     return null;
   }
 
+  /**
+   * URL -> 站点键（`https://www.amazon.ca/s?k=x` -> `amazon.ca`）。
+   * 不是亚马逊的地址、或者根本解析不了 -> `null`，由调用方决定怎么兜底。
+   */
+  function marketplaceFromUrl(url) {
+    if (!url) return null;
+    let host;
+    try {
+      host = new URL(String(url)).hostname.toLowerCase().replace(/\.$/, '');
+    } catch (e) {
+      return null;
+    }
+    const m = host.match(AMAZON_HOST_RE);
+    return m ? m[1] : null;
+  }
+
   /** URL 里的卖家 ID（店铺页 `/s?me=`、卖家资料页 `/sp?seller=`）。 */
   function sellerIdFromUrl(url) {
     const m = url.match(SELLER_PARAM_RE);
@@ -104,6 +148,10 @@
     const out = {
       type: PAGE_TYPES.UNKNOWN,
       url,
+      // 这一页属于哪个站点（F-012）。popup 显示它，推送按它建批次、取邮编。
+      // 不进 content.js 的 fingerprint：换站点必然是整页导航，content script
+      // 会重新注入，用不着靠指纹察觉。
+      marketplace: marketplaceFromUrl(url),
       asin: null,
       title: '',
       sellerId: null,
@@ -448,6 +496,108 @@
     return !!nextPageLink(doc);
   }
 
+  // ────────────────────────────────────────────────────────────
+  // 站点（F-012）：推送、队列、翻页任务共用的几条规则
+  // ────────────────────────────────────────────────────────────
+  //
+  // 总原则：**一个批次只属于一个站点**（服务端对跨站点追加回 409，见
+  // server/api/extension.py 头注）。所以插件这边每一次推送都必须先回答
+  // "这批东西是哪个站点的"，并且只带**那个站点**的邮编。
+
+  /**
+   * 站点的统一兜底顺序：显式字段 > 从 URL 推 > 美国站。
+   *
+   * 「从 URL 推」这一档是给 v1.1.0 存下来的数据用的：那时的队列条目 / 翻页
+   * 任务没有 marketplace 字段，但一定存了页面 URL（队列条目的 `url`、翻页
+   * 任务的 `startUrl`）。按 URL 推，加拿大页面上加进队列的条目升级后提交，
+   * 就是加拿大站批次 —— 而不是继续按美国站去采一个加拿大商品。
+   * 两样都没有才算美国站：那只可能是 F-012 之前、一切都是美国站时的数据。
+   */
+  function resolveMarketplace(explicit, url) {
+    return explicit || marketplaceFromUrl(url) || DEFAULT_MARKETPLACE;
+  }
+
+  /**
+   * 推某个站点时带哪个邮编。`null` = 不带，由服务端按站点取默认。
+   *
+   * 美国站读老键 `zipCode`，与 v1.1.0 **逐字节一致**（选项页上那一栏
+   * 存的就是它，升级不用重填）。其它站点只读 `zipCodes[站点]`，**绝不**
+   * 回落到 `zipCode`：美国邮编发给加拿大站，服务端会 400（站点邮编形状
+   * 不对）；就算不 400，Amazon 也会静默落到默认地区。
+   */
+  function zipFor(settings, mkt) {
+    const s = settings || {};
+    if (!mkt || mkt === DEFAULT_MARKETPLACE) return s.zipCode || null;
+    const per = s.zipCodes || {};
+    return String(per[mkt] || '').trim() || null;
+  }
+
+  /**
+   * 批次名里的站点标记：`amazon.ca` -> `ca`，`amazon.co.uk` -> `co_uk`；美国站 -> `''`。
+   *
+   * 美国站不加标记，批次名与 v1.1.0 一字不差（`ext_list_<时间戳>`）。
+   * 点号换成下划线：批次名会进截图落盘路径，服务端拒绝含 `..` 的名字。
+   */
+  function siteTag(mkt) {
+    if (!mkt || mkt === DEFAULT_MARKETPLACE) return '';
+    return String(mkt).toLowerCase().replace(/^amazon\./, '').replace(/[^a-z0-9]+/g, '_');
+  }
+
+  /** `makeBatchName` 的 kind 加站点标记：`('list', 'amazon.ca')` -> `'list_ca'`。 */
+  function siteKind(kind, mkt) {
+    const tag = siteTag(mkt);
+    return tag ? `${kind}_${tag}` : kind;
+  }
+
+  /** 队列条目属于哪个站点（老条目按它的 `url` 推，见 resolveMarketplace）。 */
+  function queueItemMarketplace(item) {
+    return resolveMarketplace(item && item.marketplace, item && item.url);
+  }
+
+  /**
+   * 两条队列条目是不是"同一个"：键是 **(asin, 站点)**，不是 asin。
+   *
+   * 同一个 ASIN 在美国站和加拿大站是两件事（价格、卖家、库存都不同），
+   * 只按 asin 去重的话，后加的那条会把先加的覆盖掉 —— 连 url 一起，
+   * 于是另一个站点的那条悄悄消失。
+   */
+  function sameQueueItem(a, b) {
+    return !!a && !!b && a.asin === b.asin &&
+      queueItemMarketplace(a) === queueItemMarketplace(b);
+  }
+
+  /**
+   * 按站点分组，组的顺序 = 该站点第一次出现的顺序，组内保持原顺序。
+   * 返回 `[[站点, [条目...]], ...]`。提交队列时一组一个批次。
+   */
+  function groupByMarketplace(items, mktOf = queueItemMarketplace) {
+    const groups = new Map();
+    for (const it of items || []) {
+      const mkt = mktOf(it);
+      if (!groups.has(mkt)) groups.set(mkt, []);
+      groups.get(mkt).push(it);
+    }
+    return [...groups.entries()];
+  }
+
+  /** 翻页任务属于哪个站点。v1.1.0 存下来的 activeRun 没有这个字段，按起始页推。 */
+  function runMarketplace(run) {
+    return resolveMarketplace(run && run.marketplace, run && run.startUrl);
+  }
+
+  /**
+   * 这一页是不是已经离开了翻页任务的站点（用户在跑批的标签页里手动切了站点）。
+   *
+   * 翻页链接本身不会跨站点，但跑批归属只看 tabId（见 background.js
+   * CONTENT_READY），用户手动把那个标签页导航到另一个站点时，不拦的话
+   * 加拿大的页会被追加进美国的批次（服务端会 409，这里是第一道闸）。
+   * 页面 URL 推不出站点时不拦（content script 只注入亚马逊页面，理论上不会发生）。
+   */
+  function pageLeavesRunSite(run, pageUrl) {
+    const pageMkt = marketplaceFromUrl(pageUrl);
+    return !!pageMkt && pageMkt !== runMarketplace(run);
+  }
+
   // 挂到 globalThis 而不是 window：content script 里两者等价，但单测在
   // 纯 Node（无 jsdom 全局）下跑时只有 globalThis，写 window 会当场 ReferenceError。
   const AmzPage = {
@@ -468,6 +618,19 @@
     extractDetailSeller,
     nextPageLink,
     hasNextPage,
+    // 站点（F-012）
+    DEFAULT_MARKETPLACE,
+    AMAZON_HOST_RE,
+    marketplaceFromUrl,
+    resolveMarketplace,
+    zipFor,
+    siteTag,
+    siteKind,
+    queueItemMarketplace,
+    sameQueueItem,
+    groupByMarketplace,
+    runMarketplace,
+    pageLeavesRunSite,
   };
 
   globalThis.AmzPage = AmzPage;

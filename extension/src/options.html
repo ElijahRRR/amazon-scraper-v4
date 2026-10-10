@@ -52,8 +52,12 @@
   <h2>采集默认值</h2>
   <div class="grid">
     <label class="field">
-      <span>配送邮编</span>
+      <span>美国站邮编（amazon.com）</span>
       <input type="text" id="zipCode" placeholder="留空则用服务端默认">
+    </label>
+    <label class="field">
+      <span>加拿大站邮编（amazon.ca）</span>
+      <input type="text" id="zipCodeCa" placeholder="留空则用服务端默认（K1V 7P8）">
     </label>
     <label class="field">
       <span>卖家整店采集深度</span>
@@ -70,6 +74,12 @@
       <span>翻页间隔（毫秒）</span>
       <input type="number" id="pageDelayMs" min="500" max="60000" step="500">
     </label>
+  </div>
+  <div class="hint">
+    邮编<strong>按站点</strong>分开填：推送时只带当前页面所属站点的那一个，美国邮编绝不会被发给
+    加拿大站（服务端会拒，而且拿美国邮编去加拿大站本来也采不到对的地区）。
+    其它站点不在这里填 —— 服务端支持的站点留空时按站点取默认邮编，不支持的站点推送会
+    直接报错并说明原因。
   </div>
   <div class="hint">
     翻页间隔别调太小：连着打 Amazon 很快会吃到验证码，那时整个任务会从「慢一点」
