@@ -46,10 +46,14 @@
   /** 从任意 URL / href 里抠卖家 ID（`me=` 与 `seller=` 两种参数名）。 */
   const SELLER_PARAM_RE = /[?&](?:me|seller|isAmazonFulfilled|merchant)=([A-Z0-9]{10,16})/i;
 
-  /** Amazon 自营的 merchant ID（美国站）。整店采集对它没意义，见下。 */
+  /** Amazon 自营的 merchant ID（各站点不同）。整店采集对它没意义，见下。 */
   const AMAZON_SELF_MERCHANTS = new Set([
     'ATVPDKIKX0DER',   // amazon.com
     'A3P5ROKL5A1OLE',  // amazon.com（部分类目）
+    // amazon.ca（F-012）：取自实采的 amazon.ca 详情页（卖家栏写 Amazon.ca，
+    // 隐藏字段 merchantID 就是它）。不加的话加拿大自营店铺页上没有「商品数以
+    // 百万计」的警告，用户会对着 Amazon.ca 点整店采集。
+    'A3DWYIK6Y9EEQB',
   ]);
 
   /** 美国站的站点键。与服务端 `common/core/marketplace.DEFAULT_MARKETPLACE` 同值。 */
@@ -455,7 +459,9 @@
     if (!out.sellerId) {
       const info = doc.querySelector('#merchant-info, #tabular-buybox, #sellerProfileTriggerId');
       const txt = (info?.textContent || '').replace(/\s+/g, ' ');
-      if (/sold by amazon(\.[a-z.]+)?\b/i.test(txt) || /亚马逊/.test(txt)) {
+      // `vendu par Amazon.ca`：amazon.ca 的法语页面（F-012），英文页面走第一条
+      if (/sold by amazon(\.[a-z.]+)?\b/i.test(txt) || /vendu par amazon\b/i.test(txt) ||
+          /亚马逊/.test(txt)) {
         out.isAmazonSelf = true;
         out.sellerName = 'Amazon';
       }
@@ -505,13 +511,10 @@
   // "这批东西是哪个站点的"，并且只带**那个站点**的邮编。
 
   /**
-   * 站点的统一兜底顺序：显式字段 > 从 URL 推 > 美国站。
+   * **当下这一页**属于哪个站点：显式字段 > 从页面 URL 推 > 美国站。
    *
-   * 「从 URL 推」这一档是给 v1.1.0 存下来的数据用的：那时的队列条目 / 翻页
-   * 任务没有 marketplace 字段，但一定存了页面 URL（队列条目的 `url`、翻页
-   * 任务的 `startUrl`）。按 URL 推，加拿大页面上加进队列的条目升级后提交，
-   * 就是加拿大站批次 —— 而不是继续按美国站去采一个加拿大商品。
-   * 两样都没有才算美国站：那只可能是 F-012 之前、一切都是美国站时的数据。
+   * 只给"正在发生的动作"用（单页采集、开始翻页、加入队列 —— 页面 URL 就是
+   * 用户眼前那一页）。**存下来的老数据不走这里**，见 storedMarketplace。
    */
   function resolveMarketplace(explicit, url) {
     return explicit || marketplaceFromUrl(url) || DEFAULT_MARKETPLACE;
@@ -549,9 +552,23 @@
     return tag ? `${kind}_${tag}` : kind;
   }
 
-  /** 队列条目属于哪个站点（老条目按它的 `url` 推，见 resolveMarketplace）。 */
+  /**
+   * **存下来的**队列条目 / 翻页任务属于哪个站点：有字段用字段，没有 = 美国站。
+   *
+   * 没有字段的只可能是 v1.1.0 存下来的东西，而 v1.1.0 推什么都是美国站 ——
+   * 升级后照旧按美国站推，与升级前那一刻点「提交」的结果逐字节相同（SPEC B3：
+   * 老存储数据视为 amazon.com）。**不**按条目的 `url` 去猜：那会让升级这个动作
+   * 本身改变一条已经排好队的东西去哪个站点 —— 一条 amazon.de 页面上加的老条目
+   * 会突然推成 amazon.de 被服务端 400；一个 amazon.ca 上开始的老翻页任务会把
+   * 后面几页推成加拿大站、撞上它自己那个美国站批次（409）。
+   */
+  function storedMarketplace(explicit) {
+    return explicit || DEFAULT_MARKETPLACE;
+  }
+
+  /** 队列条目属于哪个站点（老条目 = 美国站，见 storedMarketplace）。 */
   function queueItemMarketplace(item) {
-    return resolveMarketplace(item && item.marketplace, item && item.url);
+    return storedMarketplace(item && item.marketplace);
   }
 
   /**
@@ -567,8 +584,12 @@
   }
 
   /**
-   * 按站点分组，组的顺序 = 该站点第一次出现的顺序，组内保持原顺序。
-   * 返回 `[[站点, [条目...]], ...]`。提交队列时一组一个批次。
+   * 按站点分组。返回 `[[站点, [条目...]], ...]`，提交队列时一组一个批次。
+   *
+   * 组的顺序：**美国站那组永远第一**，其余按该站点第一次出现的顺序；组内保持
+   * 原顺序。美国站排第一是为了让它那一次推送与 v1.1.0 一样是最先发出的请求，
+   * 不排在一个可能被服务端拒掉的站点（amazon.de 等）后面 —— 调用方虽然会
+   * 一组失败接着推下一组，但美国站条目的命运不该取决于队列里谁先加进来。
    */
   function groupByMarketplace(items, mktOf = queueItemMarketplace) {
     const groups = new Map();
@@ -577,12 +598,15 @@
       if (!groups.has(mkt)) groups.set(mkt, []);
       groups.get(mkt).push(it);
     }
-    return [...groups.entries()];
+    const out = [...groups.entries()];
+    const us = out.findIndex(([mkt]) => mkt === DEFAULT_MARKETPLACE);
+    if (us > 0) out.unshift(...out.splice(us, 1));
+    return out;
   }
 
-  /** 翻页任务属于哪个站点。v1.1.0 存下来的 activeRun 没有这个字段，按起始页推。 */
+  /** 翻页任务属于哪个站点。v1.1.0 存下来的 activeRun 没有这个字段 = 美国站（见 storedMarketplace）。 */
   function runMarketplace(run) {
-    return resolveMarketplace(run && run.marketplace, run && run.startUrl);
+    return storedMarketplace(run && run.marketplace);
   }
 
   /**
@@ -623,6 +647,7 @@
     AMAZON_HOST_RE,
     marketplaceFromUrl,
     resolveMarketplace,
+    storedMarketplace,
     zipFor,
     siteTag,
     siteKind,

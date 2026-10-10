@@ -131,36 +131,99 @@ check("siteTag('amazon.co.uk') 不含点（批次名进截图路径）", P.siteT
 check("siteKind('queue', 'amazon.com')", P.siteKind('queue', 'amazon.com'), 'queue');
 check("siteKind('list', 'amazon.ca')", P.siteKind('list', 'amazon.ca'), 'list_ca');
 
+// ---- 当下页面的站点 vs 存下来的数据的站点 ----
+check('当下页面: 显式字段优先', P.resolveMarketplace('amazon.ca', 'https://www.amazon.com/dp/B0X'), 'amazon.ca');
+check('当下页面: 没字段按页面 URL 推', P.resolveMarketplace(null, 'https://www.amazon.ca/dp/B0X'), 'amazon.ca');
+check('当下页面: 都没有算美国站', P.resolveMarketplace(null, ''), 'amazon.com');
+check('存储数据: 有字段用字段', P.storedMarketplace('amazon.ca'), 'amazon.ca');
+check('存储数据: 没字段 = 美国站（SPEC B3）', P.storedMarketplace(undefined), 'amazon.com');
+
 // ---- 队列条目的站点 / 去重键 / 分组 ----
 check('队列条目: 显式站点优先', P.queueItemMarketplace({ marketplace: 'amazon.ca', url: 'https://www.amazon.com/dp/B0X' }), 'amazon.ca');
-check('队列条目: v1.1.0 老条目按 url 推', P.queueItemMarketplace({ asin: 'B0X', url: 'https://www.amazon.ca/dp/B0X' }), 'amazon.ca');
+// v1.1.0 推什么都是美国站：老条目升级后照旧按美国站推，不按 url 去猜
+// （按 url 猜的话，一条 amazon.de 页面上的老条目升级后会变成被服务端 400 的德国站推送）
+check('队列条目: v1.1.0 老条目（无站点字段）算美国站，不按 url 猜',
+      P.queueItemMarketplace({ asin: 'B0X', url: 'https://www.amazon.ca/dp/B0X' }), 'amazon.com');
+check('队列条目: v1.1.0 德国页上的老条目也算美国站',
+      P.queueItemMarketplace({ asin: 'B0X', url: 'https://www.amazon.de/dp/B0X' }), 'amazon.com');
 check('队列条目: 没 url 的老条目算美国站', P.queueItemMarketplace({ asin: 'B0X' }), 'amazon.com');
-check('队列条目: url 是垃圾也算美国站', P.queueItemMarketplace({ asin: 'B0X', url: '???' }), 'amazon.com');
 check('去重键: 同 ASIN 不同站点不是同一条',
       P.sameQueueItem({ asin: 'B0X', marketplace: 'amazon.com' }, { asin: 'B0X', marketplace: 'amazon.ca' }), false);
-check('去重键: 同 ASIN 同站点（一条老条目）是同一条',
-      P.sameQueueItem({ asin: 'B0X', url: 'https://www.amazon.ca/dp/B0X' }, { asin: 'B0X', marketplace: 'amazon.ca' }), true);
-check('分组: 按首次出现顺序，组内保持原顺序',
+check('去重键: 老条目与美国站新条目是同一条',
+      P.sameQueueItem({ asin: 'B0X', url: 'https://www.amazon.ca/dp/B0X' }, { asin: 'B0X', marketplace: 'amazon.com' }), true);
+check('去重键: 老条目与加拿大站新条目不是同一条',
+      P.sameQueueItem({ asin: 'B0X', url: 'https://www.amazon.ca/dp/B0X' }, { asin: 'B0X', marketplace: 'amazon.ca' }), false);
+check('分组: 美国站那组永远第一，其余按首次出现顺序，组内保持原顺序',
       P.groupByMarketplace([
         { asin: 'A', marketplace: 'amazon.ca' },
-        { asin: 'B', marketplace: 'amazon.com' },
-        { asin: 'C', url: 'https://www.amazon.ca/dp/C' },
+        { asin: 'B', marketplace: 'amazon.de' },
+        { asin: 'C', marketplace: 'amazon.com' },
+        { asin: 'D', url: 'https://www.amazon.ca/dp/D' },   // 老条目 = 美国站
+        { asin: 'E', marketplace: 'amazon.ca' },
       ]).map(([m, items]) => [m, items.map((i) => i.asin)]),
-      [['amazon.ca', ['A', 'C']], ['amazon.com', ['B']]]);
+      [['amazon.com', ['C', 'D']], ['amazon.ca', ['A', 'E']], ['amazon.de', ['B']]]);
+check('分组: 没有美国站时按首次出现顺序',
+      P.groupByMarketplace([{ asin: 'A', marketplace: 'amazon.de' }, { asin: 'B', marketplace: 'amazon.ca' }])
+        .map(([m]) => m), ['amazon.de', 'amazon.ca']);
 
 // ---- 翻页任务的站点 ----
 check('run: 显式站点', P.runMarketplace({ marketplace: 'amazon.ca', startUrl: 'https://www.amazon.com/s?k=x' }), 'amazon.ca');
-check('run: v1.1.0 的 run 按 startUrl 推', P.runMarketplace({ startUrl: 'https://www.amazon.ca/s?k=x' }), 'amazon.ca');
+check('run: v1.1.0 的 run（无站点字段）算美国站，不按 startUrl 猜',
+      P.runMarketplace({ startUrl: 'https://www.amazon.ca/s?k=x' }), 'amazon.com');
 check('run: 什么都没有算美国站', P.runMarketplace({}), 'amazon.com');
 check('run: 同站点翻页不拦', P.pageLeavesRunSite({ marketplace: 'amazon.ca' }, 'https://www.amazon.ca/s?k=x&page=2'), false);
 check('run: smile 与 www 是同一个站点',
       P.pageLeavesRunSite({ marketplace: 'amazon.com' }, 'https://smile.amazon.com/s?k=x&page=2'), false);
 check('run: 切到别的站点要拦', P.pageLeavesRunSite({ marketplace: 'amazon.com' }, 'https://www.amazon.ca/s?k=x'), true);
 check('run: 页面 URL 推不出站点时不拦', P.pageLeavesRunSite({ marketplace: 'amazon.ca' }, ''), false);
+check('run: v1.1.0 的美国 run 在美国页上不拦',
+      P.pageLeavesRunSite({ startUrl: 'https://www.amazon.com/s?k=x' }, 'https://www.amazon.com/s?k=x&page=2'), false);
+
+// ---- Amazon.ca 自营（merchant ID 取自实采的 amazon.ca 详情页：卖家栏 Amazon.ca）----
+const caSelf = P.detectPage('https://www.amazon.ca/s?me=A3DWYIK6Y9EEQB', EMPTY_DOC);
+check('Amazon.ca 自营店铺页: 认作店铺页且标为自营（popup 据此警告"商品数以百万计"）',
+      [caSelf.type, caSelf.isAmazonSelf], ['seller', true]);
+check('美国自营店铺页: 照旧标为自营',
+      P.detectPage('https://www.amazon.com/s?me=ATVPDKIKX0DER', EMPTY_DOC).isAmazonSelf, true);
+check('普通三方店铺页: 不标自营',
+      P.detectPage('https://www.amazon.ca/s?me=A2L77EE7U53NWQ', EMPTY_DOC).isAmazonSelf, false);
+/** 只有卖家栏文案、没有卖家链接的详情页（自营商品的典型形状）。 */
+const merchantTextDoc = (txt) => ({
+  querySelector: (sel) => (sel === '#merchant-info, #tabular-buybox, #sellerProfileTriggerId'
+    ? { textContent: txt, innerHTML: '', getAttribute: () => '' } : null),
+  querySelectorAll: () => [],
+});
+check('amazon.ca 法语页「Expédié et vendu par Amazon.ca」: 自营',
+      P.extractDetailSeller(merchantTextDoc('Expédié et vendu par Amazon.ca')).isAmazonSelf, true);
+check('amazon.ca 英文页「Ships from and sold by Amazon.ca」: 自营',
+      P.extractDetailSeller(merchantTextDoc('Ships from and sold by Amazon.ca.')).isAmazonSelf, true);
+check('法语页三方卖家「Expédié par Amazon.ca, vendu par FooBar」: 不是自营',
+      P.extractDetailSeller(merchantTextDoc('Expédié par Amazon.ca, vendu par FooBar Inc')).isAmazonSelf, false);
 
 // ════════════════════════════════════════════════════════════
 // 第二部分：background.js —— 从消息进，从推给服务端的请求体出
 // ════════════════════════════════════════════════════════════
+
+/** F-012 之前的服务端：不认 marketplace，照样 200，回包里没有站点回显。 */
+function oldServerRespond(pathOnly, body) {
+  if (pathOnly === '/api/extension/collect') {
+    return [200, {
+      asin_batch: body.asins && body.asins.length
+        ? { batch_name: body.batch_name, inserted_tasks: body.asins.length, zip_code: '10001' } : null,
+      seller_batch: body.seller_ids && body.seller_ids.length
+        ? { batch_name: `${body.batch_name}_sellers`, inserted_tasks: body.seller_ids.length } : null,
+    }];
+  }
+  return defaultRespond(pathOnly, body);
+}
+
+/** 只认美国站与加拿大站的服务端（与当前注册表一致），别的站点 400。 */
+function usCaOnlyRespond(pathOnly, body) {
+  if (body && body.marketplace && !['amazon.com', 'amazon.ca'].includes(body.marketplace)) {
+    return [400, { detail: `不支持的站点: '${body.marketplace}'` }];
+  }
+  return defaultRespond(pathOnly, body);
+}
 
 /** 一个够用的假 chrome：storage 在内存里，onMessage 的监听器交出来给测试调。 */
 function makeChrome() {
@@ -204,13 +267,15 @@ function makeFetch() {
   return state;
 }
 
+/** 与 server/api/extension.py 同口径：非美国站时 asin_batch / seller_batch 回显 marketplace。 */
 function defaultRespond(pathOnly, body) {
   if (pathOnly === '/api/extension/collect') {
+    const echo = body.marketplace && body.marketplace !== 'amazon.com' ? { marketplace: body.marketplace } : {};
     return [200, {
       asin_batch: body.asins && body.asins.length
-        ? { batch_name: body.batch_name, inserted_tasks: body.asins.length } : null,
+        ? { batch_name: body.batch_name, inserted_tasks: body.asins.length, ...echo } : null,
       seller_batch: body.seller_ids && body.seller_ids.length
-        ? { batch_name: `${body.batch_name}_sellers`, inserted_tasks: body.seller_ids.length } : null,
+        ? { batch_name: `${body.batch_name}_sellers`, inserted_tasks: body.seller_ids.length, ...echo } : null,
     }];
   }
   if (pathOnly === '/api/extension/resolve-sellers') return [200, { sellers: {}, queried: 0 }];
@@ -319,9 +384,19 @@ async function backgroundSpecs() {
       { asin: 'B0LEGACY03', addedAt: 3 },
     ] });
     r = await send({ type: 'GET_QUEUE' });
-    check('老条目: 读出来就补上站点（按 url 推，没 url 算美国站）',
+    check('老条目: 读出来就补上站点 —— 一律美国站（v1.1.0 推什么都是美国站）',
           r.queue.map((q) => [q.asin, q.marketplace]),
-          [['B0LEGACY01', 'amazon.ca'], ['B0LEGACY02', 'amazon.com'], ['B0LEGACY03', 'amazon.com']]);
+          [['B0LEGACY01', 'amazon.com'], ['B0LEGACY02', 'amazon.com'], ['B0LEGACY03', 'amazon.com']]);
+    r = await send({ type: 'SUBMIT_QUEUE' });
+    b = collects()[0].body;
+    check('老条目: 提交 = v1.1.0 的那一次美国站推送', [collects().length, b.marketplace, b.asins, b.zip_code],
+          [1, 'amazon.com', ['B0LEGACY01', 'B0LEGACY02', 'B0LEGACY03'], '10001']);
+    checkTrue('老条目: 批次名 ext_queue_<ts>', /^ext_queue_\d{8}_\d{6}$/.test(b.batch_name), b.batch_name);
+
+    // ---- 加入队列：新条目没给站点字段时按它自己的页面 URL 定 ----
+    reset({ zipCode: '10001' });
+    r = await send({ type: 'ADD_TO_QUEUE', item: { asin: 'B0NEW00001', url: 'https://www.amazon.ca/dp/B0NEW00001' } });
+    check('加入队列: 新条目按页面 URL 定站点', r.queue.map((q) => q.marketplace), ['amazon.ca']);
 
     // ---- 提交队列：只有美国站 -> 与 v1.1.0 相同，一次推送 ----
     reset({ zipCode: '10001' }, { queue: [
@@ -337,7 +412,14 @@ async function backgroundSpecs() {
     check('美国队列: 请求体', [b.marketplace, b.zip_code, b.asins, b.seller_ids, b.source, b.page_url],
           ['amazon.com', '10001', ['B0US000010', 'B0US000011'], ['A1USSELLER0001'], 'detail_queue', '']);
     check('美国队列: 提交后队列清空', chromeState.store.queue, []);
-    check('美国队列: 回包', [r.submitted, r.sellers, r.results.length], [2, 1, 1]);
+    check('美国队列: 回包', [r.submitted, r.sellers, r.results.length, r.failures], [2, 1, 1, []]);
+
+    // ---- 提交队列：只有美国站且失败 -> 与 v1.1.0 一样报服务端原话，队列不动 ----
+    reset({ zipCode: '10001' }, { queue: [{ asin: 'B0USFAIL01', marketplace: 'amazon.com' }] });
+    fetchState.respond = () => [400, { detail: '非法邮编: 10001x' }];
+    r = await send({ type: 'SUBMIT_QUEUE' });
+    check('美国队列失败: 报错就是服务端原话', [r.ok, r.error], [false, 'Server 400: 非法邮编: 10001x']);
+    check('美国队列失败: 队列原样', chromeState.store.queue.map((q) => q.asin), ['B0USFAIL01']);
 
     // ---- 提交队列：混了两个站点 -> 一个站点一个批次 ----
     reset({ zipCode: '10001', zipCodes: { 'amazon.ca': 'K2P 1L4' } }, { queue: [
@@ -345,13 +427,15 @@ async function backgroundSpecs() {
         sellerId: 'A1USSELLER0001', expandSeller: true },
       { asin: 'B0MIX00002', url: 'https://www.amazon.ca/dp/B0MIX00002', marketplace: 'amazon.ca',
         sellerId: 'A1CASELLER0001', expandSeller: true },
-      { asin: 'B0MIX00001', url: 'https://www.amazon.ca/dp/B0MIX00001' },   // v1.1.0 老条目，加拿大页
+      { asin: 'B0MIX00003', url: 'https://www.amazon.ca/dp/B0MIX00003' },   // v1.1.0 老条目 = 美国站
+      { asin: 'B0MIX00001', url: 'https://www.amazon.ca/dp/B0MIX00001', marketplace: 'amazon.ca' },
     ] });
     r = await send({ type: 'SUBMIT_QUEUE' });
     check('混合队列: ok', r.ok, true);
     check('混合队列: 两个站点两次推送', collects().map((c) => c.body.marketplace), ['amazon.com', 'amazon.ca']);
     const [us, ca] = collects().map((c) => c.body);
-    check('混合队列: 美国组', [us.asins, us.seller_ids, us.zip_code], [['B0MIX00001'], ['A1USSELLER0001'], '10001']);
+    check('混合队列: 美国组（含老条目）', [us.asins, us.seller_ids, us.zip_code],
+          [['B0MIX00001', 'B0MIX00003'], ['A1USSELLER0001'], '10001']);
     check('混合队列: 加拿大组（卖家也按站点分；邮编用加拿大的）',
           [ca.asins, ca.seller_ids, ca.zip_code], [['B0MIX00002', 'B0MIX00001'], ['A1CASELLER0001'], 'K2P 1L4']);
     checkTrue('混合队列: 美国组批次名不带标记', /^ext_queue_\d{8}_\d{6}$/.test(us.batch_name), us.batch_name);
@@ -359,9 +443,9 @@ async function backgroundSpecs() {
     check('混合队列: 两个批次名同一个时间戳', us.batch_name.match(STAMP)[0], ca.batch_name.match(STAMP)[0]);
     check('混合队列: 队列清空', chromeState.store.queue, []);
     check('混合队列: 回包按站点列出', r.results.map((x) => [x.marketplace, x.submitted, x.sellers]),
-          [['amazon.com', 1, 1], ['amazon.ca', 2, 1]]);
+          [['amazon.com', 2, 1], ['amazon.ca', 2, 1]]);
 
-    // ---- 提交队列：第二组失败 -> 第一组移出队列，第二组留着 ----
+    // ---- 提交队列：某一组失败 -> 别的组照推，失败那组留在队列里，回包里点名 ----
     reset({ zipCode: '10001' }, { queue: [
       { asin: 'B0PART0001', marketplace: 'amazon.com' },
       { asin: 'B0PART0002', marketplace: 'amazon.ca' },
@@ -369,12 +453,39 @@ async function backgroundSpecs() {
     fetchState.respond = (p, body) => (body.marketplace === 'amazon.ca'
       ? [409, { detail: '批次已经是美国站的批次' }] : defaultRespond(p, body));
     r = await send({ type: 'SUBMIT_QUEUE' });
-    check('部分失败: 报错', r.ok, false);
-    checkTrue('部分失败: 说清楚哪组成功、哪组失败、服务端怎么说',
-              /amazon\.com -> ext_queue_/.test(r.error) && /amazon\.ca 这一组推送失败/.test(r.error) &&
-              /已经是美国站/.test(r.error), r.error);
+    check('部分失败: 整体算提交了（美国组推成了）', [r.ok, r.results.map((x) => x.marketplace)], [true, ['amazon.com']]);
+    check('部分失败: 失败的组点名站点、条数、服务端原话',
+          r.failures, [{ marketplace: 'amazon.ca', count: 1, error: 'Server 409: 批次已经是美国站的批次' }]);
     check('部分失败: 只剩没推成功的那组', chromeState.store.queue.map((q) => [q.asin, q.marketplace]),
           [['B0PART0002', 'amazon.ca']]);
+
+    // ---- 提交队列：不支持的站点排在最前 -> 不能把美国站、加拿大站堵死 ----
+    reset({ zipCode: '10001' }, { queue: [
+      { asin: 'B0DE000001', url: 'https://www.amazon.de/dp/B0DE000001', marketplace: 'amazon.de' },
+      { asin: 'B0US000002', url: 'https://www.amazon.com/dp/B0US000002', marketplace: 'amazon.com' },
+      { asin: 'B0CA000003', url: 'https://www.amazon.ca/dp/B0CA000003', marketplace: 'amazon.ca' },
+    ] });
+    fetchState.respond = usCaOnlyRespond;
+    r = await send({ type: 'SUBMIT_QUEUE' });
+    check('德国条目在前: 三组都推了，美国站最先', collects().map((c) => [c.body.marketplace, c.body.asins]),
+          [['amazon.com', ['B0US000002']], ['amazon.de', ['B0DE000001']], ['amazon.ca', ['B0CA000003']]]);
+    check('德国条目在前: 美国、加拿大提交成功', [r.ok, r.results.map((x) => x.marketplace), r.submitted],
+          [true, ['amazon.com', 'amazon.ca'], 2]);
+    check('德国条目在前: 德国那组点名失败', r.failures.map((f) => [f.marketplace, f.count]), [['amazon.de', 1]]);
+    checkTrue('德国条目在前: 失败原因是服务端原话', /不支持的站点: 'amazon\.de'/.test(r.failures[0].error), r.failures[0].error);
+    check('德国条目在前: 队列里只剩德国那条', chromeState.store.queue.map((q) => q.asin), ['B0DE000001']);
+
+    // ---- 提交队列：一组都没推成 -> 报错，逐个站点列出，队列原样 ----
+    reset({ zipCode: '10001' }, { queue: [
+      { asin: 'B0DE000001', marketplace: 'amazon.de' },
+      { asin: 'B0FR000001', marketplace: 'amazon.fr' },
+    ] });
+    fetchState.respond = usCaOnlyRespond;
+    r = await send({ type: 'SUBMIT_QUEUE' });
+    check('全部失败: 报错', r.ok, false);
+    checkTrue('全部失败: 两个站点都点名、说明还在队列里',
+              /amazon\.de（1 条）/.test(r.error) && /amazon\.fr（1 条）/.test(r.error) && /还在队列里/.test(r.error), r.error);
+    check('全部失败: 队列原样', chromeState.store.queue.map((q) => q.asin), ['B0DE000001', 'B0FR000001']);
 
     // ---- 补全卖家：按站点分开问 ----
     reset({ zipCode: '10001' }, { queue: [
@@ -397,7 +508,32 @@ async function backgroundSpecs() {
           [['B0RS000001', 'amazon.com', 'A1USSELLER0001'],
            ['B0RS000001', 'amazon.ca', 'A1CASELLER0001'],
            ['B0RS000002', 'amazon.ca', null]]);
-    check('补全卖家: resolved 计数', r.resolved, 2);
+    check('补全卖家: resolved 计数', [r.resolved, r.failures], [2, []]);
+
+    // ---- 补全卖家：不支持的站点排在最前 -> 美国站、加拿大站照样补 ----
+    reset({ zipCode: '10001' }, { queue: [
+      { asin: 'B0RS000001', marketplace: 'amazon.de' },
+      { asin: 'B0RS000001', marketplace: 'amazon.com' },
+      { asin: 'B0RS000001', marketplace: 'amazon.ca' },
+    ] });
+    fetchState.respond = (p, body) => {
+      if (!['amazon.com', 'amazon.ca'].includes(body.marketplace)) return [400, { detail: `不支持的站点: '${body.marketplace}'` }];
+      const seller = body.marketplace === 'amazon.ca' ? 'A1CASELLER0001' : 'A1USSELLER0001';
+      return [200, { sellers: { B0RS000001: { seller_id: seller, seller_name: body.marketplace } }, queried: 1 }];
+    };
+    r = await send({ type: 'RESOLVE_SELLERS' });
+    check('补全卖家/德国在前: 三个站点都问了',
+          fetchState.calls.map((c) => c.body.marketplace), ['amazon.com', 'amazon.de', 'amazon.ca']);
+    check('补全卖家/德国在前: 美国、加拿大补上了，德国没有',
+          chromeState.store.queue.map((q) => [q.marketplace, q.sellerId || null]),
+          [['amazon.de', null], ['amazon.com', 'A1USSELLER0001'], ['amazon.ca', 'A1CASELLER0001']]);
+    check('补全卖家/德国在前: 回包', [r.ok, r.resolved, r.failures.map((f) => f.marketplace)], [true, 2, ['amazon.de']]);
+
+    // ---- 补全卖家：只有美国站且失败 -> 与 v1.1.0 一样报服务端原话 ----
+    reset({ zipCode: '10001' }, { queue: [{ asin: 'B0RS000009', marketplace: 'amazon.com' }] });
+    fetchState.respond = () => [500, { detail: 'db down' }];
+    r = await send({ type: 'RESOLVE_SELLERS' });
+    check('补全卖家/美国失败: 服务端原话', [r.ok, r.error], [false, 'Server 500: db down']);
 
     // ---- 翻页：加拿大站一次 run ----
     reset({ zipCode: '10001' });
@@ -439,17 +575,62 @@ async function backgroundSpecs() {
     b = collects()[0].body;
     check('美国翻页: 推送体', [b.marketplace, b.zip_code, b.source], ['amazon.com', '10001', 'seller']);
 
-    // ---- 翻页：v1.1.0 存下来的 run（没有 marketplace）按 startUrl 推站点 ----
-    reset({ zipCode: '10001' }, { activeRun: {
+    // ---- 翻页：v1.1.0 存下来的 run（没有 marketplace）= 美国站 ----
+    const legacyRun = (startUrl) => ({ activeRun: {
       active: true, tabId: 10, kind: 'list', batchName: 'ext_list_20260101_000000',
       pagesDone: 1, maxPages: 5, pushedAsins: 3, startedAt: 1,
-      startUrl: 'https://www.amazon.ca/s?k=x', lastError: null, finishedReason: null,
+      startUrl, lastError: null, finishedReason: null,
     } });
+    reset({ zipCode: '10001' }, legacyRun('https://www.amazon.com/s?k=x'));
     r = await send({ type: 'PAGE_COLLECTED', asins: ['B0OLDRUN01'], hasNext: true,
-                     pageUrl: 'https://www.amazon.ca/s?k=x&page=2' }, { tab: { id: 10 } });
+                     pageUrl: 'https://www.amazon.com/s?k=x&page=2' }, { tab: { id: 10 } });
     b = collects()[0].body;
-    check('老 run: 按 startUrl 推出加拿大站', [b.marketplace, b.batch_name, b.zip_code],
-          ['amazon.ca', 'ext_list_20260101_000000', null]);
+    check('老美国 run: 照旧推美国站、原批次名、美国邮编', [r.next, b.marketplace, b.batch_name, b.zip_code],
+          ['continue', 'amazon.com', 'ext_list_20260101_000000', '10001']);
+    // 加拿大页面上开始的老 run：它前面的页 v1.1.0 都推成了美国站，批次是美国站的；
+    // 继续推成加拿大站会撞上自己的批次（409），继续推成美国站是在采错国家 —— 停下说清楚
+    reset({ zipCode: '10001' }, legacyRun('https://www.amazon.ca/s?k=x'));
+    r = await send({ type: 'PAGE_COLLECTED', asins: ['B0OLDRUN02'], hasNext: true,
+                     pageUrl: 'https://www.amazon.ca/s?k=x&page=2' }, { tab: { id: 10 } });
+    check('老加拿大 run: 停下、一个都不推', [r.next, r.reason, collects().length], ['stop', 'marketplace_changed', 0]);
+    checkTrue('老加拿大 run: 原因里说明老翻页按美国站算',
+              /升级插件前开始的翻页/.test(chromeState.store.activeRun.lastError), chromeState.store.activeRun.lastError);
+
+    // ---- 服务端比插件旧（不认 marketplace）：非美国站推送必须报错，不能显示"已推送（amazon.ca）" ----
+    reset({ zipCode: '10001' });
+    fetchState.respond = oldServerRespond;
+    r = await send({ type: 'COLLECT_PAGE', asins: ['B0SKEW0001'], kind: 'list',
+                     pageUrl: 'https://www.amazon.ca/s?k=mouse' });
+    check('老服务端/加拿大单页: 失败', r.ok, false);
+    checkTrue('老服务端/加拿大单页: 说清楚服务端没按站点建、点名批次、让升级',
+              /服务端没有按 amazon\.ca 建任务/.test(r.error) && /ext_list_ca_\d{8}_\d{6}（amazon\.com）/.test(r.error) &&
+              /升级服务端/.test(r.error), r.error);
+    r = await send({ type: 'COLLECT_PAGE', sellerIds: ['A2L77EE7U53NWQ'], kind: 'seller_full',
+                     pageUrl: 'https://www.amazon.ca/s?me=A2L77EE7U53NWQ' });
+    checkTrue('老服务端/加拿大整店: 卖家批次同样核对', !r.ok && /_sellers（amazon\.com）/.test(r.error || ''), r.error);
+    r = await send({ type: 'COLLECT_PAGE', asins: ['B0SKEW0002'], kind: 'list',
+                     pageUrl: 'https://www.amazon.com/s?k=mouse' });
+    check('老服务端/美国单页: 不核对，照常成功（与 v1.1.0 相同）', r.ok, true);
+
+    reset({ zipCode: '10001' }, { queue: [
+      { asin: 'B0SKEW0003', marketplace: 'amazon.com' },
+      { asin: 'B0SKEW0004', marketplace: 'amazon.ca' },
+    ] });
+    fetchState.respond = oldServerRespond;
+    r = await send({ type: 'SUBMIT_QUEUE' });
+    check('老服务端/混合队列: 美国组成功、加拿大组算失败',
+          [r.ok, r.results.map((x) => x.marketplace), r.failures.map((f) => f.marketplace)],
+          [true, ['amazon.com'], ['amazon.ca']]);
+    check('老服务端/混合队列: 加拿大条目留在队列里', chromeState.store.queue.map((q) => q.asin), ['B0SKEW0004']);
+
+    reset({ zipCode: '10001' });
+    fetchState.respond = oldServerRespond;
+    await send({ type: 'START_RUN', tabId: 11, kind: 'list', maxPages: 3, pageUrl: 'https://www.amazon.ca/s?k=x' });
+    r = await send({ type: 'PAGE_COLLECTED', asins: ['B0SKEW0005'], hasNext: true,
+                     pageUrl: 'https://www.amazon.ca/s?k=x' }, { tab: { id: 11 } });
+    check('老服务端/加拿大翻页: 第一页就停', [r.next, r.reason], ['stop', 'push_failed']);
+    checkTrue('老服务端/加拿大翻页: run 上留着原因', /服务端没有按 amazon\.ca 建任务/.test(chromeState.store.activeRun.lastError || ''),
+              chromeState.store.activeRun.lastError);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

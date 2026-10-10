@@ -84,9 +84,9 @@ async function setSettings(patch) {
 
 async function getQueue() {
   const stored = await chrome.storage.local.get('queue');
-  // v1.1.0 存下来的条目没有 marketplace —— 读出来时就补上（按条目的 url 推，
-  // 见 page.js 的 resolveMarketplace）。下游（去重键、按站点分组、popup 上的
-  // 站点标记）于是只需要认一种形状。
+  // v1.1.0 存下来的条目没有 marketplace —— 读出来时就补上：一律美国站
+  // （v1.1.0 推什么都是美国站，见 page.js storedMarketplace）。下游（去重键、
+  // 按站点分组、popup 上的站点标记）于是只需要认一种形状。
   return (stored.queue || []).map((q) =>
     (q && q.marketplace) ? q : { ...q, marketplace: P.queueItemMarketplace(q) });
 }
@@ -195,7 +195,7 @@ async function callServer(path, { method = 'GET', body = null } = {}) {
 async function pushCollect({ asins = [], sellerIds = [], batchName = null, source = 'extension', pageUrl = '', marketplace = null }) {
   const settings = await getSettings();
   const mkt = P.resolveMarketplace(marketplace, pageUrl);
-  return callServer('/api/extension/collect', {
+  const result = await callServer('/api/extension/collect', {
     method: 'POST',
     body: {
       batch_name: batchName,
@@ -209,6 +209,33 @@ async function pushCollect({ asins = [], sellerIds = [], batchName = null, sourc
       page_url: pageUrl,
     },
   });
+  // 美国站不核对：老服务端、新服务端对美国站的回包都不带 marketplace（v1.1.0 的形状）。
+  if (mkt !== P.DEFAULT_MARKETPLACE) assertServerKeptSite(result, mkt);
+  return result;
+}
+
+/**
+ * 非美国站推送之后核对：服务端真的按这个站点建了批次吗？
+ *
+ * 插件比服务端新（插件 1.2.0、服务端还是 F-012 之前的版本）时会**静默**出错：
+ * 老服务端不认 `marketplace` 字段，照样回 200，建的却是美国站任务、带美国默认
+ * 邮编 —— worker 去 amazon.com 采加拿大的 ASIN，popup 还显示"已推送（amazon.ca）"。
+ * 认这个字段的服务端对非美国站的 `asin_batch` / `seller_batch` 都回显
+ * `marketplace`（server/api/extension.py），没回显或对不上 = 服务端没按这个站点建。
+ *
+ * 到这一步批次已经建了（只能事后发现），所以报错要点名是哪几个批次、该怎么收拾。
+ * 抛错让各条推送路径都按"失败"处理：单页采集弹错、翻页停下、队列里那一组留着。
+ */
+function assertServerKeptSite(result, mkt) {
+  const wrong = ['asin_batch', 'seller_batch']
+    .map((k) => result && result[k])
+    .filter((b) => b && b.marketplace !== mkt)
+    .map((b) => `${b.batch_name}（${b.marketplace || 'amazon.com'}）`);
+  if (!wrong.length) return;
+  throw new Error(
+    `服务端没有按 ${mkt} 建任务（多半是服务端版本过旧、不认 marketplace 字段）：` +
+    `批次 ${wrong.join('、')} 已经建成了别的站点的任务。` +
+    '请先升级服务端，到控制台删掉这些批次，再重新推送。');
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -255,8 +282,9 @@ const handlers = {
 
   async ADD_TO_QUEUE({ item }) {
     const queue = await getQueue();
-    // 站点在入队时就钉死在条目上（popup 给的是页面识别出的站点，没给就按 url 推）
-    const it = { ...item, marketplace: P.queueItemMarketplace(item) };
+    // 站点在入队时就钉死在条目上：popup 给的是页面识别出的站点，没给就按
+    // 这一页的 url 推。之后它就是"存下来的数据"，只认这个字段。
+    const it = { ...item, marketplace: P.resolveMarketplace(item.marketplace, item.url) };
     // 去重键是 (asin, 站点)：同一个 ASIN 的美国站与加拿大站是两条，见 page.js sameQueueItem
     const idx = queue.findIndex((q) => P.sameQueueItem(q, it));
     if (idx >= 0) {
@@ -307,9 +335,14 @@ const handlers = {
    * (batch_id, asin)，下游按任务行的站点取数据），混着推服务端会 409。
    * 只有美国站条目时，行为与 v1.1.0 相同：一次推送、批次名 `ext_queue_<时间戳>`。
    *
-   * 中途某一组失败：**已推成功的组从队列里移除，失败的及之后的组留着**，
-   * 再把错误抛给 popup。全留着的话重试会把成功的那组再推进一个新批次
-   * （批次名带时间戳，每次都不同），全清掉的话失败的那组就丢了。
+   * 某一组推送失败：**那一组留在队列里，接着推下一组**，最后一起报告。
+   * 不能停在失败的那组：服务端拒掉一个站点（amazon.de 等不支持的站点）就把
+   * 别的站点 —— 包括美国站 —— 一起堵住，用户得先找出那条删掉才提交得出去，
+   * 而 v1.1.0 里同一个队列一次就能提交成功。推成功的组立刻移出队列：留着的话
+   * 重试会把它再推进一个新批次（批次名带时间戳，每次都不同）。
+   *
+   * 返回 `{ results, failures, submitted, sellers }`。一组都没推成才抛错；
+   * 只有一组时错误就是服务端原话（纯美国站队列失败时与 v1.1.0 一字不差）。
    */
   async SUBMIT_QUEUE() {
     const queue = await getQueue();
@@ -322,6 +355,7 @@ const handlers = {
     }));
 
     const results = [];
+    const failures = [];
     let submitted = 0;
     let sellers = 0;
     for (const plan of plans) {
@@ -340,11 +374,8 @@ const handlers = {
           marketplace: plan.mkt,
         });
       } catch (e) {
-        if (!results.length) throw e;
-        const done = results.map((r) => `${r.marketplace} -> ${r.result?.asin_batch?.batch_name || '?'}`);
-        throw new Error(
-          `已提交 ${done.join('、')}；${plan.mkt} 这一组推送失败，` +
-          `它和后面的条目仍留在队列里：${e.message}`);
+        failures.push({ marketplace: plan.mkt, count: asins.length, error: e.message });
+        continue;
       }
 
       // 只移除推成功的这一组。重新读一次队列而不是拿开头那份：推送期间
@@ -356,7 +387,8 @@ const handlers = {
       submitted += asins.length;
       sellers += sellerIds.length;
     }
-    return { results, submitted, sellers };
+    if (!results.length) throw new Error(describeFailures(failures));
+    return { results, failures, submitted, sellers };
   },
 
   /**
@@ -374,28 +406,36 @@ const handlers = {
     // 按站点分开问：同一个 ASIN 在美国站和加拿大站可以是不同的卖家。
     // 混在一起问的话，加拿大条目会拿到美国卖家，再拿它去建加拿大站的
     // 整店任务 —— 翻的是另一个国家的店铺，而界面上一切正常。
+    //
+    // 某个站点问失败了（比如服务端不支持那个站点）就记下来、接着问下一组，
+    // 理由同 SUBMIT_QUEUE：一个被拒的站点不能把美国站条目的补全也堵死。
+    const groups = P.groupByMarketplace(unknown);
+    const failures = [];
     let resolved = 0;
-    try {
-      for (const [mkt, items] of P.groupByMarketplace(unknown)) {
-        const data = await callServer('/api/extension/resolve-sellers', {
+    for (const [mkt, items] of groups) {
+      let data;
+      try {
+        data = await callServer('/api/extension/resolve-sellers', {
           method: 'POST',
           body: { asins: items.map((q) => q.asin), marketplace: mkt },
         });
-        const found = data.sellers || {};
-        for (const item of items) {   // items 里的对象就是 queue 里的那些，原地补
-          if (!item.sellerId && found[item.asin]) {
-            item.sellerId = found[item.asin].seller_id;
-            item.sellerName = found[item.asin].seller_name || item.sellerName;
-            resolved += 1;
-          }
+      } catch (e) {
+        failures.push({ marketplace: mkt, count: items.length, error: e.message });
+        continue;
+      }
+      const found = data.sellers || {};
+      for (const item of items) {   // items 里的对象就是 queue 里的那些，原地补
+        if (!item.sellerId && found[item.asin]) {
+          item.sellerId = found[item.asin].seller_id;
+          item.sellerName = found[item.asin].seller_name || item.sellerName;
+          resolved += 1;
         }
       }
-    } finally {
-      // 某个站点问失败了（比如服务端不支持那个站点）也把已经补上的存下来，
-      // 再把错误交给 popup —— 不能因为一组失败把别的组的结果也丢掉。
-      await setQueue(queue);
     }
-    return { resolved, queue };
+    // 一组都没问成：与 v1.1.0 一样直接报错，队列原样不动。
+    if (failures.length === groups.length) throw new Error(describeFailures(failures));
+    await setQueue(queue);
+    return { resolved, queue, failures };
   },
 
   // ---------- 单页采集（不翻页）----------
@@ -503,7 +543,7 @@ const handlers = {
           source: run.kind,
           pageUrl,
           // 用 run 的站点而不是这一页的：两者已经由上面那道闸保证相同，
-          // 而 v1.1.0 存下来的 run 没有 marketplace 字段，要按 startUrl 推。
+          // 而 v1.1.0 存下来的 run 没有 marketplace 字段（= 美国站）。
           marketplace: P.runMarketplace(run),
         });
         // 记的是 `inserted_tasks`（**真正新建的任务数**），不是这一页读到的
@@ -546,9 +586,22 @@ const handlers = {
 async function stopForSiteChange(run, pageUrl) {
   run.active = false;
   run.finishedReason = 'marketplace_changed';
-  run.lastError = `本次翻页属于 ${P.runMarketplace(run)}，` +
-    `标签页切到了 ${P.marketplaceFromUrl(pageUrl)}`;
+  // 升级前开始的翻页没有站点字段、按美国站算（它前面那些页也确实推成了美国站），
+  // 在加拿大页面上开始的老翻页会停在这里 —— 点明原因，免得看着像插件认错了站点。
+  run.lastError = `本次翻页属于 ${P.runMarketplace(run)}` +
+    (run.marketplace ? '' : '（升级插件前开始的翻页一律按美国站算）') +
+    `，标签页切到了 ${P.marketplaceFromUrl(pageUrl)}`;
   await setRun(run);
+}
+
+/**
+ * 按站点分组的请求一组都没成功时的报错。只有一组就是那一组的原话（纯美国站
+ * 队列与 v1.1.0 一字不差）；多组就逐个站点列出来，并说清楚条目都还在队列里。
+ */
+function describeFailures(failures) {
+  if (failures.length === 1) return failures[0].error;
+  return '全部失败，条目都还在队列里：' +
+    failures.map((f) => `${f.marketplace}（${f.count} 条）：${f.error}`).join('；');
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {

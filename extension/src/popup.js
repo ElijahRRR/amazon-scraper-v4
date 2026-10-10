@@ -405,15 +405,18 @@ async function doSubmitQueue() {
       if (sb) msg += `；另建卖家批次 ${sb.batch_name}，${sb.inserted_tasks} 个整店发现任务`;
       return msg;
     });
-    status(lines.join('\n'), 'ok');
-    const q = await bg('GET_QUEUE');   // 推送期间又加进来的条目还在，照实显示
+    // 部分站点没推成（比如服务端不支持 amazon.de）：别的站点照样推了，
+    // 没推成的那组还在队列里 —— 两件事都要说，而且整体按"有错"显示。
+    const failed = r.failures || [];
+    for (const f of failed) {
+      lines.push(`${f.marketplace} 的 ${f.count} 个商品没提交上，仍留在队列里：${f.error}`);
+    }
+    status(lines.join('\n'), failed.length ? 'err' : 'ok');
+    const q = await bg('GET_QUEUE');   // 推送期间又加进来的条目、没推成的组都还在，照实显示
     renderQueue(q.queue || []);
   } catch (e) {
     status(e.message, 'err');
     $('submitQueue').disabled = false;
-    // 按站点分组推送时可能已经推成功了几组（它们已从队列移除），刷新一下
-    const q = await bg('GET_QUEUE');
-    if (q.ok) renderQueue(q.queue || []);
   }
 }
 
@@ -521,10 +524,13 @@ $('resolveSellers').addEventListener('click', async () => {
     renderQueue(r.queue);
     // 补不上就如实说"补不上"，不含糊。服务端只回库里真有的 —— 查不到
     // 就是这些 ASIN 还没被采过，不是出了错。
-    status(r.resolved
+    let msg = r.resolved
       ? `补全了 ${r.resolved} 条的卖家，现在可以在队列里勾"整店"了`
-      : '没有可补全的：这些 ASIN 服务端还没采过，所以库里也没有卖家信息',
-      r.resolved ? 'ok' : 'busy');
+      : '没有可补全的：这些 ASIN 服务端还没采过，所以库里也没有卖家信息';
+    // 按站点分开问（F-012），某个站点没问成不影响别的站点，但要照实说
+    const failed = r.failures || [];
+    for (const f of failed) msg += `\n${f.marketplace} 的 ${f.count} 条没问成：${f.error}`;
+    status(msg, failed.length ? 'err' : (r.resolved ? 'ok' : 'busy'));
   } catch (e) {
     status(e.message, 'err');
     $('resolveSellers').disabled = false;
