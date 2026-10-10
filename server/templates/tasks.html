@@ -12,17 +12,26 @@
     <div class="card-body">
         <form id="uploadForm" enctype="multipart/form-data">
             <div class="row g-3 mb-3">
-                <div class="col-md-4">
+                <div class="col-md-3">
                     <label class="form-label">批次名称（可选）</label>
                     <input type="text" class="form-control" name="batch_name" placeholder="自动生成">
                 </div>
-                <div class="col-md-4">
+                <div class="col-md-3">
+                    <label class="form-label">站点</label>
+                    {# 选项来自服务端站点注册表（pages.py），这里不写第二份站点表 #}
+                    <select class="form-select" name="marketplace" id="upMarketplace" autocomplete="off">
+                        {% for id, label, postal in marketplaces %}
+                        <option value="{{ id }}" data-postal="{{ postal }}"{{ ' selected' if id == default_marketplace }}>{{ label }}（{{ id }}）</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="col-md-3">
                     <label class="form-label">配送邮编</label>
-                    <input type="text" class="form-control" name="zip_code"
+                    <input type="text" class="form-control" name="zip_code" id="upZip" autocomplete="off"
                            value="{{ default_zip_code }}" placeholder="10001">
                     <small class="text-secondary">可在系统设置中修改默认值</small>
                 </div>
-                <div class="col-md-4">
+                <div class="col-md-3">
                     <label class="form-label">ASIN 文件</label>
                     <input type="file" class="form-control" name="file" accept=".xlsx,.xls,.csv,.txt" required>
                 </div>
@@ -291,6 +300,28 @@
 
 {% block extra_js %}
 <script>
+// F-012 blocker 3：站点切换时同步邮编框。站点表只有一份 —— 上传表单站点下拉
+// 那几个由服务端注册表渲染的 <option>（data-postal = 该站点默认邮编），这里只读它。
+const SERVER_DEFAULT_ZIP = String({{ default_zip_code|tojson }} ?? '');  // 与输入框 value 同形（字符串）
+const DEFAULT_MKT = {{ default_marketplace|tojson }};
+const SITE_POSTAL = Object.fromEntries(
+    [...document.getElementById('upMarketplace').options].map(o => [o.value, o.dataset.postal]));
+
+// 框里还是「预填的全局默认」或「某个站点的默认邮编」= 用户没动过，跟着站点换：
+// 切到美国站填回全局默认（与改造前一致），切到别的站点清空 —— 美国邮编送去
+// 加拿大站必 400，留空则服务端用该站点自己的默认。用户自己填的值不碰。
+function applySiteZip(input, mktId) {
+    if (!SITE_POSTAL[mktId]) mktId = DEFAULT_MKT;
+    const v = input.value.trim();
+    if (v === '' || v === SERVER_DEFAULT_ZIP || Object.values(SITE_POSTAL).includes(v)) {
+        input.value = (mktId === DEFAULT_MKT) ? SERVER_DEFAULT_ZIP : '';
+    }
+    input.placeholder = SITE_POSTAL[mktId];
+}
+document.getElementById('upMarketplace').addEventListener('change', (e) => {
+    applySiteZip(document.getElementById('upZip'), e.target.value);
+});
+
 document.getElementById('uploadForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const btn = document.getElementById('uploadBtn');
@@ -316,6 +347,11 @@ document.getElementById('uploadForm').addEventListener('submit', async (e) => {
             alertDiv.className = 'alert alert-success';
             alertDiv.append('✅ 上传成功！批次: ', batchSpan,
                 `，共 ${parseInt(data.total_asins)} 个 ASIN，插入 ${parseInt(data.inserted)} 个任务`);
+            // 非美国站批次服务端才回显 marketplace；B 列邮编按站点校验，不合格的行
+            // 退回批次邮编 —— 不提示的话，填错站点的那一列邮编就无声无息地没生效。
+            if (data.marketplace) alertDiv.append(`，站点 ${data.marketplace}`);
+            const badZip = parseInt(data.invalid_zip_rows) || 0;
+            if (badZip > 0) alertDiv.append(`（${badZip} 行 B 列邮编不符合该站点形状，已改用批次邮编）`);
             resultDiv.appendChild(alertDiv);
             setTimeout(() => location.reload(), 1500);
         } else {
@@ -455,6 +491,10 @@ async function loadSearchOptions(domain) {
 
 document.getElementById('kwDomain').addEventListener('change', (e) => {
     loadSearchOptions(e.target.value);
+    // 同一个邮编陷阱：站点切到加拿大、框里还是预填的美国邮编 -> 服务端 400。
+    // kwDomain 的值是带 www. 的主机名，去掉 www. 才是站点键；不在站点注册表里的站点只能
+    // discover_only，服务端按美国站校验邮编，applySiteZip 对它同样回落美国站。
+    applySiteZip(document.getElementById('kwZip'), e.target.value.replace(/^www\./, ''));
 });
 loadSearchOptions();
 

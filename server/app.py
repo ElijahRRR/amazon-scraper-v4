@@ -882,26 +882,36 @@ async def _auto_scrape_scheduler():
                     except ValueError:
                         pass
 
-                # 获取 ASIN 列表：优先从文件，否则全库
+                # F-012 blocker 3：站点（存储值每次重新校验，见 _schedule_spec）。
+                # 不合法 -> 记日志、只跳过**这一条**。绝不能让它抛出去：外层只有
+                # 一个 try 包着整个 for，抛出去等于本轮排在它后面的定时任务全部不跑。
+                # 也必须在 create_batch 之前，否则每 60 秒留下一个空批次。
+                try:
+                    spec = _schedules_api._schedule_spec(sched)
+                except HTTPException as e:
+                    logger.error(f"定时任务站点非法，本轮跳过: {e.detail}")
+                    continue
+
+                # 获取 ASIN 列表：优先从文件，否则全库（= 本定时任务那个站点的全库）
                 source_file = sched.get("source_file", "")
                 if source_file and os.path.isfile(source_file):
                     asins = _extract_asins_from_file(source_file)
                 else:
-                    asins = await db.get_all_asins()
+                    asins = await db.get_all_asins(marketplace=spec.id)
 
                 if not asins:
                     continue
 
-                sched_name = sched.get("name", "task")
                 # P4.7：**分钟 -> 秒**（有意的行为改动，见 _batch_name 的 docstring）。
                 # 分钟精度下「同一分钟内自动 + 手动触发同一个定时任务」会撞名，
                 # 而撞名不是 no-op：create_batch 返回既有批次 id，新 ASIN 被
-                # 悄悄塞进上一个批次。
-                batch_name = _batch_name(f"auto_{sched_name}")
-                zc = _runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE)
+                # 悄悄塞进上一个批次。前缀 / 邮编与「立即执行」共用同一组函数
+                # （美国站与改造前一字不差，见 server/api/schedules.py）。
+                batch_name = _batch_name(_schedules_api._auto_batch_prefix(sched, spec))
+                zc = _schedules_api._schedule_zip(sched, spec)
                 ns = sched.get("needs_screenshot", False)
                 batch_id = await db.create_batch(batch_name, ns, is_auto=True)
-                await db.create_tasks(batch_id, asins, zc, ns)
+                await db.create_tasks(batch_id, asins, zc, ns, marketplace=spec.id)
                 sched["last_run_date"] = today
                 changed = True
                 logger.info(f"自动采集已调度: {batch_name}, {len(asins)} ASINs (间隔{interval}天)")
@@ -1129,6 +1139,20 @@ def _site_default_zip(spec: "_marketplace.MarketplaceSpec") -> str:
     if spec.id == _marketplace.DEFAULT_MARKETPLACE:
         return zc
     return _normalize_zip(zc, spec.id) or spec.default_postal
+
+
+def _site_zip_error(raw, spec: "_marketplace.MarketplaceSpec") -> HTTPException:
+    """调用方给的邮编不符合该站点形状时的 400（F-012 blocker 3）。
+
+    报错原文与 ``server/api/searches.py`` 关键词批次那句同口径：带上站点名和
+    一个合法示例。只说「非法邮编」的话，一个往加拿大站批次里填了 ``10001``
+    的用户看不出错在哪 —— 那是个完全合法的美国邮编。
+
+    返回而不是直接 raise，是让调用点写成 ``raise _s._site_zip_error(...)``，
+    读代码的人在调用点就能看到这里会中断。
+    """
+    return HTTPException(
+        400, f"非法邮编: {raw!r}（{spec.label}需要 {spec.default_postal!r} 这种形状）")
 
 
 def _safe_fs_component(name: str) -> Optional[str]:
