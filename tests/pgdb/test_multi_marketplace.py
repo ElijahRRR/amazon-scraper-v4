@@ -230,3 +230,181 @@ async def test_event_stream_accepts_and_preserves_the_marketplace(pgdb):
     assert mine[0]["marketplace"] == "amazon.ca"
     # 提交体里那一份也必须是加拿大站：relay 落库时读的就是它。
     assert mine[0]["result"]["marketplace"] == "amazon.ca"
+
+
+# ================================================================== 批次读写路径（blocker 3）
+#
+# 与 tests/test_results_marketplace.py 同一组场景的 PG 孪生（那边走 HTTP、跟着
+# DB_BACKEND 跑；这里直接调库，只在 PG 上跑）。批次 -> 站点的唯一真源是 tasks 行，
+# 批次读写路径必须按它钉住 asin_data 的站点。
+
+_X, _Y, _Z = "B0DUPE0001", "B0USONLY02", "B0CAONLY03"
+_CA, _US, _CA_ZIP = "amazon.ca", "amazon.com", "M5V 3L9"
+
+
+async def _batch(db, name, asins, *, marketplace=None, zip_code="10001",
+                 needs_screenshot=False, expand_variants=False):
+    bid = await db.create_batch(name, needs_screenshot, expand_variants=expand_variants)
+    await db.create_tasks(bid, asins, zip_code, needs_screenshot, marketplace=marketplace)
+    return bid
+
+
+async def _pulled(db, worker_id):
+    return {t["asin"]: t for t in await db.pull_tasks(worker_id, 50)}
+
+
+async def _accept(db, task, worker_id, price, marketplace="<omit>", **extra):
+    data = _payload(task["asin"], marketplace=marketplace, price=price)
+    if marketplace == "<omit>":
+        del data["marketplace"]                 # 老 worker：根本不交这个键
+    data.update(extra)
+    return await db.accept_success_result(task["id"], worker_id, task["lease_epoch"],
+                                          data, task["batch_id"])
+
+
+async def _two_sites(db, needs_screenshot=False):
+    """us_b=[X,Y] 美国站采齐；ca_b=[X,Y,Z] 加拿大站只采到 X、Z（Y 处理中）。"""
+    us = await _batch(db, "us_b", [_X, _Y], needs_screenshot=needs_screenshot)
+    t = await _pulled(db, "w-us")
+    await _accept(db, t[_X], "w-us", "$10.00", variation_asins=f"{_X},B0USFAM001")
+    await _accept(db, t[_Y], "w-us", "$20.00")
+    ca = await _batch(db, "ca_b", [_X, _Y, _Z], marketplace=_CA, zip_code=_CA_ZIP,
+                      needs_screenshot=needs_screenshot)
+    t = await _pulled(db, "w-ca")
+    await _accept(db, t[_X], "w-ca", "$13.50", marketplace=_CA)
+    await _accept(db, t[_Z], "w-ca", "$30.00", marketplace=_CA)
+    return us, ca
+
+
+def _keys(items):
+    return sorted((i["asin"], i["marketplace"]) for i in items)
+
+
+async def test_batch_results_are_pinned_to_the_task_site(pgdb):
+    us, ca = await _two_sites(pgdb)
+    for kw in ({}, {"change_filter": "new"}, {"search": "B0"},
+               {"search": "B0DUPE,B0CAONLY"}):        # 最后一个走 bset CTE
+        got = await pgdb.get_results(batch_id=ca, **kw)
+        assert _keys(got["items"]) == sorted([(_X, _CA), (_Z, _CA)]), kw
+        assert got["total"] == 2, kw
+        got = await pgdb.get_results(batch_id=us, **kw)
+        want = ([(_X, _US)] if kw.get("search") == "B0DUPE,B0CAONLY"
+                else sorted([(_X, _US), (_Y, _US)]))
+        assert _keys(got["items"]) == want, kw
+
+
+async def test_batch_export_has_one_row_per_batch_asin_for_any_page_size(pgdb):
+    us, ca = await _two_sites(pgdb)
+    for bid, want in ((us, [(_X, _US), (_Y, _US)]),
+                      (ca, [(_Z, _CA), (_X, _CA), (_Y, None)])):   # ba.asin 升序
+        for bs in (1, 2, 500):
+            got = [(r["asin"], r["marketplace"])
+                   async for r in pgdb.iter_results(bid, batch_size=bs)]
+            assert got == want, (bid, bs)
+
+
+async def test_result_by_asin_prefers_the_us_row(pgdb):
+    await _two_sites(pgdb)
+    assert (await pgdb.get_result_by_asin(_X))["marketplace"] == _US
+    assert (await pgdb.get_result_by_asin(_X, marketplace=_CA))["current_price"] == "$13.50"
+    assert (await pgdb.get_result_by_asin(_Z))["marketplace"] == _CA   # 加拿大独有仍返回
+    assert await pgdb.get_result_by_asin(_Y, marketplace=_CA) is None
+    with pytest.raises(ValueError):
+        await pgdb.get_result_by_asin(_X, marketplace="amazon.xx")
+
+
+async def test_screenshots_do_not_cross_sites(pgdb):
+    us, ca = await _two_sites(pgdb, needs_screenshot=True)
+    assert await pgdb.update_screenshot_status(_X, us, "done", "/p/us.png") is True
+    rows = await _rows(pgdb, "SELECT marketplace, screenshot_path FROM asin_data "
+                             "WHERE asin = ? ORDER BY marketplace", (_X,))
+    assert rows == [{"marketplace": _CA, "screenshot_path": None},
+                    {"marketplace": _US, "screenshot_path": "/p/us.png"}]
+    # 读路径的兜底也按站点：加拿大行不借美国截图
+    assert await pgdb._get_done_screenshot_paths([_X], marketplace=_CA) == {}
+    assert await pgdb._get_done_screenshot_paths([_X], marketplace=_US) == {_X: "/p/us.png"}
+    assert (await pgdb.get_result_by_asin(_X, marketplace=_CA))["screenshot_path"] is None
+    assert await pgdb.update_screenshot_status(_X, ca, "done", "/p/ca.png") is True
+    rows = await _rows(pgdb, "SELECT marketplace, screenshot_path FROM asin_data "
+                             "WHERE asin = ? ORDER BY marketplace", (_X,))
+    assert rows == [{"marketplace": _CA, "screenshot_path": "/p/ca.png"},
+                    {"marketplace": _US, "screenshot_path": "/p/us.png"}]
+
+
+async def test_variant_expansion_stays_on_the_batch_site(pgdb):
+    await _two_sites(pgdb)                               # 美国 X 的家族：B0USFAM001
+    ca = await _batch(pgdb, "ca_fam", [_X], marketplace=_CA, zip_code=_CA_ZIP,
+                      expand_variants=True)
+    t = (await _pulled(pgdb, "w-fam"))[_X]
+    # 加拿大行没有家族：不许借美国家族
+    await _accept(pgdb, t, "w-fam", "$13.50", marketplace=_CA)
+    assert await pgdb.expand_batch_variants(ca) == 0
+    # 加拿大行有了自己的家族：只展开它，兄弟款带同一条任务行的站点与邮编
+    await pgdb.save_result({**_payload(_X, marketplace=_CA, price="$13.50"),
+                            "variation_asins": f"{_X},B0CAFAM001"})
+    assert await pgdb.expand_batch_variants(ca) == 1
+    rows = await _rows(pgdb, "SELECT asin, zip_code, marketplace FROM tasks "
+                             "WHERE batch_id = ? ORDER BY id", (ca,))
+    assert rows == [{"asin": _X, "zip_code": _CA_ZIP, "marketplace": _CA},
+                    {"asin": "B0CAFAM001", "zip_code": _CA_ZIP, "marketplace": _CA}]
+    assert await pgdb.expand_batch_variants(ca) == 0     # 收敛
+
+
+async def test_old_worker_cannot_write_a_ca_task_into_the_us_row(pgdb):
+    await _two_sites(pgdb)
+    ca = await _batch(pgdb, "ca_old", [_X], marketplace=_CA, zip_code=_CA_ZIP)
+    t = (await _pulled(pgdb, "w-old"))[_X]
+    before = await _rows(pgdb, "SELECT marketplace, current_price FROM asin_data "
+                               "WHERE asin = ? ORDER BY marketplace", (_X,))
+    res = await _accept(pgdb, t, "w-old", "$99.99")              # 不带 marketplace
+    assert res == {"accepted": True, "saved": False, "server_reject": True}
+    assert await _rows(pgdb, "SELECT marketplace, current_price FROM asin_data "
+                             "WHERE asin = ? ORDER BY marketplace", (_X,)) == before
+    task = (await _rows(pgdb, "SELECT status, error_type, error_detail FROM tasks "
+                              "WHERE id = ?", (t["id"],)))[0]
+    assert task == {"status": "failed", "error_type": "server_reject",
+                    "error_detail": "marketplace_mismatch task=amazon.ca payload=amazon.com"}
+    # 批量提交同一条规则
+    await pgdb.create_tasks(ca, [_Z], _CA_ZIP, marketplace=_CA)
+    t2 = (await _pulled(pgdb, "w-old2"))[_Z]
+    data = _payload(_Z, marketplace=_US, price="$1.00")
+    res = await pgdb.accept_results_batch([{
+        "task_id": t2["id"], "worker_id": "w-old2", "lease_epoch": t2["lease_epoch"],
+        "batch_id": ca, "data": data, "success": True}])
+    assert res == {"accepted": 0, "stale": 0, "failed": 1}
+    assert (await pgdb.get_result_by_asin(_Z, marketplace=_US)) is None
+
+
+async def test_old_worker_rejection_event_is_attributed_to_the_task_site(pgdb):
+    """拒收也是一次终态尝试，进事件流；分组键的站点按**任务行**记（服务端赢）。"""
+    import json
+
+    ca = await _batch(pgdb, "ca_ev", [_X], marketplace=_CA, zip_code=_CA_ZIP)
+    t = (await _pulled(pgdb, "w-ev"))[_X]
+    await _accept(pgdb, t, "w-ev", "$99.99")
+    rows = await pgdb._write_conn.fetch(
+        "SELECT body FROM scraper.scrape_outbox ORDER BY id")
+    bodies = [json.loads(r["body"]) if isinstance(r["body"], str) else r["body"]
+              for r in rows]
+    mine = [b for b in bodies if b.get("task_id") == t["id"]]
+    assert len(mine) == 1, bodies
+    assert mine[0]["outcome"] == "parse_failed"
+    assert mine[0]["error_type"] == "server_reject"
+    assert mine[0]["marketplace"] == _CA
+    assert mine[0]["batch_id"] == ca
+
+
+async def test_search_batch_takes_the_marketplace_from_the_caller(pgdb):
+    """HTTP 边界解析过站点就显式传下来，库层不再按 domain 推导（UI-5）。"""
+    params = searchurl.normalize_search_params({"domain": "www.amazon.de"})
+    bid, n = await pgdb.create_search_batch(
+        name="kw_de", keywords=["usb hub"], search_params=params,
+        discover_mode="discover_only", marketplace=_US)
+    assert n == 1
+    assert (await _rows(pgdb, "SELECT marketplace FROM tasks WHERE batch_id = ?",
+                        (bid,))) == [{"marketplace": _US}]
+    # 不传：老行为（按 domain 推导；注册表外的站点照旧 ValueError）
+    with pytest.raises(ValueError):
+        await pgdb.create_search_batch(name="kw_de2", keywords=["usb hub"],
+                                       search_params=params,
+                                       discover_mode="discover_only")

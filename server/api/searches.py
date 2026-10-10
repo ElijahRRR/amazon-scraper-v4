@@ -169,6 +169,10 @@ async def api_create_search_batch(request: Request):
 
     needs_screenshot = bool(body.get("needs_screenshot", False))
 
+    # 站点**显式**传给库层，不让它再从 search_params['domain'] 推导一遍：
+    # 上面对注册表之外的 16 个搜索站点有意放行了 discover_only（站点落到美国），
+    # 库层再推导会对它们抛 ValueError —— 这里放行的请求在库层变成 500。
+    # 站点只认这一处解析的结果，两层不可能各说各的。
     batch_id, inserted = await _s.db.create_search_batch(
         name=batch_name,
         keywords=keywords,
@@ -176,6 +180,7 @@ async def api_create_search_batch(request: Request):
         discover_mode=discover_mode,
         zip_code=zc,
         needs_screenshot=needs_screenshot,
+        marketplace=mkt.id,
     )
     if not batch_id:
         raise HTTPException(500, "创建关键词批次失败")

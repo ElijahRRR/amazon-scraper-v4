@@ -10,7 +10,7 @@ OWNS（6 个方法）:
 
 依赖别人:
     tasks.py   -> fail_task(...)
-    media.py   -> _get_done_screenshot_path(asin, batch_id)
+    media.py   -> _get_done_screenshot_path(asin, batch_id, marketplace=...)
 
 --------------------------------------------------------------------------
 一、lease 门：逐字移植，不要"加固"
@@ -139,7 +139,7 @@ from common.core.timeutil import now_ts
 # F-012：站点注册表。按模块导入（而不是 `from ... import get`）——
 # `get` 这个名字在本模块里太容易和 dict.get 混起来，读的人会看错。
 from common.core import marketplace as _marketplace
-from typing import List
+from typing import List, Optional, Tuple
 
 from common.pgdb._shared import (  # noqa: F401
     ASIN_DATA_FIELDS,
@@ -233,6 +233,47 @@ NOT_FOUND_PRESERVED_FIELDS = frozenset(
     })
 
 
+# ==========================================================================
+# F-012 MISS-01：提交体的站点必须与任务行一致（混合机队的防线）
+# ==========================================================================
+# 灰度期一定有「新 server + 老 worker」的窗口（见上面 P4-3 第 1 条）。F-012 之前
+# 的 worker **不认识** tasks.marketplace：它拉到一条加拿大任务，照样去 amazon.com
+# 采，提交体里也没有 marketplace 键 —— 而 `_save_result_inner_unlocked` 对缺键
+# 的兜底是美国站（那是为了兼容老 worker 采美国任务）。于是这一页美国数据会
+# **覆盖 asin_data 里真的美国行**，加拿大任务还被标成 done，两侧都不报错。
+#
+# 所以在租约门之后、写库之前比一次：提交体的站点（缺键 -> 美国站，与写入路径
+# 同一个口径）≠ 任务行的站点 -> 不写 asin_data，任务按 server_reject 判失败，
+# error_detail 写清两个站点（运维据此找出还没升级的 worker）。
+#
+# 美国任务 + 老 worker（不交这个键）：两边都是 amazon.com，路径与改动前完全相同
+# （golden 的结果提交步骤钉着）。
+# 不认识的站点：`_marketplace.get` 照旧抛 ValueError —— 与写入路径里那条
+# 「故意不兜底」是同一个异常、同一个时机之前，整条提交失败的行为不变。
+#
+# ⚠ 读 tasks.marketplace 是租约 UPDATE 之后**另发**的一条 PK 读（同一事务、
+#   写连接）。**不许**改成给租约 UPDATE 加 RETURNING：那会让 rowcount 变成 -1、
+#   租约门永远放行（文件头 §五 的红线）。
+# ⚠ 不动 pull_tasks（热查询）：「老 worker 别拉加拿大任务」要靠 worker 声明能力，
+#   那是另一条改动；这里只保证拉错了也写不坏数据。
+
+async def _marketplace_mismatch(db, task_id, data) -> Tuple[str, str, Optional[str]]:
+    """(task_mkt, payload_mkt, error_detail)；一致时 error_detail 为 None。
+
+    error_detail 的格式与 SQLite 侧（common/database.py）逐字一致。
+    """
+    payload_mkt = _marketplace.get(data.get("marketplace")).id
+    async with db._db.execute(
+        "SELECT marketplace FROM tasks WHERE id = ?", (task_id,)
+    ) as c:
+        row = await c.fetchone()
+    task_mkt = (row["marketplace"] if row else None) or _marketplace.DEFAULT_MARKETPLACE
+    if task_mkt == payload_mkt:
+        return task_mkt, payload_mkt, None
+    return (task_mkt, payload_mkt,
+            f"marketplace_mismatch task={task_mkt} payload={payload_mkt}")
+
+
 class ResultsWriteMixin:
     """只定义方法，绝不定义 __init__。"""
 
@@ -296,6 +337,35 @@ class ResultsWriteMixin:
                         data=data, batch_id=batch_id,
                         error_type="server_reject",
                         error_detail="parse_failure_on_server",
+                        **(ev.as_kwargs() if ev is not None else {}))
+                    await self._db.execute("COMMIT")
+                    return {"accepted": True, "saved": False, "server_reject": True}
+
+                # Step 2.5（F-012 MISS-01）：提交体的站点必须与任务行一致，
+                # 理由见模块级 _marketplace_mismatch 上方的注释。
+                task_mkt, _payload_mkt, mismatch = await _marketplace_mismatch(
+                    self, tid, data)
+                if mismatch:
+                    asin = data.get("asin", "")
+                    logger.warning(
+                        f"server_reject: {asin} {mismatch}（task_id={task_id} "
+                        f"worker={worker_id}，多半是还没升级到 F-012 的 worker）")
+                    await self._db.execute(
+                        "UPDATE tasks SET status='failed', error_type='server_reject', "
+                        "error_detail=? WHERE id=?",
+                        (mismatch, tid)
+                    )
+                    # 与 S2 同一个事务、同一种 outcome。事件的站点按**任务行**记：
+                    # 消费侧分组键 (asin, marketplace, zip_requested) 必须与 tasks 行
+                    # 对得上（同 relay 里 zip_requested「服务端赢」的口径），否则这次
+                    # 失败会落进一个不存在的 (美国站, 加拿大邮编) 组。提交体自称的
+                    # 站点留在 error_detail 里。
+                    await emit(
+                        self, outcome="parse_failed",
+                        asin=(asin.strip() if isinstance(asin, str) else asin),
+                        data={**data, "marketplace": task_mkt}, batch_id=batch_id,
+                        error_type="server_reject",
+                        error_detail=mismatch,
                         **(ev.as_kwargs() if ev is not None else {}))
                     await self._db.execute("COMMIT")
                     return {"accepted": True, "saved": False, "server_reject": True}
@@ -410,6 +480,31 @@ class ResultsWriteMixin:
                                 data=data, batch_id=batch_id,
                                 error_type="server_reject",
                                 error_detail="parse_failure_on_server",
+                                **(ev.as_kwargs() if ev is not None else {}))
+                            continue
+
+                        # F-012 MISS-01：提交体站点 ≠ 任务行站点 -> 不写 asin_data、
+                        # 任务按 server_reject 判失败。与单条提交（Step 2.5）同一条规则，
+                        # 事件同 B4（站点按任务行记，理由见单条提交那里）。
+                        task_mkt, _payload_mkt, mismatch = await _marketplace_mismatch(
+                            self, tid, data)
+                        if mismatch:
+                            await self._db.execute(
+                                "UPDATE tasks SET status='failed', error_type='server_reject', "
+                                "error_detail=? WHERE id=?",
+                                (mismatch, tid)
+                            )
+                            failed += 1
+                            _asin = data.get("asin", "")
+                            logger.warning(
+                                f"server_reject: {_asin} {mismatch}（task_id={task_id} "
+                                f"worker={worker_id}，多半是还没升级到 F-012 的 worker）")
+                            await emit(
+                                self, outcome="parse_failed",
+                                asin=(_asin.strip() if isinstance(_asin, str) else _asin),
+                                data={**data, "marketplace": task_mkt}, batch_id=batch_id,
+                                error_type="server_reject",
+                                error_detail=mismatch,
                                 **(ev.as_kwargs() if ev is not None else {}))
                             continue
 
@@ -600,7 +695,9 @@ class ResultsWriteMixin:
                 if row:
                     is_auto = bool(row[0])
 
-        resolved_screenshot_path = await self._get_done_screenshot_path(asin, batch_id)
+        # F-012：只认同站点的截图（否则加拿大行会继承美国批次的截图，反之亦然）。
+        resolved_screenshot_path = await self._get_done_screenshot_path(
+            asin, batch_id, marketplace=marketplace)
 
         # 只查变动检测和更新路径实际用到的列，减少 I/O 与反序列化开销（原先 SELECT *，40+ 列）
         async with self._db.execute(

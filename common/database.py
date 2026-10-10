@@ -27,6 +27,12 @@ from common.core.error_types import SERVER_REJECT
 from common.core.searchurl import normalize_keyword
 # F-012：站点注册表。按模块导入，理由同 PG 侧 results_write.py。
 from common.core import marketplace as _marketplace
+# F-012：「批次里这一行是哪个站点」的 SQL 片段，与 PG 侧逐字共用（不含 `?`）。
+from common.core.dbtables import (
+    BA_ROW_MARKETPLACE_SQL,
+    DEFAULT_MARKETPLACE_SQL,
+    task_marketplace_sql,
+)
 
 # ============================================================
 # 与 PG 后端共享的纯 Python 符号 —— 定义在 common/core/（Phase 4.1）。
@@ -869,17 +875,21 @@ class Database:
                 return 0
             ss = bool(brow["needs_screenshot"])
             # 继承本批已有任务的 zip（同族应同邮编）
+            # F-012：站点与邮编取自同一条任务行（选行逻辑不变，只多取一列），
+            # 家族只读同站点的 asin_data。理由见 PG 侧 common/pgdb/media.py 同名方法。
             async with rc.execute(
-                "SELECT zip_code FROM tasks WHERE batch_id=? LIMIT 1", (batch_id,)
+                "SELECT zip_code, marketplace FROM tasks WHERE batch_id=? LIMIT 1", (batch_id,)
             ) as c:
                 zrow = await c.fetchone()
             zip_code = (zrow["zip_code"] if zrow else None) or config.DEFAULT_ZIP_CODE
+            mkt = _marketplace.get(zrow["marketplace"] if zrow else None).id
             # 本批已采 ASIN 的同族列表（twister 洗干净的真家族）
             async with rc.execute(
                 "SELECT d.variation_asins FROM asin_data d "
                 "JOIN batch_asins ba ON ba.asin = d.asin "
-                "WHERE ba.batch_id=? AND d.variation_asins IS NOT NULL AND d.variation_asins != ''",
-                (batch_id,)
+                "WHERE ba.batch_id=? AND d.marketplace=? "
+                "AND d.variation_asins IS NOT NULL AND d.variation_asins != ''",
+                (batch_id, mkt)
             ) as c:
                 fam_rows = await c.fetchall()
             # 本批已有 ASIN（去重基准）
@@ -908,7 +918,9 @@ class Database:
         if not candidates:
             return 0
         # 复用 create_tasks：INSERT OR IGNORE tasks + 维护 batch_asins + 截图任务，返回实际新增数
-        return await self.create_tasks(batch_id, sorted(candidates), zip_code, ss)
+        # F-012：站点显式传下去；美国批次传 'amazon.com'，与原来不传落库值相同。
+        return await self.create_tasks(batch_id, sorted(candidates), zip_code, ss,
+                                       marketplace=mkt)
 
     # ==================== 批次完成检测 + 回调 ====================
 
@@ -1854,7 +1866,8 @@ class Database:
                                   search_params: Optional[Dict] = None,
                                   discover_mode: str = "with_detail",
                                   zip_code: str = "10001",
-                                  needs_screenshot: bool = False) -> Tuple[int, int]:
+                                  needs_screenshot: bool = False,
+                                  marketplace: str = None) -> Tuple[int, int]:
         """创建一个 keyword_discovery 批次，每个关键词一个 discover_search 任务。
 
         - 衍生的 ASIN 详情任务在 discover 任务完成时由
@@ -1863,6 +1876,11 @@ class Database:
           的输出；这里**不再校验**（校验属于 HTTP 边界，重复一份就会分叉），
           原样序列化进 task_meta。
         - 截图开关只作用于衍生的详情任务，discover 任务本身不截图。
+        - ``marketplace``（F-012）：任务的站点。调用方给了就用它，**不再**从
+          ``search_params['domain']`` 重新推导 —— HTTP 边界已经解析过站点，
+          而且对注册表之外的搜索站点有意放行 discover_only（站点落到美国），
+          库层再推导一遍会对那些站点抛 ValueError -> 500。
+          ``None``（老调用方）-> 照旧按 domain 推导。
 
         Returns: (batch_id, inserted_search_task_count)
         """
@@ -1883,8 +1901,10 @@ class Database:
 
         meta_json = json.dumps({"search": search_params or {}}, ensure_ascii=False)
         ss_val = 1 if needs_screenshot else 0
-        # F-012：站点从搜索参数的 domain 推导，语义见 PG 侧同名方法的注释。
-        mkt = _marketplace.get((search_params or {}).get("domain")).id
+        # F-012：站点优先用调用方给的，没给才从搜索参数的 domain 推导，
+        # 语义见 PG 侧同名方法的注释。
+        mkt = (_marketplace.get(marketplace).id if marketplace is not None
+               else _marketplace.get((search_params or {}).get("domain")).id)
         async with self._write_lock:
             await self._db.execute("BEGIN")
             try:
@@ -2105,6 +2125,28 @@ class Database:
 
     # ==================== 结果操作（含变动检测）====================
 
+    async def _marketplace_mismatch(self, task_id, data) -> Tuple[str, str, Optional[str]]:
+        """F-012 MISS-01：(task_mkt, payload_mkt, error_detail)，一致时 error_detail 为 None。
+
+        提交体的站点（缺键 -> 美国站，与写入路径同一个口径）必须与任务行一致：
+        F-012 之前的 worker 不认识 tasks.marketplace，拉到加拿大任务照样去
+        amazon.com 采、提交体也不带这个键，不拦的话这页美国数据会覆盖真的美国行。
+        完整理由见 PG 侧 common/pgdb/results_write.py 的 ``_marketplace_mismatch``；
+        error_detail 的格式与那边逐字一致。不认识的站点照旧抛 ValueError。
+
+        调用方必须已经在写事务里（走 self._db）。私有名，不进 PUBLIC_API。
+        """
+        payload_mkt = _marketplace.get(data.get("marketplace")).id
+        async with self._db.execute(
+            "SELECT marketplace FROM tasks WHERE id = ?", (task_id,)
+        ) as c:
+            row = await c.fetchone()
+        task_mkt = (row["marketplace"] if row else None) or _marketplace.DEFAULT_MARKETPLACE
+        if task_mkt == payload_mkt:
+            return task_mkt, payload_mkt, None
+        return (task_mkt, payload_mkt,
+                f"marketplace_mismatch task={task_mkt} payload={payload_mkt}")
+
     async def accept_success_result(self, task_id: int, worker_id: str, lease_epoch: int,
                                     data: dict, batch_id: int = None) -> dict:
         """原子事务：校验 lease → 写数据 → 标 done
@@ -2136,6 +2178,21 @@ class Database:
                         "UPDATE tasks SET status='failed', error_type=?, "
                         "error_detail=? WHERE id=?",
                         (SERVER_REJECT, "parse_failure_on_server", task_id)
+                    )
+                    await self._db.execute("COMMIT")
+                    return {"accepted": True, "saved": False, "server_reject": True}
+
+                # Step 2.5（F-012 MISS-01）：提交体站点 ≠ 任务行站点 -> 不写 asin_data，
+                # 任务按 server_reject 判失败。与 PG 侧同一条规则、同一个位置。
+                _tm, _pm, mismatch = await self._marketplace_mismatch(task_id, data)
+                if mismatch:
+                    logger.warning(
+                        f"server_reject: {data.get('asin', '')} {mismatch}（task_id={task_id} "
+                        f"worker={worker_id}，多半是还没升级到 F-012 的 worker）")
+                    await self._db.execute(
+                        "UPDATE tasks SET status='failed', error_type=?, "
+                        "error_detail=? WHERE id=?",
+                        (SERVER_REJECT, mismatch, task_id)
                     )
                     await self._db.execute("COMMIT")
                     return {"accepted": True, "saved": False, "server_reject": True}
@@ -2205,6 +2262,21 @@ class Database:
                                 "UPDATE tasks SET status='failed', error_type='server_reject', "
                                 "error_detail='parse_failure_on_server' WHERE id=?",
                                 (task_id,)
+                            )
+                            failed += 1
+                            continue
+
+                        # F-012 MISS-01：同单条提交的 Step 2.5
+                        _tm, _pm, mismatch = await self._marketplace_mismatch(task_id, data)
+                        if mismatch:
+                            logger.warning(
+                                f"server_reject: {data.get('asin', '')} {mismatch}"
+                                f"（task_id={task_id} worker={worker_id}，"
+                                f"多半是还没升级到 F-012 的 worker）")
+                            await self._db.execute(
+                                "UPDATE tasks SET status='failed', error_type='server_reject', "
+                                "error_detail=? WHERE id=?",
+                                (mismatch, task_id)
                             )
                             failed += 1
                             continue
@@ -2295,7 +2367,9 @@ class Database:
                 if row:
                     is_auto = bool(row[0])
 
-        resolved_screenshot_path = await self._get_done_screenshot_path(asin, batch_id)
+        # F-012：只认同站点的截图（否则加拿大行会继承美国批次的截图，反之亦然）。
+        resolved_screenshot_path = await self._get_done_screenshot_path(
+            asin, batch_id, marketplace=marketplace)
 
         # 只查变动检测和更新路径实际用到的列，减少 I/O 与反序列化开销（原先 SELECT *，40+ 列）
         async with self._db.execute(
@@ -2472,20 +2546,29 @@ class Database:
                     pass
                 raise
 
-    async def _get_done_screenshot_path(self, asin: str, batch_id: int = None) -> Optional[str]:
+    async def _get_done_screenshot_path(self, asin: str, batch_id: int = None,
+                                        marketplace: str = None) -> Optional[str]:
+        """``marketplace``（F-012）：给了就只认同站点的截图（站点由截图那一行
+        (batch_id, asin) 的任务决定），``None`` -> 与改动前相同。语义与 PG 侧
+        common/pgdb/media.py 同名方法逐字一致，理由见那边。"""
+        mkt_pred = ""
+        mkt_params: tuple = ()
+        if marketplace is not None:
+            mkt_pred = f" AND {task_marketplace_sql('s.batch_id', 's.asin')} = ?"
+            mkt_params = (marketplace,)
         queries = []
         if batch_id is not None:
             queries.append((
-                """SELECT file_path FROM screenshots
-                   WHERE asin = ? AND batch_id = ? AND status = 'done'
-                   ORDER BY updated_at DESC, id DESC LIMIT 1""",
-                (asin, batch_id),
+                f"""SELECT s.file_path FROM screenshots s
+                   WHERE s.asin = ? AND s.batch_id = ? AND s.status = 'done'{mkt_pred}
+                   ORDER BY s.updated_at DESC, s.id DESC LIMIT 1""",
+                (asin, batch_id) + mkt_params,
             ))
         queries.append((
-            """SELECT file_path FROM screenshots
-               WHERE asin = ? AND status = 'done'
-               ORDER BY updated_at DESC, id DESC LIMIT 1""",
-            (asin,),
+            f"""SELECT s.file_path FROM screenshots s
+               WHERE s.asin = ? AND s.status = 'done'{mkt_pred}
+               ORDER BY s.updated_at DESC, s.id DESC LIMIT 1""",
+            (asin,) + mkt_params,
         ))
 
         for sql, params in queries:
@@ -2498,7 +2581,9 @@ class Database:
         return None
 
     async def _get_done_screenshot_paths(self, asins: List[str],
-                                         batch_id: int = None) -> Dict[str, str]:
+                                         batch_id: int = None,
+                                         marketplace: str = None) -> Dict[str, str]:
+        """``marketplace``：同 ``_get_done_screenshot_path``（两次 load 都限定）。"""
         if not asins:
             return {}
 
@@ -2512,14 +2597,18 @@ class Database:
 
             placeholders = ",".join("?" * len(remaining))
             sql = (
-                f"SELECT asin, file_path FROM screenshots "
-                f"WHERE status = 'done' AND asin IN ({placeholders})"
+                f"SELECT s.asin, s.file_path FROM screenshots s "
+                f"WHERE s.status = 'done' AND s.asin IN ({placeholders})"
             )
             params: List[Any] = list(remaining)
             if batch_filter is not None:
-                sql += " AND batch_id = ?"
+                sql += " AND s.batch_id = ?"
                 params.append(batch_filter)
-            sql += " ORDER BY updated_at DESC, id DESC"
+            if marketplace is not None:
+                # 参数顺序 = SQL 文本顺序：asins -> batch -> 站点
+                sql += f" AND {task_marketplace_sql('s.batch_id', 's.asin')} = ?"
+                params.append(marketplace)
+            sql += " ORDER BY s.updated_at DESC, s.id DESC"
 
             async with self.read() as rc, rc.execute(sql, params) as c:
                 rows = await c.fetchall()
@@ -2536,17 +2625,24 @@ class Database:
         return mapping
 
     async def _hydrate_screenshot_paths(self, items: List[Dict], batch_id: int = None):
-        missing = []
+        """**原地修改** items。F-012：缺截图的行按自己的站点分组兜底；行里没有
+        ``marketplace`` 键（窄投影没点它）-> 不分站点，与改动前相同。
+        语义与 PG 侧 common/pgdb/media.py 同名方法逐字一致，理由见那边。"""
+        missing: Dict[Optional[str], List[str]] = {}
         for item in items:
             normalized = _normalize_screenshot_path(item.get("screenshot_path"))
             item["screenshot_path"] = normalized
             if normalized is None:
-                missing.append(item["asin"])
+                missing.setdefault(item.get("marketplace") or None, []).append(item["asin"])
 
-        fallback = await self._get_done_screenshot_paths(missing, batch_id) if missing else {}
+        fallback: Dict[Optional[str], Dict[str, str]] = {}
+        for mkt, asins in missing.items():
+            fallback[mkt] = await self._get_done_screenshot_paths(
+                asins, batch_id, marketplace=mkt)
         for item in items:
             if item["screenshot_path"] is None:
-                item["screenshot_path"] = fallback.get(item["asin"])
+                item["screenshot_path"] = fallback.get(
+                    item.get("marketplace") or None, {}).get(item["asin"])
 
     async def _hydrate_batch_task_status(self, items: List[Dict], batch_id):
         """`/api/results?batch_id=` 追加三列。**只在带 batch_id 时调用。**
@@ -2717,9 +2813,14 @@ class Database:
         where_params: list = []
 
         # 批次筛选 - 通过 batch_asins JOIN
+        # F-012：按任务行的站点钉住 d.marketplace，理由与片段定义见 PG 侧同名
+        # 方法的注释和 common/core/dbtables.py。片段不含 `?`，参数顺序不变。
+        # FTS 快路径的 `d.id IN (...)` 谓词与这个连接相互独立，不用跟着改。
         if batch_id:
-            join_parts.append("JOIN batch_asins ba ON ba.asin = d.asin AND ba.batch_id = ?")
-            count_join_parts.append("JOIN batch_asins ba ON ba.asin = d.asin AND ba.batch_id = ?")
+            batch_join = ("JOIN batch_asins ba ON ba.asin = d.asin AND ba.batch_id = ? "
+                          f"AND d.marketplace = {BA_ROW_MARKETPLACE_SQL}")
+            join_parts.append(batch_join)
+            count_join_parts.append(batch_join)
             join_params.append(batch_id)
 
         # 变动筛选 —— 由 `JOIN (SELECT DISTINCT asin FROM asin_changes ...)`
@@ -2991,9 +3092,22 @@ class Database:
                 raise
         return screenshot_files
 
-    async def get_result_by_asin(self, asin: str) -> Optional[Dict]:
+    async def get_result_by_asin(self, asin: str, marketplace: str = None) -> Optional[Dict]:
+        """单个 ASIN 的结果行。``marketplace=None`` -> 优先美国行（没有再给别的站点
+        的那行）；给了站点 -> 只要那一行。语义与 PG 侧同名方法逐字一致，理由见那边。
+
+        老 SQLite 库的唯一键仍是 (asin)（init_tables 的迁移改不动唯一键），
+        那份数据里只有美国行，两种写法给出同一行。
+        """
         # 注意：先释放读连接再 _hydrate（其内部还要借读连接），避免池内嵌套借用导致死锁
-        async with self.read() as rc, rc.execute("SELECT * FROM asin_data WHERE asin = ?", (asin,)) as c:
+        if marketplace is None:
+            sql = ("SELECT * FROM asin_data WHERE asin = ? "
+                   f"ORDER BY (marketplace = {DEFAULT_MARKETPLACE_SQL}) DESC, id LIMIT 1")
+            params = (asin,)
+        else:
+            sql = "SELECT * FROM asin_data WHERE asin = ? AND marketplace = ?"
+            params = (asin, _marketplace.get(marketplace).id)
+        async with self.read() as rc, rc.execute(sql, params) as c:
             row = await c.fetchone()
         if not row:
             return None
@@ -3030,9 +3144,12 @@ class Database:
                 )
                 updated = cursor.rowcount > 0
                 if updated:
+                    # F-012：只回写这个批次任务所在站点的那一行（片段里的 `?` 是
+                    # 本批 batch_id）。理由见 PG 侧 common/pgdb/media.py 同名方法。
                     await self._db.execute(
-                        "UPDATE asin_data SET screenshot_path=? WHERE asin=?",
-                        (file_path, asin)
+                        "UPDATE asin_data SET screenshot_path=? WHERE asin=? "
+                        f"AND marketplace = {task_marketplace_sql('?', 'asin_data.asin')}",
+                        (file_path, asin, batch_id)
                     )
             elif status == "failed":
                 cursor = await self._db.execute(
@@ -3194,9 +3311,13 @@ class Database:
             while True:
                 if batch_id:
                     d_select = ", ".join(f"d.{c}" for c in proj_cols) if proj_cols else "d.*"
+                    # F-012：先连 tasks，再按任务行的站点连 asin_data —— 恢复
+                    # 「每条 batch_asins 行恰好一行」，`ba.asin > ?` 的 keyset 才精确。
+                    # 理由与连接顺序的约束见 PG 侧同名方法的注释。
                     joins = [
-                        "LEFT JOIN asin_data d ON d.asin = ba.asin",
                         "LEFT JOIN tasks t ON t.batch_id = ba.batch_id AND t.asin = ba.asin",
+                        "LEFT JOIN asin_data d ON d.asin = ba.asin "
+                        f"AND d.marketplace = COALESCE(t.marketplace, {DEFAULT_MARKETPLACE_SQL})",
                     ]
                     join_params: list = []
                     where = ["ba.batch_id = ?", "ba.asin > ?"]

@@ -256,6 +256,70 @@ async def test_batch_filter_uses_materialized_bset_not_branches(monkeypatch, kw)
     if kw.get("change_filter") == "new":
         assert "ba2" in sql, "本批新增的 ba2 连接不该被一起换掉"
     assert sql.count("?") == len(params), (sql.count("?"), len(params))
+    # F-012：bset 顺带物化每行任务的站点，外层按它钉 d.marketplace。少了这一条，
+    # 加拿大批次一搜索就把同 ASIN 的美国行也带出来（R2）。片段与非搜索路径同源。
+    from common.core.dbtables import task_marketplace_sql
+    assert (f"{task_marketplace_sql('batch_asins.batch_id', 'batch_asins.asin')} "
+            "AS marketplace") in sql, sql[:600]
+    assert "JOIN bset ON bset.asin = d.asin AND bset.marketplace = d.marketplace" in sql
+
+
+def _capture_sql_with_count(monkeypatch):
+    """同 ``_capture_sql``，但 fetchone 回 ``[0]`` —— 让 count 查询也能跑完、被抓到。"""
+    import contextlib
+    from common.pgdb import Database as PgDatabase
+    seen = []
+
+    class _Cur:
+        def __init__(self): self.rowcount = -1
+        async def fetchall(self): return []
+        async def fetchone(self): return [0]
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+
+    class _Conn:
+        def execute(self, sql, params=None):
+            seen.append((sql, list(params or [])))
+            return _Cur()
+
+    @contextlib.asynccontextmanager
+    async def fake_read(self):
+        yield _Conn()
+
+    monkeypatch.setattr(PgDatabase, "read", fake_read, raising=False)
+    async def _noop(*a, **k): return None
+    monkeypatch.setattr(PgDatabase, "_hydrate_screenshot_paths", _noop, raising=False)
+    monkeypatch.setattr(PgDatabase, "_hydrate_batch_task_status", _noop, raising=False)
+    return PgDatabase.__new__(PgDatabase), seen
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kw", [
+    dict(),
+    dict(change_filter="new"),
+    dict(change_filter="price_stock"),
+    dict(search="qz"),                 # 短词：扁平 OR，留在 WHERE
+    dict(cursor_id=7),
+])
+async def test_batch_join_pins_rows_to_the_task_site(monkeypatch, kw):
+    """F-012（R1）：带 batch_id 的数据查询与 count 查询，都要按**任务行的站点**
+    钉住 d.marketplace —— 不然加拿大批次把同 ASIN 的美国行也算进来（total 翻倍），
+    美国批次也会多出加拿大行。
+
+    片段内联注册表常量、不加 ``?``：所以参数个数仍然与占位符一一对应，
+    而主批次连接仍以 ``JOIN batch_asins ba `` 开头（bset 分支靠它摘掉主连接）。
+    """
+    from common.core.dbtables import BA_ROW_MARKETPLACE_SQL
+    from common.pgdb import Database as PgDatabase
+    db, seen = _capture_sql_with_count(monkeypatch)
+    await PgDatabase.get_results(db, batch_id=1, limit=50, with_total=True, **kw)
+    data_sql, data_params = seen[0]
+    count_sql, count_params = seen[-1]
+    assert "COUNT(*)" in count_sql, count_sql
+    for sql, params in ((data_sql, data_params), (count_sql, count_params)):
+        assert ("JOIN batch_asins ba ON ba.asin = d.asin AND ba.batch_id = ? "
+                f"AND d.marketplace = {BA_ROW_MARKETPLACE_SQL}") in sql, sql[:600]
+        assert sql.count("?") == len(params), (sql.count("?"), len(params), sql)
 
 
 @pytest.mark.asyncio

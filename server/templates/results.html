@@ -311,11 +311,17 @@ async function loadResults(cursor = null, direction = 'next') {
     // 不显示 —— 实测 100 万行的库上单页 274 KB -> 17.8 KB。
     // 加列的时候记得同步这里，漏了就是那一列渲染成 undefined。
     // （服务端还会强制补 id / asin / screenshot_path / updated_at，不用写。）
+    {#- F-012 marketplace：同一个 ASIN 在两个站点各有一行，行上要标站点、商品链接要按
+       站点拼；服务端的截图兜底也只在行里带着站点时才按站点找图。服务端**不会**替你补
+       这一列（补了会改变 fields= 的返回键集，golden results_narrow_fields 钉着），
+       所以必须点名。
+       本文件新增的说明一律写成 Jinja 注释：渲染时剥掉、不进浏览器，页面体积不变
+       （golden 的 page_results 按 1000 字符分桶比对页面大小）。 #}
     const UI_FIELDS = [
         'asin', 'title', 'brand', 'current_price', 'buybox_price',
         'rating', 'review_count', 'seller_id', 'seller_name',
         'stock_count', 'stock_status', 'is_fba', 'delivery_date',
-        'crawl_time', 'screenshot_path'
+        'crawl_time', 'screenshot_path', 'marketplace'
     ].join(',');
 
     // total 是全表 COUNT，随行数线性增长，而翻页途中它恒定不变 ——
@@ -421,6 +427,11 @@ function renderResults(items) {
         const delivery = esc(r.delivery_date || 'N/A');
         const crawlTime = esc(r.crawl_time || '');
         const hasScreenshot = r.screenshot_path && r.screenshot_path.startsWith('/static/');
+        {#- F-012：商品链接按行的站点拼（主机名规则同 common/core/marketplace.py 的
+           id_to_host：www.<站点键>）；缺这一列（老服务端）就是美国站，与原来一致。
+           只给非美国站的行打站点标记：全局视图里同一个 ASIN 的美国行与加拿大行除了
+           价格一模一样，不标分不出来；美国行保持原样，不给每一行加噪声。 #}
+        const mkt = esc(r.marketplace || 'amazon.com');
 
         const fbaCell = fba === 'FBA'
             ? '<span class="badge-status badge-done">FBA</span>'
@@ -437,7 +448,7 @@ function renderResults(items) {
 
         html += `<tr>
             <td><input type="checkbox" class="row-check" value="${asin}" onchange="updateSelectUI()"></td>
-            <td><a href="https://www.amazon.com/dp/${asin}" target="_blank" class="text-accent">${asin}</a></td>
+            <td><a href="https://www.${mkt}/dp/${asin}" target="_blank" class="text-accent">${asin}</a>${mkt === 'amazon.com' ? '' : ` <span class="badge-status badge-processing">${mkt}</span>`}</td>
             <td title="${esc(r.title || '')}">${title}</td>
             <td>${rating !== 'N/A' ? `<span title="${rating} / 5">${rating} ★</span>` : '-'}</td>
             <td>${reviewCount}</td>
@@ -531,11 +542,19 @@ async function openExportModal() {
     document.getElementById('exportScope').textContent = batchText;
 
     // 渲染字段复选框
+    {#- 「保存过的字段列表里没有」有两种意思：用户自己取消勾选的，或者是保存之后才
+       新加的字段。前者保持不勾，后者默认勾上 —— 否则老用户永远看不到新列（F-012 的
+       「采集站点」就是这样：没有它，美国行与加拿大行导出来除了价格一模一样）。
+       所以保存时一并记下「当时一共有哪些字段」（export_fields_known），不在那份
+       清单里的就是新字段。那份清单是这次才开始记的：之前保存的老用户没有它，只能按
+       「已知在那之后新加的字段」兜底 —— 目前就是 marketplace 一个。 #}
     const saved = JSON.parse(localStorage.getItem('export_fields') || 'null');
+    const known = JSON.parse(localStorage.getItem('export_fields_known') || 'null');
+    const isNew = f => known ? !known.includes(f) : f === 'marketplace';
     const container = document.getElementById('exportFields');
     container.innerHTML = '';
     for (const f of _exportFields) {
-        const checked = saved ? saved.includes(f) : true;
+        const checked = saved ? (saved.includes(f) || isNew(f)) : true;
         const label = esc(_exportHeaders[f] || f);
         container.innerHTML += `<div style="break-inside:avoid; margin-bottom:4px;">
             <label><input type="checkbox" value="${f}" ${checked ? 'checked' : ''}> ${label}</label>
@@ -569,7 +588,10 @@ async function doExport() {
     if (!selected.length) { alert('请至少选择一个字段'); return; }
 
     // 持久化
+    {#- export_fields_known = 这次弹窗里一共列出了哪些字段，下次据此区分「用户取消
+       勾选的」与「之后新加的」（见 openExportModal）。 #}
     localStorage.setItem('export_fields', JSON.stringify(selected));
+    localStorage.setItem('export_fields_known', JSON.stringify(_exportFields));
 
     // 构建 URL
     let url;

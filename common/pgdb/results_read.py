@@ -125,7 +125,12 @@ from common.pgdb._shared import (  # noqa: F401
     search_like_pattern,
 )
 from common.core import marketplace as _marketplace
-from common.core.dbtables import TOTAL_ESTIMATE_MIN_ROWS
+from common.core.dbtables import (
+    BA_ROW_MARKETPLACE_SQL,
+    DEFAULT_MARKETPLACE_SQL,
+    TOTAL_ESTIMATE_MIN_ROWS,
+    task_marketplace_sql,
+)
 from common.core.results_sort import (
     DEFAULT_SORT,
     CursorExpired,
@@ -259,9 +264,20 @@ class ResultsReadMixin:
         where_params: list = []
 
         # 批次筛选 - 通过 batch_asins JOIN
+        #
+        # F-012：除了 asin，还要按**任务行的站点**钉住 d.marketplace。asin_data 的
+        # 唯一键是 (asin, marketplace)，只按 asin 关联的话，加拿大批次会把同一
+        # ASIN 的美国行也带出来（反之亦然），total 跟着翻倍，每一行还都挂上本批
+        # 任务的 batch_task_status —— 美国行看起来就像这批刚采的加拿大数据。
+        # 片段的定义与理由见 common/core/dbtables.py；它不含 `?`，所以下面所有
+        # 「参数顺序 = SQL 文本顺序」的注释照旧成立。
+        # ⚠ 字符串必须仍以 "JOIN batch_asins ba " 开头：bset 分支靠这个前缀把
+        #   主批次连接从 other_joins 里摘掉。
         if batch_id:
-            join_parts.append("JOIN batch_asins ba ON ba.asin = d.asin AND ba.batch_id = ?")
-            count_join_parts.append("JOIN batch_asins ba ON ba.asin = d.asin AND ba.batch_id = ?")
+            batch_join = ("JOIN batch_asins ba ON ba.asin = d.asin AND ba.batch_id = ? "
+                          f"AND d.marketplace = {BA_ROW_MARKETPLACE_SQL}")
+            join_parts.append(batch_join)
+            count_join_parts.append(batch_join)
             join_params.append(as_int(batch_id))
 
         # 变动筛选 —— 由 `JOIN (SELECT DISTINCT asin FROM asin_changes ...)`
@@ -438,15 +454,23 @@ class ResultsReadMixin:
             # ⚠ 只换掉**主批次连接**。change_filter='new' 会再加一个
             #   `JOIN batch_asins ba2 ... is_new = 1`，那条原样保留 —— 它是另一个
             #   语义（"本批新增"），不是候选集限制。
+            #
+            # F-012：bset 顺带物化每行任务的站点，外层按它钉 d.marketplace ——
+            # 与主批次连接里那个站点谓词同一份片段（common/core/dbtables.py），
+            # 只是外层列引用换成不带别名的 batch_asins.*。这样
+            # `FROM batch_asins WHERE batch_id` 仍然只出现一次、`?` 一个没加，
+            # tests/test_search_no_planner_cliff.py 钉的形状照旧。
             other_joins = [j for j in join_parts if "batch_asins ba " not in j]
             # join_params 的第一个就是主批次连接的 batch_id（它最先 append）
             other_join_params = join_params[1:]
+            bset_mkt = task_marketplace_sql("batch_asins.batch_id", "batch_asins.asin")
             sql = f"""
                 WITH bset AS MATERIALIZED (
-                    SELECT asin FROM batch_asins WHERE batch_id = ?
+                    SELECT asin, {bset_mkt} AS marketplace
+                    FROM batch_asins WHERE batch_id = ?
                 )
                 SELECT {proj or 'd.*'} FROM asin_data d
-                JOIN bset ON bset.asin = d.asin
+                JOIN bset ON bset.asin = d.asin AND bset.marketplace = d.marketplace
                 {' '.join(other_joins)}
                 WHERE {where_clause} AND {search_pred}
                 ORDER BY {order_by_clause}
@@ -737,11 +761,29 @@ class ResultsReadMixin:
         async with self.read() as rc, rc.execute(sql, params) as c:
             return {row["asin"] for row in await c.fetchall()}
 
-    async def get_result_by_asin(self, asin: str) -> Optional[Dict]:
+    async def get_result_by_asin(self, asin: str, marketplace: str = None) -> Optional[Dict]:
+        """单个 ASIN 的结果行（``GET /api/results/{asin}``）。
+
+        F-012：同一个 ASIN 可以在两个站点各有一行。
+          * ``marketplace=None``（老调用方）-> **优先美国行**，没有美国行再给别的
+            站点的那行。原来是裸 ``WHERE asin = ?`` + fetchone，取哪行由索引顺序
+            决定 —— (asin, marketplace) 索引里 'amazon.ca' 排在 'amazon.com'
+            前面，于是不传站点的老调用方**拿到加拿大数据**。现在美国行存在时
+            答案与 F-012 之前逐字相同；只在加拿大才有的 ASIN 仍然返回（不 404）。
+          * 给了站点 -> 只要那个站点的行，没有就 None。不认识的站点抛 ValueError
+            （端点层先拦过一道）。
+        排序里的 ``id`` 是同站点内的决胜键 —— 唯一键保证同站点至多一行，它只是让
+        ORDER BY 在语法上是全序。
+        """
         # 注意：先释放读连接再 _hydrate（其内部还要借读连接），避免池内嵌套借用导致死锁
-        async with self.read() as rc, rc.execute(
-            "SELECT * FROM asin_data WHERE asin = ?", (text_affinity(asin),)
-        ) as c:
+        if marketplace is None:
+            sql = ("SELECT * FROM asin_data WHERE asin = ? "
+                   f"ORDER BY (marketplace = {DEFAULT_MARKETPLACE_SQL}) DESC, id LIMIT 1")
+            params = (text_affinity(asin),)
+        else:
+            sql = "SELECT * FROM asin_data WHERE asin = ? AND marketplace = ?"
+            params = (text_affinity(asin), text_affinity(_marketplace.get(marketplace).id))
+        async with self.read() as rc, rc.execute(sql, params) as c:
             row = await c.fetchone()
         if not row:
             return None
@@ -785,9 +827,19 @@ class ResultsReadMixin:
             while True:
                 if batch_id:
                     d_select = ", ".join(f"d.{c}" for c in proj_cols) if proj_cols else "d.*"
+                    # F-012：先连 tasks，再按**任务行的站点**连 asin_data。
+                    # 只按 asin 连的话，同一个 ASIN 两站各一行会让一条 batch_asins
+                    # 行变成两行：导出里多出别的站点的数据（还被 data_source 标成
+                    # 「历史产品库数据」），而且 keyset 是 `ba.asin > ?` —— 页边界
+                    # 正好落在两行之间时第二行被**静默跳过**，导出内容随 batch_size
+                    # 变化。钉住站点后恢复「每条 batch_asins 行恰好一行」，keyset
+                    # 重新精确。
+                    # 顺序是承重的：PG 的 ON 子句只能引用它前面的 FROM 项，
+                    # t 必须先于 d 出现。
                     joins = [
-                        "LEFT JOIN asin_data d ON d.asin = ba.asin",
                         "LEFT JOIN tasks t ON t.batch_id = ba.batch_id AND t.asin = ba.asin",
+                        "LEFT JOIN asin_data d ON d.asin = ba.asin "
+                        f"AND d.marketplace = COALESCE(t.marketplace, {DEFAULT_MARKETPLACE_SQL})",
                     ]
                     join_params: list = []
                     where = ["ba.batch_id = ?", "ba.asin > ?"]

@@ -97,7 +97,7 @@ async def test_rollback_after_result_write_leaves_no_outbox_row(db):
     import types
     orig = db._get_done_screenshot_path
 
-    async def boom(self, asin, batch_id=None):
+    async def boom(self, asin, batch_id=None, marketplace=None):
         raise RuntimeError("boom after hook")
 
     db._get_done_screenshot_path = types.MethodType(boom, db)
