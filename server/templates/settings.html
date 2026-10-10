@@ -557,7 +557,10 @@ async function submitNewSchedule() {
     fd.append('time', timeStr);
     fd.append('interval_days', interval);
     fd.append('needs_screenshot', screenshot ? 'true' : 'false');
-    fd.append('marketplace', document.getElementById('newSchedMarketplace').value);
+    // 美国站不发：服务端只在收到时才往定时任务里存 marketplace 键，不发则存下来的
+    // dict（及 GET /api/schedules、runtime_settings.json）与改造前逐字节一致
+    const schedMkt = document.getElementById('newSchedMarketplace').value;
+    if (schedMkt !== DEFAULT_MKT) fd.append('marketplace', schedMkt);
     const schedZip = document.getElementById('newSchedZip').value.trim();
     if (schedZip) fd.append('zip_code', schedZip);   // 不填 = 每次执行时取该站点默认
     if (hasFile) fd.append('file', fileInput.files[0]);

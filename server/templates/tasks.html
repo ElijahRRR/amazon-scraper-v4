@@ -307,16 +307,23 @@ const DEFAULT_MKT = {{ default_marketplace|tojson }};
 const SITE_POSTAL = Object.fromEntries(
     [...document.getElementById('upMarketplace').options].map(o => [o.value, o.dataset.postal]));
 
-// 框里还是「预填的全局默认」或「某个站点的默认邮编」= 用户没动过，跟着站点换：
-// 切到美国站填回全局默认（与改造前一致），切到别的站点清空 —— 美国邮编送去
-// 加拿大站必 400，留空则服务端用该站点自己的默认。用户自己填的值不碰。
+{# 只在**跨站点**时动框里的值（ZIP_SITE 记每个框上一次的站点，初始都是美国站）。
+   框里还是「预填的全局默认」「某个站点的默认邮编」或空 = 用户没动过，跟着站点换：
+   切回美国站填回全局默认，切到别的站点清空 —— 美国邮编送去加拿大站必 400，
+   留空则服务端用该站点自己的默认。用户自己填的值不碰。同站点内换主机（kwDomain
+   在 www.amazon.com 与不在注册表、按美国站算的站点之间切）一个字都不碰，与改造前一致。
+   写成模板注释：不随页面下发（这页已经很大）。 #}
+const ZIP_SITE = new WeakMap();
 function applySiteZip(input, mktId) {
     if (!SITE_POSTAL[mktId]) mktId = DEFAULT_MKT;
+    const prev = ZIP_SITE.get(input) || DEFAULT_MKT;
+    ZIP_SITE.set(input, mktId);
+    input.placeholder = SITE_POSTAL[mktId];
+    if (mktId === prev) return;
     const v = input.value.trim();
     if (v === '' || v === SERVER_DEFAULT_ZIP || Object.values(SITE_POSTAL).includes(v)) {
         input.value = (mktId === DEFAULT_MKT) ? SERVER_DEFAULT_ZIP : '';
     }
-    input.placeholder = SITE_POSTAL[mktId];
 }
 document.getElementById('upMarketplace').addEventListener('change', (e) => {
     applySiteZip(document.getElementById('upZip'), e.target.value);
@@ -349,9 +356,12 @@ document.getElementById('uploadForm').addEventListener('submit', async (e) => {
                 `，共 ${parseInt(data.total_asins)} 个 ASIN，插入 ${parseInt(data.inserted)} 个任务`);
             // 非美国站批次服务端才回显 marketplace；B 列邮编按站点校验，不合格的行
             // 退回批次邮编 —— 不提示的话，填错站点的那一列邮编就无声无息地没生效。
-            if (data.marketplace) alertDiv.append(`，站点 ${data.marketplace}`);
-            const badZip = parseInt(data.invalid_zip_rows) || 0;
-            if (badZip > 0) alertDiv.append(`（${badZip} 行 B 列邮编不符合该站点形状，已改用批次邮编）`);
+            // 只对非美国站提示：美国站的成功提示保持改造前原样。
+            if (data.marketplace) {
+                alertDiv.append(`，站点 ${data.marketplace}`);
+                const badZip = parseInt(data.invalid_zip_rows) || 0;
+                if (badZip > 0) alertDiv.append(`（${badZip} 行 B 列邮编不符合该站点形状，已改用批次邮编）`);
+            }
             resultDiv.appendChild(alertDiv);
             setTimeout(() => location.reload(), 1500);
         } else {
@@ -491,9 +501,9 @@ async function loadSearchOptions(domain) {
 
 document.getElementById('kwDomain').addEventListener('change', (e) => {
     loadSearchOptions(e.target.value);
-    // 同一个邮编陷阱：站点切到加拿大、框里还是预填的美国邮编 -> 服务端 400。
-    // kwDomain 的值是带 www. 的主机名，去掉 www. 才是站点键；不在站点注册表里的站点只能
-    // discover_only，服务端按美国站校验邮编，applySiteZip 对它同样回落美国站。
+    {# 同一个邮编陷阱：站点切到加拿大、框里还是预填的美国邮编 -> 服务端 400。
+       kwDomain 的值是带 www. 的主机名，去掉 www. 才是站点键；不在站点注册表里的站点只能
+       discover_only，服务端按美国站校验邮编，applySiteZip 对它同样回落美国站。 #}
     applySiteZip(document.getElementById('kwZip'), e.target.value.replace(/^www\./, ''));
 });
 loadSearchOptions();

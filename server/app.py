@@ -883,13 +883,17 @@ async def _auto_scrape_scheduler():
                         pass
 
                 # F-012 blocker 3：站点（存储值每次重新校验，见 _schedule_spec）。
-                # 不合法 -> 记日志、只跳过**这一条**。绝不能让它抛出去：外层只有
-                # 一个 try 包着整个 for，抛出去等于本轮排在它后面的定时任务全部不跑。
+                # 不合法 -> 记日志（每条每天一次，见 _bad_site_sched_logged）、只跳过**这一条**。
+                # 绝不能让它抛出去：外层只有一个 try 包着整个 for，抛出去等于本轮
+                # 排在它后面的定时任务全部不跑。
                 # 也必须在 create_batch 之前，否则每 60 秒留下一个空批次。
                 try:
                     spec = _schedules_api._schedule_spec(sched)
                 except HTTPException as e:
-                    logger.error(f"定时任务站点非法，本轮跳过: {e.detail}")
+                    key = str(sched.get("id"))
+                    if _bad_site_sched_logged.get(key) != today:
+                        _bad_site_sched_logged[key] = today
+                        logger.error(f"定时任务站点非法，已跳过（修好之前每轮都跳过，同一条每天只记一次）: {e.detail}")
                     continue
 
                 # 获取 ASIN 列表：优先从文件，否则全库（= 本定时任务那个站点的全库）
@@ -993,6 +997,11 @@ _completion_check_set: Set[int] = set()
 # 若第 2 次展开仍新增（=采集第 3 轮）则打 WARNING（家族列表不一致信号），但靠
 # UNIQUE(batch_id,asin) 去重仍保证收敛、不死循环。批次完成后清理。
 _expand_rounds: Dict[int, int] = {}
+# 自动调度里「存的站点不合法」的定时任务：sched id -> 最近一次记 error 的日期。
+# 这种定时任务过点后每 60 秒都会被重新判定一次（跳过时不推进 last_run_date ——
+# 推进了等于假装它跑过），不去重的话一条坏定时任务一天能刷上千行 ERROR，
+# 把日志告警打穿。每条每天记一次就够人看见了。
+_bad_site_sched_logged: Dict[str, str] = {}
 # 待发送的 callback 内存队列：
 # - _completion_watcher 把刚标记 completed 的 batch_id 入队
 # - _timeout_task_loop 兜底从 DB 扫描入队（处理重启 / 实时漏掉的）

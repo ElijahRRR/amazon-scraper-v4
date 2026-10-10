@@ -43,6 +43,7 @@ import shutil
 import subprocess
 import types
 import unittest
+from unittest import mock
 
 import openpyxl
 
@@ -158,10 +159,10 @@ class _Stop(Exception):
     """让自动调度跑完一轮就停。不能是 BaseException：那会掀翻 anyio portal。"""
 
 
-def _one_auto_tick(client):
-    """在 TestClient 的事件循环上把**真的** ``_auto_scrape_scheduler`` 跑一轮。
+def _one_auto_tick(client, ticks=1):
+    """在 TestClient 的事件循环上把**真的** ``_auto_scrape_scheduler`` 跑 ``ticks`` 轮。
 
-    第 1 次 ``asyncio.sleep(60)`` 立即返回、循环体跑一遍，第 2 次抛 ``_Stop``
+    前 ``ticks`` 次 ``asyncio.sleep(60)`` 立即返回、循环体各跑一遍，下一次抛 ``_Stop``
     跳出 ``while True``（sleep 在循环体那层 try 之外，不会被它吞掉）。
     """
     assert _REAL_AUTO_SCHEDULER.__name__ == "_auto_scrape_scheduler", (
@@ -170,7 +171,7 @@ def _one_auto_tick(client):
 
     async def _sleep(_secs):
         calls["n"] += 1
-        if calls["n"] > 1:
+        if calls["n"] > ticks:
             raise _Stop()
 
     saved = srv.asyncio
@@ -442,6 +443,22 @@ class ScheduleCreateTests(unittest.TestCase):
         self.assertEqual(ca_zip["zip_code"], "M5V 3L9")
         self.assertEqual(ca_zip["name"], "加拿大站-定时任务-03:30")
 
+    def test_explicit_us_site_and_a_float_zip_are_stored_normalized(self):
+        """显式给了美国站就存（给了才存）；邮编按美国站归一（xlsx 读出来的 90001.0）。"""
+        with isolated_server() as (client, _ctx):
+            r = _mk_sched(client, time="03:30", marketplace="amazon.com", zip_code="90001.0",
+                          _files={"file": ("a.txt", b"B0SCHUS001\n", "text/plain")})
+            self.assertEqual(r.status_code, 200, r.text)
+            s = r.json()["schedule"]
+            run = client.post(f"/api/schedules/{s['id']}/run")
+            self.assertEqual(run.status_code, 200, run.text)
+            got = _pulled(client)
+        self.assertEqual(set(s), _LEGACY_SCHED_KEYS | {"marketplace", "zip_code"})
+        self.assertEqual((s["marketplace"], s["zip_code"]), (US, "90001"))
+        self.assertEqual(s["name"], "定时任务-03:30")       # 美国站默认名不加站点前缀
+        self.assertEqual(set(run.json()), {"ok", "batch_id", "batch_name", "asin_count"})
+        self.assertEqual(got[(run.json()["batch_name"], "B0SCHUS001")], ("90001", US))
+
     def test_bad_site_or_zip_is_400_before_the_file_is_written(self):
         cases = (
             {"marketplace": "amazon.xx"},
@@ -588,6 +605,35 @@ class AutoSchedulerMarketplaceTests(unittest.TestCase):
         self.assertTrue(name.startswith("auto_good_amazon.ca_"), name)
         self.assertEqual(tasks, {"B0AUTOGOOD": (CA_DEFAULT, CA)})
 
+    def test_auto_tick_uses_the_stored_zip_and_falls_back_on_a_bad_one(self):
+        """自动调度与「立即执行」同一套邮编规则：存的合法就用，被改坏了退回站点默认。"""
+        with isolated_server() as (client, _ctx):
+            _mk_sched(client, name="zip_ok", marketplace=CA, zip_code="m5v3l9",
+                      _files={"file": ("a.txt", b"B0AUTOZIP1\n", "text/plain")})
+            _mk_sched(client, name="zip_bad", marketplace=CA, zip_code="h0h0h0",
+                      _files={"file": ("b.txt", b"B0AUTOZIP2\n", "text/plain")})
+            _stored_schedules()[1]["zip_code"] = "10001"   # PUT /api/settings 能改成任何东西
+            _one_auto_tick(client)
+            got = {a: v for (_b, a), v in _pulled(client).items()}
+        self.assertEqual(got, {"B0AUTOZIP1": ("M5V 3L9", CA), "B0AUTOZIP2": (CA_DEFAULT, CA)})
+
+    def test_a_bad_site_schedule_logs_once_per_day_not_every_tick(self):
+        """坏站点的定时任务过点后每 60 秒都会被判定一次 —— ERROR 每条每天只记一次。"""
+        with isolated_server() as (client, _ctx):
+            bad = _mk_sched(client, name="bad_log",
+                            _files={"file": ("a.txt", b"B0AUTOLOG1\n", "text/plain")}
+                            ).json()["schedule"]
+            _stored_schedules()[0]["marketplace"] = "amazon.xx"
+            # 直接接住 logger.error，不用 assertLogs：别的测试模块在导入期
+            # logging.disable(CRITICAL)，pytest 先收集全部模块，本用例跑的时候日志是关着的。
+            with mock.patch.object(srv.logger, "error") as err:
+                _one_auto_tick(client, ticks=3)
+            got = _pulled(client)
+        hits = [str(c.args[0]) for c in err.call_args_list if bad["id"] in str(c.args[0])]
+        self.assertEqual(len(hits), 1, hits)
+        self.assertIn("amazon.xx", hits[0])
+        self.assertEqual(got, {})
+
     def test_same_named_us_and_ca_schedules_get_separate_single_site_batches(self):
         """同名同时刻的美国 / 加拿大全库定时任务：同一轮、同一秒，必须是两个批次。
 
@@ -698,6 +744,9 @@ const kw = {value: '10001', placeholder: '10001'};
 const host = (h) => h.replace(/^www\./, '');
 applySiteZip(kw, host('www.amazon.ca')); snap(kw);
 applySiteZip(kw, host('www.amazon.de')); snap(kw); // 不在注册表 -> 按美国站
+const kw2 = {value: '', placeholder: '10001'};     // 用户清空了（= 服务端默认）
+applySiteZip(kw2, host('www.amazon.co.uk')); snap(kw2); // 仍是美国站 -> 一个字都不碰
+applySiteZip(kw2, host('www.amazon.com')); snap(kw2);
 console.log(JSON.stringify(out));
 """
         proc = subprocess.run([node, "-e", stub + m.group(1) + "\n" + scenario],
@@ -706,6 +755,81 @@ console.log(JSON.stringify(out));
         self.assertEqual(json.loads(proc.stdout), [
             ["", CA_DEFAULT], ["10001", "10001"], ["M5V 3L9", CA_DEFAULT],
             ["", CA_DEFAULT], ["10001", "10001"],
+            ["", "10001"], ["", "10001"],
+        ])
+
+    def test_schedule_form_and_list(self):
+        """定时任务表单：美国站（默认）不发 marketplace —— 存下来的 dict 与改造前逐字节
+        一致；加拿大站发站点 + 邮编。列表：非美国站显示站点，老定时任务一行与改造前一样。
+
+        同上，跑的是渲染出来的 /settings 里真的那几段 JS（裸 Node）。
+        """
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("没装 Node")
+        with isolated_server() as (client, _ctx):
+            html = client.get("/settings").text
+        blocks = [re.search(pat, html, re.S) for pat in (
+            r"(const DEFAULT_MKT = .*?)\nasync function loadSchedules",
+            r"(function renderSchedules\(\) \{.*?\n\})\n",
+            r"(async function submitNewSchedule\(\) \{.*?\n\})\n",
+        )]
+        self.assertTrue(all(blocks), "页面里没有站点 / 邮编相关的定时任务脚本")
+        m = re.search(r'<select[^>]*id="newSchedMarketplace"[^>]*>(.*?)</select>', html, re.S)
+        opts = [{"value": v, "dataset": {"postal": p}, "textContent": t} for v, p, t in re.findall(
+            r'<option value="([^"]+)" data-postal="([^"]+)"(?: selected)?>([^<]*)</option>',
+            m.group(1))]
+        stub = """
+const els = {
+  newSchedMarketplace: {options: %s, value: 'amazon.com', addEventListener() {}},
+  newSchedZip: {value: '', placeholder: ''},
+  newSchedName: {value: ''}, newSchedHour: {value: '03'}, newSchedMinute: {value: '30'},
+  newSchedInterval: {value: '1'}, newSchedFile: {files: []}, newSchedScreenshot: {checked: false},
+  scheduleList: {innerHTML: ''}, scheduleEmpty: {style: {}},
+};
+const document = {getElementById: (id) => els[id]};
+let _schedules = [];
+const sent = [];
+const fetch = async (_url, init) => {
+  sent.push([...init.body.entries()]);
+  return {ok: false, json: async () => ({detail: 'stub'})};
+};
+const showScheduleMsg = () => {};
+""" % json.dumps(opts)
+        scenario = r"""
+(async () => {
+  const placeholder = els.newSchedZip.placeholder;
+  await submitNewSchedule();                                   // 默认选中美国站
+  els.newSchedMarketplace.value = 'amazon.ca'; els.newSchedZip.value = ' m5v3l9 ';
+  await submitNewSchedule();
+  const base = {time: '03:30', interval_days: 1, source_file: '', enabled: true};
+  _schedules = [
+    {...base, id: 's1', name: 'legacy', last_run_date: '2026-10-09'},
+    {...base, id: 's2', name: 'ca', last_run_date: '2026-10-09',
+     marketplace: 'amazon.ca', zip_code: 'M5V 3L9'},
+    {...base, id: 's3', name: 'odd', last_run_date: '', marketplace: '<img src=x>'},
+  ];
+  renderSchedules();
+  const rows = [...els.scheduleList.innerHTML.matchAll(
+      /<small class="text-secondary">(.*?)<\/small>/g)].map(x => x[1]);
+  console.log(JSON.stringify({placeholder, sent, rows}));
+})();
+"""
+        src = stub + "\n".join(b.group(1) for b in blocks) + "\n" + scenario
+        proc = subprocess.run([node, "-e", src], capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        legacy_fields = [["name", ""], ["time", "03:30"], ["interval_days", "1"],
+                         ["needs_screenshot", "false"]]
+        self.assertEqual(out["placeholder"], "10001")
+        self.assertEqual(out["sent"], [
+            legacy_fields,                                           # 与改造前的请求体一模一样
+            legacy_fields + [["marketplace", CA], ["zip_code", "m5v3l9"]],
+        ])
+        self.assertEqual(out["rows"], [
+            "03:30 | 每天 | 全库 | 上次: 2026-10-09",
+            "03:30 | 每天 | 全库 | 加拿大站（amazon.ca） | 邮编 M5V 3L9 | 上次: 2026-10-09",
+            "03:30 | 每天 | 全库 | &lt;img src=x&gt; | 未运行",
         ])
 
 
