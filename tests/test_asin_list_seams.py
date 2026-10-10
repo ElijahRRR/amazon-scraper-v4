@@ -22,9 +22,13 @@ marketplace=...)`` 建批次，而不是走 ``/api/upload``）。三块各自全
 """
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
+import types
 import unittest
+
+import httpx
 
 import server.app as srv
 from tests.golden.harness import isolated_server
@@ -79,12 +83,17 @@ def _batch_id(client, name):
 
 
 def _run_watcher_once(client):
-    """真的完成检测协程跑一轮（第二次 sleep 时抛出去结束循环）。"""
+    """真的完成检测协程跑一轮（第二次 sleep 时抛出去结束循环）。
+
+    换的是 ``server.app`` 模块上的 ``asyncio`` 引用（一个只把 ``sleep`` 换掉的
+    代理），不是 ``asyncio.sleep`` 本身 —— 后者是全进程的，同一个事件循环上别的
+    协程一 sleep 就会吃掉这里的计数。与 test_asin_list_marketplace 的
+    ``_one_auto_tick`` 同一个做法。
+    """
     class _Stop(Exception):
         pass
 
     calls = {"n": 0}
-    real_sleep = srv.asyncio.sleep
 
     async def _sleep(_s):
         calls["n"] += 1
@@ -92,13 +101,16 @@ def _run_watcher_once(client):
             raise _Stop()
 
     async def _go():
-        srv.asyncio.sleep = _sleep
+        saved = srv.asyncio
+        attrs = {k: getattr(saved, k) for k in dir(saved) if not k.startswith("__")}
+        attrs["sleep"] = _sleep
+        srv.asyncio = types.SimpleNamespace(**attrs)
         try:
             await _REAL_WATCHER()
         except _Stop:
             pass
         finally:
-            srv.asyncio.sleep = real_sleep
+            srv.asyncio = saved
     client.portal.call(_go)
 
 
@@ -265,6 +277,80 @@ class SameNameMergeEntriesRejectCrossSiteTests(unittest.TestCase):
                         body["marketplace"] = site
                     r = client.post("/api/extension/collect", json=body)
                     self.assertEqual(r.status_code, 409, r.text)
+
+
+class ConcurrentSameNameDifferentSiteTests(unittest.TestCase):
+    """同名、不同站点的两个请求**同时**到达：只能有一个成功，批次不能混站点。
+
+    跨站点检查是先查后写；不把「查 + 写」放进同一把按批次名的锁，两边都会查到
+    「没有别的站点的任务」然后都写进去（审查时 15/15 次复现）。
+    """
+
+    PAIRS = [
+        ("extension CA + keyword US",
+         ("/api/extension/collect", {"json": {"asins": ["B0RACE0001"], "marketplace": CA}}),
+         ("/api/search-batches", {"json": {"keywords": ["yoga mat"], "domain": "www.amazon.com",
+                                           "discover_mode": "discover_only"}})),
+        ("upload CA + seller upload US",
+         ("/api/upload", {"data": {"marketplace": CA},
+                          "files": {"file": ("a.txt", b"B0RACE0002\n", "text/plain")}}),
+         ("/api/upload-sellers", {"files": {"file": ("s.txt", b"A1RACESHOP001\n", "text/plain")}})),
+        ("upload CA + keyword US",
+         ("/api/upload", {"data": {"marketplace": CA},
+                          "files": {"file": ("a.txt", b"B0RACE0003\n", "text/plain")}}),
+         ("/api/search-batches", {"json": {"keywords": ["desk"], "domain": "www.amazon.com",
+                                           "discover_mode": "discover_only"}})),
+    ]
+
+    def _fire(self, client, name, a, b):
+        def with_name(spec):
+            path, kw = spec
+            kw = {k: (dict(v) if isinstance(v, dict) else v) for k, v in kw.items()}
+            if "json" in kw:
+                kw["json"]["batch_name"] = name
+            else:
+                kw.setdefault("data", {})
+                kw["data"] = {**kw["data"], "batch_name": name}
+            return path, kw
+
+        async def _go():
+            transport = httpx.ASGITransport(app=srv.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as ac:
+                (pa, ka), (pb, kb) = with_name(a), with_name(b)
+                return await asyncio.gather(ac.post(pa, **ka), ac.post(pb, **kb))
+        return client.portal.call(_go)
+
+    def test_only_one_of_two_concurrent_cross_site_requests_wins(self):
+        with isolated_server() as (client, _ctx):
+            for i, (label, a, b) in enumerate(self.PAIRS):
+                for run in range(3):
+                    name = f"race_{i}_{run}"
+                    with self.subTest(pair=label, run=run):
+                        r1, r2 = self._fire(client, name, a, b)
+                        self.assertEqual(sorted((r1.status_code, r2.status_code)), [200, 409],
+                                         (r1.text[:200], r2.text[:200]))
+                        sites = {row["marketplace"] for row in _rows(
+                            client, "SELECT t.marketplace FROM tasks t "
+                                    "JOIN batches b ON b.id = t.batch_id WHERE b.name = ?",
+                            (name,))}
+                        self.assertEqual(len(sites), 1, f"批次 {name} 混了站点: {sites}")
+            # 锁表用完即删，不随批次名增长
+            self.assertEqual(srv._batch_name_locks, {})
+
+
+class KeywordBatchNameTypeTests(unittest.TestCase):
+    """关键词批次的 batch_name 可以是 JSON 数字：库层会把它存成文本，跨站点检查也
+    必须按同一规则绑定（PG 上把 int 绑到 text 列是 DataError -> 500）。本机只有
+    SQLite 能跑，PG 的那一半由 CI 的 PG 任务覆盖。"""
+
+    def test_numeric_batch_name_still_creates_the_batch(self):
+        with isolated_server() as (client, _ctx):
+            for raw in (20261010, 1.5):
+                with self.subTest(batch_name=raw):
+                    r = client.post("/api/search-batches", json={
+                        "batch_name": raw, "keywords": ["mouse"],
+                        "domain": "www.amazon.com", "discover_mode": "discover_only"})
+                    self.assertEqual(r.status_code, 200, r.text)
 
 
 class KeywordBatchCanadaDefaultZipTests(unittest.TestCase):

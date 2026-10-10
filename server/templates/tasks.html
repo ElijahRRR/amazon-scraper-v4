@@ -378,7 +378,9 @@ document.getElementById('uploadForm').addEventListener('submit', async (e) => {
                     (data.marketplace ? '）' : '；如果那是加拿大邮编，请改选加拿大站重新上传）'));
             }
             resultDiv.appendChild(alertDiv);
-            setTimeout(() => location.reload(), 1500);
+            // 有邮编被退回时不自动刷新：1.5 秒后提示就没了，用户来不及看到
+            // 「站点可能选错了」。没有退回时与改造前一样自动刷新。
+            if (!(badZip > 0)) setTimeout(() => location.reload(), 1500);
         } else {
             resultDiv.style.display = 'block';
             const alertDiv = document.createElement('div');

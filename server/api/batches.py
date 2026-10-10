@@ -131,42 +131,47 @@ async def _create_batch_with_tasks(
     base = str(request.base_url).rstrip("/")
     status_url = f"{base}/api/batches/{batch_name}/status"
 
-    batch_id, created = await _s.db.create_batch_if_absent(
-        batch_name, needs_screenshot,
-        external_id=ext_id, callback_url=cb_url,
-        expand_variants=expand_variants,
-    )
-    if not created:
-        # 撞名 -> 409，**绝不静默合并**。
-        #
-        # 以前这里是 200 + 既有 batch_id，实测后果（Phase 4.7 已证明撞名不是
-        # no-op，本轮修的就是它）：
-        #   * 本次的新 ASIN 被悄悄塞进上一个批次，「一次采集」的语义破掉；
-        #   * `inserted` 在部分重叠时是非零，看起来像成功新建；
-        #   * **本次的 external_id / callback_url 被静默丢弃**（INSERT OR IGNORE
-        #     整行不插，既有行一个字段都不更新），而响应回显的是**请求**里的值 ——
-        #     调用方以为回调注册好了，回调永远不会触发。
-        #
-        # 为什么是 409，而不是「自动加后缀」或「200 加个 merged 标志」：只有让
-        # 撞名变成一个**可识别的失败**，上传/推送才是可安全重试的 —— 网络超时后
-        # 重发，上一次若其实成功了，这里回的是 409 + 那个 batch_id。
-        # 自动加后缀会让重试造出第二个批次，200+标志则要求每个调用方都记得读那个
-        # 标志，漏读的代价与今天一模一样。
-        #
-        # 注意 batch_id 是**既有批次**的 id（create_batch_if_absent 撞名时照样把它
-        # SELECT 回来），调用方可以直接拿 status_url 接着轮询，不必再查一次。
-        raise HTTPException(409, {
-            "error": _s._BATCH_NAME_CONFLICT_CODE,
-            "message": f"批次名已存在: {batch_name}（未合并，也未改动既有批次）",
-            "batch_id": batch_id,
-            "batch_name": batch_name,
-            "status_url": status_url,
-        })
+    # 建批次行与写任务是两个事务，中间有一段「批次已存在、还没有任务」的窗口；
+    # 「同名 = 合并」的入口（插件 / 关键词 / 卖家上传）在这段窗口里查站点会放行，
+    # 把别的站点的任务并进来。同一把按批次名的锁让它们等本批任务写完再查
+    # （server/app.py::_batch_name_lock）。本入口自己撞名仍是下面的 409。
+    async with _s._batch_name_lock(batch_name):
+        batch_id, created = await _s.db.create_batch_if_absent(
+            batch_name, needs_screenshot,
+            external_id=ext_id, callback_url=cb_url,
+            expand_variants=expand_variants,
+        )
+        if not created:
+            # 撞名 -> 409，**绝不静默合并**。
+            #
+            # 以前这里是 200 + 既有 batch_id，实测后果（Phase 4.7 已证明撞名不是
+            # no-op，本轮修的就是它）：
+            #   * 本次的新 ASIN 被悄悄塞进上一个批次，「一次采集」的语义破掉；
+            #   * `inserted` 在部分重叠时是非零，看起来像成功新建；
+            #   * **本次的 external_id / callback_url 被静默丢弃**（INSERT OR IGNORE
+            #     整行不插，既有行一个字段都不更新），而响应回显的是**请求**里的值 ——
+            #     调用方以为回调注册好了，回调永远不会触发。
+            #
+            # 为什么是 409，而不是「自动加后缀」或「200 加个 merged 标志」：只有让
+            # 撞名变成一个**可识别的失败**，上传/推送才是可安全重试的 —— 网络超时后
+            # 重发，上一次若其实成功了，这里回的是 409 + 那个 batch_id。
+            # 自动加后缀会让重试造出第二个批次，200+标志则要求每个调用方都记得读那个
+            # 标志，漏读的代价与今天一模一样。
+            #
+            # 注意 batch_id 是**既有批次**的 id（create_batch_if_absent 撞名时照样把它
+            # SELECT 回来），调用方可以直接拿 status_url 接着轮询，不必再查一次。
+            raise HTTPException(409, {
+                "error": _s._BATCH_NAME_CONFLICT_CODE,
+                "message": f"批次名已存在: {batch_name}（未合并，也未改动既有批次）",
+                "batch_id": batch_id,
+                "batch_name": batch_name,
+                "status_url": status_url,
+            })
 
-    inserted = await _s.db.create_tasks(
-        batch_id, unique_asins, zc, needs_screenshot,
-        per_asin_zip=per_asin_zip, marketplace=spec.id,
-    )
+        inserted = await _s.db.create_tasks(
+            batch_id, unique_asins, zc, needs_screenshot,
+            per_asin_zip=per_asin_zip, marketplace=spec.id,
+        )
 
     # 回显**存下来的**值，不是请求里的值。
     # 撞名已经在上面 409 掉了，所以走到这里两者必然相等——但「回显请求值」这个

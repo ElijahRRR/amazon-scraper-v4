@@ -174,21 +174,23 @@ async def api_create_search_batch(request: Request):
     needs_screenshot = bool(body.get("needs_screenshot", False))
 
     # 关键词批次「同名 = 合并」；合并进一个别的站点的批次会让它变成混合站点批次。
-    await _s._reject_cross_site_batch(batch_name, mkt)
+    # 查与写放进同一把按批次名的锁（理由见 server/app.py::_batch_name_lock）。
+    async with _s._batch_name_lock(batch_name):
+        await _s._reject_cross_site_batch(batch_name, mkt)
 
-    # 站点**显式**传给库层，不让它再从 search_params['domain'] 推导一遍：
-    # 上面对注册表之外的 16 个搜索站点有意放行了 discover_only（站点落到美国），
-    # 库层再推导会对它们抛 ValueError —— 这里放行的请求在库层变成 500。
-    # 站点只认这一处解析的结果，两层不可能各说各的。
-    batch_id, inserted = await _s.db.create_search_batch(
-        name=batch_name,
-        keywords=keywords,
-        search_params=search_params,
-        discover_mode=discover_mode,
-        zip_code=zc,
-        needs_screenshot=needs_screenshot,
-        marketplace=mkt.id,
-    )
+        # 站点**显式**传给库层，不让它再从 search_params['domain'] 推导一遍：
+        # 上面对注册表之外的 16 个搜索站点有意放行了 discover_only（站点落到美国），
+        # 库层再推导会对它们抛 ValueError —— 这里放行的请求在库层变成 500。
+        # 站点只认这一处解析的结果，两层不可能各说各的。
+        batch_id, inserted = await _s.db.create_search_batch(
+            name=batch_name,
+            keywords=keywords,
+            search_params=search_params,
+            discover_mode=discover_mode,
+            zip_code=zc,
+            needs_screenshot=needs_screenshot,
+            marketplace=mkt.id,
+        )
     if not batch_id:
         raise HTTPException(500, "创建关键词批次失败")
 

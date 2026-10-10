@@ -274,66 +274,71 @@ async def api_extension_collect(request: Request):
             400, f"batch_name 含有不能用作路径的字符（/ \\ .. 或控制字符）: {batch_name!r}")
 
     # ---- 一个批次一个站点：两个批次都先查完，再动手写（见模块头注）----
-    if asins:
-        await _reject_cross_site_append(batch_name, spec)
-    if seller_ids:
-        await _reject_cross_site_append(f"{batch_name}_sellers", spec)
+    # 「查站点 + 写」放在同一把按批次名的锁里：先查后写的两个同名、不同站点的
+    # 请求同时到达时，否则两边都会查到「没有别的站点」然后都写进去。
+    lock_names = ([batch_name] if asins else []) + (
+        [f"{batch_name}_sellers"] if seller_ids else [])
+    async with _s._batch_name_lock(*lock_names):
+        if asins:
+            await _reject_cross_site_append(batch_name, spec)
+        if seller_ids:
+            await _reject_cross_site_append(f"{batch_name}_sellers", spec)
 
-    out: Dict[str, Any] = {
-        "asin_batch": None,
-        "seller_batch": None,
-        "invalid_asins": len(invalid_asins),
-        "source": str(body.get("source") or "")[:32],
-    }
-
-    # ---- 商品批次：create_batch_if_absent + create_tasks（追加语义天然成立）----
-    if asins:
-        batch_id, created = await _s.db.create_batch_if_absent(
-            name=batch_name, needs_screenshot=needs_screenshot)
-        if not batch_id:
-            raise HTTPException(500, f"创建批次失败: {batch_name}")
-        inserted = await _s.db.create_tasks(batch_id, asins, zc, needs_screenshot,
-                                            marketplace=spec.id)
-        out["asin_batch"] = {
-            "batch_id": batch_id,
-            "batch_name": batch_name,
-            "created": created,
-            "submitted_asins": len(asins),
-            "inserted_tasks": inserted,
-            "zip_code": zc,
-            "status_url": f"/api/batches/{batch_name}/status",
+        out: Dict[str, Any] = {
+            "asin_batch": None,
+            "seller_batch": None,
+            "invalid_asins": len(invalid_asins),
+            "source": str(body.get("source") or "")[:32],
         }
-        # 只在非美国站时多回一个键：老插件（不带 marketplace）拿到的响应
-        # 与改造前逐字节一致，与 /api/upload 的口径相同。
-        if not is_us:
-            out["asin_batch"]["marketplace"] = spec.id
 
-    # ---- 卖家批次：独立批次，见模块头注 ----
-    if seller_ids:
-        seller_batch_name = f"{batch_name}_sellers"
-        sb_id, sb_inserted = await _s.db.create_seller_batch(
-            name=seller_batch_name,
-            seller_ids=seller_ids,
-            discover_mode=discover_mode,
-            zip_code=zc,
-            needs_screenshot=needs_screenshot,
-            # 整店发现任务带上站点：worker 按任务行的站点去翻**这个站点**的
-            # 店铺，派生出来的详情任务再继承它（common/pgdb/media.py）。
-            # 不带的话加拿大店铺页上点"整店采集"，翻的是同一个卖家的美国店。
-            marketplace=spec.id,
-        )
-        if not sb_id:
-            raise HTTPException(500, f"创建卖家批次失败: {seller_batch_name}")
-        out["seller_batch"] = {
-            "batch_id": sb_id,
-            "batch_name": seller_batch_name,
-            "discover_mode": discover_mode,
-            "submitted_sellers": len(seller_ids),
-            "inserted_tasks": sb_inserted,
-            "status_url": f"/api/seller-batches/{sb_id}/progress",
-        }
-        if not is_us:
-            out["seller_batch"]["marketplace"] = spec.id
+        # ---- 商品批次：create_batch_if_absent + create_tasks（追加语义天然成立）----
+        if asins:
+            batch_id, created = await _s.db.create_batch_if_absent(
+                name=batch_name, needs_screenshot=needs_screenshot)
+            if not batch_id:
+                raise HTTPException(500, f"创建批次失败: {batch_name}")
+            inserted = await _s.db.create_tasks(batch_id, asins, zc, needs_screenshot,
+                                                marketplace=spec.id)
+            out["asin_batch"] = {
+                "batch_id": batch_id,
+                "batch_name": batch_name,
+                "created": created,
+                "submitted_asins": len(asins),
+                "inserted_tasks": inserted,
+                "zip_code": zc,
+                "status_url": f"/api/batches/{batch_name}/status",
+            }
+            # 只在非美国站时多回一个键：老插件（不带 marketplace）拿到的响应
+            # 与改造前逐字节一致，与 /api/upload 的口径相同。
+            if not is_us:
+                out["asin_batch"]["marketplace"] = spec.id
+
+        # ---- 卖家批次：独立批次，见模块头注 ----
+        if seller_ids:
+            seller_batch_name = f"{batch_name}_sellers"
+            sb_id, sb_inserted = await _s.db.create_seller_batch(
+                name=seller_batch_name,
+                seller_ids=seller_ids,
+                discover_mode=discover_mode,
+                zip_code=zc,
+                needs_screenshot=needs_screenshot,
+                # 整店发现任务带上站点：worker 按任务行的站点去翻**这个站点**的
+                # 店铺，派生出来的详情任务再继承它（common/pgdb/media.py）。
+                # 不带的话加拿大店铺页上点"整店采集"，翻的是同一个卖家的美国店。
+                marketplace=spec.id,
+            )
+            if not sb_id:
+                raise HTTPException(500, f"创建卖家批次失败: {seller_batch_name}")
+            out["seller_batch"] = {
+                "batch_id": sb_id,
+                "batch_name": seller_batch_name,
+                "discover_mode": discover_mode,
+                "submitted_sellers": len(seller_ids),
+                "inserted_tasks": sb_inserted,
+                "status_url": f"/api/seller-batches/{sb_id}/progress",
+            }
+            if not is_us:
+                out["seller_batch"]["marketplace"] = spec.id
 
     return out
 

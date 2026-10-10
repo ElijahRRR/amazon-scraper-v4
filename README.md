@@ -339,7 +339,9 @@ curl -X POST http://<server>:8899/api/upload \
   -F file=@ca_asins.xlsx -F marketplace=amazon.ca -F zip_code='M5V 3L9'
 ```
 
-一个批次只属于一个站点。批次结果、批次导出、截图都按**任务行的站点**取对应那一行
+一个批次只属于一个站点：「同名 = 合并 / 追加」的入口（插件推送、`POST /api/search-batches`、
+`POST /api/upload-sellers`）遇到同名批次里已有**另一个站点**的任务时返回 `409`，什么都不写；
+同站点的同名合并语义不变。批次结果、批次导出、截图都按**任务行的站点**取对应那一行
 `asin_data`（同一个 ASIN 美加各有一行时，加拿大批次只出加拿大行，美国批次只出美国行）；
 `GET /api/results/{asin}` 不带站点时只给美国行（与加站点之前一致，只在加拿大有的 ASIN 返回 404），带 `?marketplace=amazon.ca` 取加拿大行。
 

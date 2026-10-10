@@ -1164,24 +1164,69 @@ def _site_zip_error(raw, spec: "_marketplace.MarketplaceSpec") -> HTTPException:
         400, f"非法邮编: {raw!r}（{spec.label}需要 {spec.default_postal!r} 这种形状）")
 
 
-async def _reject_cross_site_batch(name: str, spec: "_marketplace.MarketplaceSpec") -> None:
+#: 每个批次名一把锁 + 引用计数（见 ``_batch_name_lock``）。用完即删，不会随批次名增长。
+_batch_name_locks: Dict[str, list] = {}
+
+
+@asynccontextmanager
+async def _batch_name_lock(*names):
+    """同名批次的「查站点 -> 写任务」串行化（F-012 blocker 3）。
+
+    ``_reject_cross_site_batch`` 是先查后写：两个同名、不同站点的请求同时到达时，
+    两边都查到「没有别的站点的任务」，然后都写进去 —— 批次就混了站点，之后同名的
+    每一次推送都是 409。把「查 + 写」放进同一把按批次名的锁里，第二个请求就会在
+    第一个写完之后再查，查到别的站点 -> 409。
+
+    只锁同名请求，不同批次名之间互不等待；美国站同名追加的响应不变，只是同名
+    请求之间排队。锁是**进程内**的 —— server 是单进程（``main()`` 的
+    ``uvicorn.run`` 没开多 worker），多进程部署需要换成库里的行锁。
+    多个名字按排序后的顺序加锁，两个各要两把锁的请求不会互相死等。
+    """
+    keys = sorted({str(n) for n in names})
+    entries = []
+    for k in keys:
+        ent = _batch_name_locks.setdefault(k, [asyncio.Lock(), 0])
+        ent[1] += 1
+        entries.append((k, ent))
+    acquired = []
+    try:
+        for _k, ent in entries:
+            await ent[0].acquire()
+            acquired.append(ent[0])
+        yield
+    finally:
+        for lock in reversed(acquired):
+            lock.release()
+        for k, ent in entries:
+            ent[1] -= 1
+            if ent[1] == 0 and _batch_name_locks.get(k) is ent:
+                del _batch_name_locks[k]
+
+
+async def _reject_cross_site_batch(name, spec: "_marketplace.MarketplaceSpec") -> None:
     """同名批次里已有**别的站点**的任务 -> 409（F-012 blocker 3）。
 
     给「同名 = 合并 / 追加」的入口用（插件推送、关键词批次、卖家文件上传）：
     一个批次只能属于一个站点 —— tasks 是 UNIQUE(batch_id, asin)，批次结果 /
     导出 / 变体展开都按任务行的站点取数据、按「整批同一站点」挑查询形状。
     把两个站点混进一个批次，这些读路径就只能走慢的逐行兜底，变体展开取哪条
-    任务行的站点也说不准。
+    任务行的站点也说不准。调用方要把这个检查和随后的写放进 ``_batch_name_lock``。
 
     问的是「有没有任何一条任务不属于这个站点」，而不是「第一条任务是哪个站点」：
-    只看 ``LIMIT 1`` 的话，一个已经混了站点的老批次（或两个入口并发写同名批次）
-    会因为恰好先读到同站点那条而放行，越混越多。批次不存在 / 还没有任务 -> 放行。
+    只看 ``LIMIT 1`` 的话，一个已经混了站点的老批次会因为恰好先读到同站点那条而
+    放行，越混越多。批次不存在 / 还没有任务 -> 放行。
+
+    批次名按库层写入时的同一条规则绑定（PG 走 ``text_affinity``，OWNERSHIP.md
+    规则 7）：关键词批次的 ``batch_name`` 可以是 JSON 数字，库层 create_* 会把它
+    转成文本存下；这里若把 int 原样绑到 text 列，asyncpg 直接 DataError -> 500，
+    而改动前同一个请求是 200。SQLite 靠列亲和性，不需要转换。
     """
+    name_p = db.text_affinity(name) if hasattr(db, "text_affinity") else name
     sql = (
         "SELECT t.marketplace FROM tasks t JOIN batches b ON b.id = t.batch_id "
-        "WHERE b.name = ? AND COALESCE(t.marketplace, 'amazon.com') <> ? LIMIT 1"
+        "WHERE b.name = ? AND t.marketplace <> ? LIMIT 1"
     )
-    async with db.read() as rc, rc.execute(sql, (name, spec.id)) as c:
+    async with db.read() as rc, rc.execute(sql, (name_p, spec.id)) as c:
         row = await c.fetchone()
     if not row:
         return
@@ -1194,7 +1239,7 @@ async def _reject_cross_site_batch(name: str, spec: "_marketplace.MarketplaceSpe
         409,
         f"批次 {name!r} 已经是{existing_label}（{existing}）的批次，不能追加"
         f"{spec.label}（{spec.id}）的任务：一个批次只能属于一个站点。"
-        f"换一个批次名重新推送。")
+        f"换一个批次名重新提交。")
 
 
 def _safe_fs_component(name: str) -> Optional[str]:
