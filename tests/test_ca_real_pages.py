@@ -49,6 +49,18 @@ def _parse(asin: str) -> dict:
         return AmazonParser().parse_product(f.read(), asin, _ZIP, "amazon.ca")
 
 
+def _raw(asin: str) -> str:
+    """原始 HTML。给需要直接喂某一层的用例用 —— 出口看不见那一层的死活。"""
+    path = os.path.join(_FIXTURE_DIR, f"{asin}.html.gz")
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        return f.read()
+
+
+def _sp_data(asin: str) -> dict:
+    from common.core import marketplace as M
+    return AmazonParser()._extract_sp_data(_raw(asin), M.get("amazon.ca"))
+
+
 class GildanFirstPartyPage(unittest.TestCase):
     """B09S6W6H5B —— Amazon.ca **自营**，detailBullets 版详情表。"""
 
@@ -116,6 +128,20 @@ class GildanFirstPartyPage(unittest.TestCase):
         self.assertEqual(self.r["product_url"],
                          "https://www.amazon.ca/dp/B09S6W6H5B")
 
+    def test_js_price_fallback_layer_is_alive_on_a_real_page(self):
+        """真页面上这一层曾经**整层**返回 {} —— 而出口字段看着完全正常。
+
+        所以必须直接喂 ``_extract_sp_data``：CSS 价格在这张页面上取得到，
+        ``current_price`` 照样是 ``$32.67``，从 ``parse_product`` 的出口看不出
+        这一层死了。夹具里 ``"priceAmount":32.67`` 就在 buybox JSON 里。
+        这一层是纯正则，不碰 HTML 引擎，所以不需要 skipUnless(_HAS_SLX)。
+        """
+        d = _sp_data("B09S6W6H5B")
+        self.assertNotEqual(d, {}, "真实加拿大页面上整层 JS fallback 返回空字典")
+        self.assertEqual(d["_twister_price"], "$32.67")
+        # 同页两个价格键形状必须一致，别出现 "$32.67" vs "CDN$ 32.67"
+        self.assertEqual(d["_twister_price"], d["_js_display_price"])
+
 
 class YatineyThirdPartyPage(unittest.TestCase):
     """B0F673BSBL —— **第三方卖家** + Amazon 发货，tech-spec 表格版详情。"""
@@ -167,6 +193,12 @@ class YatineyThirdPartyPage(unittest.TestCase):
     def test_zip_observed_and_verified(self):
         self.assertEqual(self.r["_zip_observed"], _ZIP)
         self.assertEqual(self.r["_zip_verify"], "confirmed")
+
+    def test_js_price_fallback_layer_is_alive_on_a_real_page(self):
+        """同 GildanFirstPartyPage 那条：三方卖家页面上这一层也不许整层消失。"""
+        d = _sp_data("B0F673BSBL")
+        self.assertNotEqual(d, {}, "真实加拿大页面上整层 JS fallback 返回空字典")
+        self.assertEqual(d["_twister_price"], "$77.89")
 
 
 class BothEnginesAgree(unittest.TestCase):

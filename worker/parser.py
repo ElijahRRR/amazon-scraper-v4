@@ -490,7 +490,7 @@ class AmazonParser:
         result["_page_asin"] = self._extract_page_asin(tree, html_text)
 
         # v3: 提取 JS 脚本数据（额外 fallback 层）
-        sp_data = self._extract_sp_data(html_text)
+        sp_data = self._extract_sp_data(html_text, spec)
 
         # 全页预扫描 — 提取 Product Information 表格
         page_details = self._slx_parse_all_details(tree, html_text)
@@ -1556,9 +1556,19 @@ class AmazonParser:
 
     # ==================== v3 增强: 多层 fallback 方法 ====================
 
-    def _extract_sp_data(self, html_text: str) -> Dict[str, Any]:
+    def _extract_sp_data(self, html_text: str, spec=None) -> Dict[str, Any]:
         """从 JavaScript SP/twister/AAPI 数据中提取字段（v3 新增 fallback 层）
         Amazon 页面经常在 <script> 中嵌入结构化数据，比 CSS 更稳定
+
+        ``spec``（F-012）只有下面第 2 步用得上：twister 给的是**裸数字**
+        （``"priceAmount":32.67``），价格串得我们自己拼，拼哪个符号由站点的
+        注册表字段 ``render_symbol`` 决定。其余几步搬的是页面上已有的串，与站点无关。
+
+        ⚠ 这个形参曾经漏了，而函数体已经在用 ``spec``：第 2 步抛 NameError，
+          内层 except 捕不到、被末尾的 ``except Exception`` 吞掉，整个函数返回
+          ``{}`` —— 与「页面没有这段 JSON」完全同形，美加两站任何含
+          ``priceAmount`` 的页面上这一层四路 fallback 都静默消失。
+          回归由 tests/test_marketplace.py 的 SpDataFallbackLayerIsAlive 守住。
         """
         result = {}
         try:

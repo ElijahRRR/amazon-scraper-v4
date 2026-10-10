@@ -332,6 +332,27 @@ class SearchTaskTests(unittest.TestCase):
         self.assertEqual(len(w.submitted_failures), 1)
         self.assertEqual(w.submitted_failures[0]["error_type"], error_types.BLOCKED)
 
+    def test_ca_task_marketplace_and_zip_reach_the_slot_on_every_page(self):
+        """F-012：站点与邮编必须**逐页**传到 slot —— 包括被封轮换之后那几页。
+
+        这条同时把 FakeSlot.ensure_ready_calls 从"记了没人读"变成真有断言读它。
+        """
+        pages = [
+            FakeResponse(_page_html(["B0CA000001"], has_next=True)),
+            FakeResponse("blocked", status_code=503),
+            FakeResponse(_page_html(["B0CA000002"], has_next=False)),
+        ]
+        w, slot, session = make_worker(pages)
+        task = make_task(domain="www.amazon.ca")
+        task["marketplace"] = "amazon.ca"
+        task["zip_code"] = "M5V 3L9"
+        run(w._process_search_task(task, slot))
+
+        self.assertTrue(slot.rotations, "被封必须轮换 session 换 IP")
+        self.assertGreaterEqual(len(slot.ensure_ready_calls), 2)
+        self.assertEqual({mk for mk, _ in slot.ensure_ready_calls}, {"amazon.ca"})
+        self.assertEqual({z for _, z in slot.ensure_ready_calls}, {"M5V 3L9"})
+
     def test_404_mid_pagination_is_a_boundary_not_an_error(self):
         """翻页途中拿到 404 = 没有更多结果，已抓到的照常提交。"""
         pages = [

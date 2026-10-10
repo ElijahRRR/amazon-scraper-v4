@@ -272,17 +272,33 @@ class SessionSlot:
         return self._success_since_rotate >= self._w._rotate_every
 
     async def rotate(self, reason: str = "轮换"):
-        """冷轮换本 slot 的 session（5s 防抖）。只影响本 slot，其它 slot 不停。"""
+        """冷轮换本 slot 的 session（5s 防抖）。只影响本 slot，其它 slot 不停。
+
+        F-012：换掉的只有**代理 IP**。站点与邮编是任务维度，轮换不许顺手改。
+        不带这两个参数，新 session 会落回「amazon.com + worker 全局邮编」，而
+        self._marketplace 仍自称 amazon.ca → 下一次 ensure_ready('amazon.ca')
+        判定「站点没变」不重建 → 这个 slot 之后所有 CA 任务都从 amazon.com 取页，
+        两侧都不会响。
+        """
         now = time.monotonic()
         if now - self._last_rotate_time < 5:
             return
         logger.info(f"🔄 [slot] Session {reason}，冷轮换")
+        # 两个值都必须在 _close() 之前读：_close() 会把 self.session 置 None。
+        keep_marketplace = self._marketplace
+        keep_zip = self.session.zip_code if self.session is not None else None
         await self._close()
         try:
             await self._w.proxy_manager.report_blocked()
         except Exception:
             pass
-        self.session = await self._w._create_session_with_retry(delay=1)
+        # 邮编传回去的只是期望值：新 session 的 initialize() 会在新 IP 上重新
+        # POST 并验证，不存在沿用旧 IP 服务端状态的情形。
+        self.session = await self._w._create_session_with_retry(
+            delay=1, marketplace=keep_marketplace, zip_code=keep_zip)
+        # 与 ensure_ready 写 want 同一口径：_marketplace 永远等于 session 真实站点。
+        self._marketplace = (_marketplace.get(keep_marketplace).id
+                             if self.session is not None else None)
         self._success_since_rotate = 0
         self._empty_title_count = 0
         self._last_rotate_time = time.monotonic()

@@ -641,5 +641,212 @@ class FieldBugsFoundByRealCollection(unittest.TestCase):
                          "package 行不许落进 item 字段")
 
 
+
+# ==========================================================================
+# 10) JS fallback 层：spec 的交接（blocker 1）
+# ==========================================================================
+try:
+    from selectolax.parser import HTMLParser as _Slx  # noqa: F401
+    _HAS_SLX = True
+except ImportError:                                   # pragma: no cover
+    _Slx = None
+    _HAS_SLX = False
+
+
+def _unbound_spec_refs(src: str, label: str) -> list:
+    """函数体里以 Load 方式用到 ``spec``、而本函数又没绑定它的位置。
+
+    只认 ``spec`` 这一个名字是有意的：放宽成「所有未绑定名」会被一百多处函数内
+    局部 import 淹没，那种噪音会训练人去忽略哨兵。F-012 的 ``spec`` 是**传参**、
+    不入 self、也没有模块级同名变量，所以引用它只可能来自形参或局部绑定。
+
+    本仓没装 pyflakes / ruff / flake8，这里只用标准库 ``symtable``，永不 skip。
+    """
+    import symtable
+
+    bad = []
+
+    def walk(table, trail=""):
+        name = trail + "/" + table.get_name()
+        if table.get_type() == "function":
+            for sym in table.get_symbols():
+                if (sym.get_name() == "spec" and sym.is_referenced()
+                        and not (sym.is_parameter() or sym.is_assigned()
+                                 or sym.is_free())):
+                    bad.append(f"{label}:{table.get_lineno()} {name}")
+        for child in table.get_children():
+            walk(child, name)
+
+    walk(symtable.symtable(src, label, "exec"))
+    return bad
+
+
+class SpDataFallbackLayerIsAlive(unittest.TestCase):
+    """``_extract_sp_data`` 的 ``spec`` 没绑上，把整层 JS fallback 弄死了。
+
+    被测函数**恒静默失败**：NameError 被函数末尾的 ``except Exception`` 吞掉，
+    交出一个空字典，于是「价格取不到」和「页面上本来就没价格」长得一模一样。
+    所以第一条断言不是「值对不对」，是「字典不是空的」—— 而且是严格超集：
+    同一张页面只差一个 ``priceAmount`` token，加了它反而让键变少，只可能是
+    整层被吞了。这组用例不改 production 的 except（那会改美国站的日志与返回形状）。
+    """
+
+    #: 同一张页面，只差一个 priceAmount token —— 为的是能做严格超集断言。
+    _BASE = ('<html><body><span id="productTitle">T</span><script>var d={'
+             '"stockStatus":"IN_STOCK","displayPrice":"$24.99"%s};'
+             '</script></body></html>')
+
+    def setUp(self):
+        from worker.parser import AmazonParser
+        self.p = AmazonParser()
+        self.without = self._BASE % ""
+        self.with_tw = self._BASE % ',"priceAmount":24.99'
+
+    def test_the_whole_layer_does_not_die_on_a_page_that_has_a_price(self):
+        """bug 在时：``without`` 给两个键、``with_tw`` 给空字典，这条直接红。"""
+        for mkt in list(M.all_ids()) + [None]:
+            with self.subTest(marketplace=mkt):
+                spec = M.get(mkt)
+                a = set(self.p._extract_sp_data(self.without, spec))
+                b = set(self.p._extract_sp_data(self.with_tw, spec))
+                self.assertTrue(b, f"{mkt}: 返回空字典 —— 整层 fallback 被吞了")
+                self.assertTrue(b > a,
+                                f"{mkt}: 多给一个 priceAmount 反而键没变多（{b - a}）")
+                self.assertEqual(b - a, {"_twister_price"})
+
+    def test_a_page_with_no_payload_is_legitimately_empty(self):
+        """把「空字典的唯一合法来源」钉死，上一条的 {} 才不会被当成正常。"""
+        self.assertEqual(self.p._extract_sp_data("<html></html>", None), {})
+
+    def test_us_twister_price_is_the_pre_f012_literal(self):
+        """与 origin/main 的 ``f"${price_val:.2f}"`` 逐字节相同。"""
+        for mkt in (None, "amazon.com", "AMAZON.COM", "https://www.amazon.com/"):
+            with self.subTest(marketplace=mkt):
+                r = self.p._extract_sp_data(self.with_tw, M.get(mkt))
+                self.assertEqual(r["_twister_price"], "$24.99")
+
+    def test_ca_twister_price_comes_from_the_registry(self):
+        """第二条故意与第一条冗余：注册表被人改坏时第一条会跟着错，第二条不会。
+        加拿大站 ``render_symbol`` 是裸 ``$``、不是 ``CDN$``（真实页面实测）。
+        """
+        r = self.p._extract_sp_data(self.with_tw, M.get("amazon.ca"))
+        self.assertEqual(r["_twister_price"],
+                         M.get("amazon.ca").render_symbol + "24.99")
+        self.assertEqual(r["_twister_price"], "$24.99")
+
+    def test_the_symbol_follows_the_spec_and_is_not_pinned_to_us(self):
+        """两站 ``render_symbol`` 今天恰好同值，必须造第三个站点才测得出
+        「符号到底跟不跟着 spec 走」：写死 ``$`` 或 ``_sym(None)`` 的改法这条都红。
+        """
+        import dataclasses
+        fake = dataclasses.replace(M.get("amazon.ca"),
+                                   id="amazon.test", render_symbol="£")
+        r = self.p._extract_sp_data(self.with_tw, fake)
+        self.assertEqual(r["_twister_price"], "£24.99",
+                         "符号没跟着 spec 走 —— 函数里把站点钉死了")
+
+    @unittest.skipUnless(_HAS_SLX, "selectolax 未安装；lxml 路径没有这一层")
+    def test_current_price_and_stock_reach_the_result_through_the_js_layer(self):
+        """字段级端到端。必须 skipUnless(_HAS_SLX)：``_parse_with_lxml`` 不调
+        ``_extract_sp_data``，lxml 路径上 ``current_price`` 是 N/A。
+
+        页面故意**不给** displayPrice，否则优先级会先命中 ``_js_display_price``，
+        测不到 twister 那一段。
+        """
+        html = ('<html><body><span id="productTitle">T</span><script>var d={'
+                '"priceAmount":24.99,"stockStatus":"IN_STOCK"};'
+                '</script></body></html>')
+        for mkt, zipc in ((None, "10001"), ("amazon.com", "10001"),
+                          ("amazon.ca", "K1V 7P8")):
+            with self.subTest(marketplace=mkt):
+                r = self.p.parse_product(html, "B0TWIST001", zipc, mkt)
+                self.assertEqual(r["current_price"], "$24.99",
+                                 "价格回落到 N/A —— JS fallback 层没活过来")
+                self.assertEqual(r["stock_status"], "IN_STOCK")
+
+    @unittest.skipUnless(_HAS_SLX, "selectolax 未安装")
+    def test_the_fallback_value_is_not_double_prefixed(self):
+        """这一层的产出**已经带符号**，``_slx_parse_price_enhanced`` 不许再补一个
+        变成 ``$$24.99``。"""
+        out = self.p._slx_parse_price_enhanced(
+            _Slx("<html><body></body></html>"), {},
+            {"_twister_price": "$24.99"}, M.get("amazon.ca"))
+        self.assertEqual(out, "$24.99")
+
+
+class SpecIsBoundWhereverItIsUsed(unittest.TestCase):
+    """让「spec 没绑上 / 没传下去」这一整类缺陷再也回不来。
+
+    两条哨兵抓同一个错误类的两种形态：
+      * 第 1 条抓「函数体读 spec、签名没 spec」 —— 运行期 NameError，而 parser
+        里到处是 ``except Exception``，会被吞成静默空值；
+      * 第 3 条抓「调用点忘了传 spec」 —— 不炸，但悄悄按美国站口径解析，
+        第 1 条抓不到它。
+    """
+
+    _PKGS = ("worker", "server", "common", "tools")
+
+    def test_no_function_reads_an_unbound_spec(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        bad = []
+        for pkg in self._PKGS:
+            for dirpath, dirnames, filenames in os.walk(os.path.join(root, pkg)):
+                dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+                for fn in sorted(filenames):
+                    if not fn.endswith(".py"):
+                        continue
+                    path = os.path.join(dirpath, fn)
+                    with open(path, encoding="utf-8") as f:
+                        bad += _unbound_spec_refs(f.read(),
+                                                  os.path.relpath(path, root))
+        self.assertEqual(bad, [],
+                         "这些函数引用了没有绑定的 spec（F-012 的 spec 是**传参**，"
+                         "不入 self、也没有模块级同名变量）：\n  "
+                         + "\n  ".join(bad))
+
+    def test_the_guard_itself_still_reports(self):
+        """哨兵自测：不会失效的哨兵才算哨兵（同第 8 节那条 AST 哨兵的立场）。"""
+        self.assertEqual(
+            len(_unbound_spec_refs("def f(x):\n    return _sym(spec)\n", "t.py")), 1)
+        self.assertEqual(
+            _unbound_spec_refs("def f(x, spec=None):\n    return _sym(spec)\n",
+                               "t.py"), [])
+
+    def test_every_spec_taking_call_in_parser_passes_spec(self):
+        """收 spec 形参的方法，在 parser.py 内的调用点必须显式传 spec。"""
+        import ast
+
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        path = os.path.join(root, "worker", "parser.py")
+        with open(path, encoding="utf-8") as f:
+            tree = ast.parse(f.read(), filename=path)
+
+        takers = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                args = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
+                if "spec" in [a.arg for a in args]:
+                    takers.add(node.name)
+        self.assertIn("_extract_sp_data", takers,
+                      "_extract_sp_data 没有 spec 形参 —— blocker 1 没修")
+
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = (func.attr if isinstance(func, ast.Attribute)
+                    else getattr(func, "id", None))
+            if name not in takers:
+                continue
+            shown = [ast.unparse(a) for a in node.args]
+            shown += [f"{kw.arg}={ast.unparse(kw.value)}" for kw in node.keywords]
+            if not any("spec" in s for s in shown):
+                offenders.append(
+                    f"worker/parser.py:{node.lineno} {name}({', '.join(shown)})")
+        self.assertEqual(offenders, [],
+                         "这些站内调用点没传 spec，会静默按美国站口径解析：\n  "
+                         + "\n  ".join(offenders))
+
 if __name__ == "__main__":
     unittest.main()
