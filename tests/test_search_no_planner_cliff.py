@@ -193,10 +193,22 @@ async def test_long_terms_still_use_branches(monkeypatch):
     assert "WITH search_hit AS MATERIALIZED" in seen["sqls"][0][0]
 
 
-def _capture_sql(monkeypatch):
+def _patch_batch_site(monkeypatch, site):
+    """F-012：批次连接先发一条站点探针（``_batch_site_literal``）再拼 SQL。
+    这里不连库，把探针换成固定答案：``"'amazon.com'"`` = 单一站点（钉字面量），
+    ``None`` = 证明不了单一站点（逐行片段）。"""
+    from common.pgdb import Database as PgDatabase
+
+    async def _site(self, batch_id):
+        return site
+    monkeypatch.setattr(PgDatabase, "_batch_site_literal", _site, raising=False)
+
+
+def _capture_sql(monkeypatch, site="'amazon.com'"):
     """跑一次 get_results，把它拼出来的 SQL + 参数抓回来（不连库）。"""
     import contextlib
     from common.pgdb import Database as PgDatabase
+    _patch_batch_site(monkeypatch, site)
     seen = []
 
     class _Cur:
@@ -223,6 +235,8 @@ def _capture_sql(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("site", ["'amazon.com'", "'amazon.ca'", None],
+                         ids=["single-us", "single-ca", "mixed"])
 @pytest.mark.parametrize("kw", [
     dict(search="B0AAA11111,B0BBB22222,B0CCC33333,B0DDD44444", batch_id=1),
     dict(search="B0AAA11111,B0BBB22222", batch_id=1, cursor_id=7),
@@ -230,7 +244,7 @@ def _capture_sql(monkeypatch):
     dict(search="B0AAA11111,B0BBB22222", batch_id=1, change_filter="new"),
     dict(search="B0AAA11111,B0BBB22222", batch_id=1, sort="recent"),
 ])
-async def test_batch_filter_uses_materialized_bset_not_branches(monkeypatch, kw):
+async def test_batch_filter_uses_materialized_bset_not_branches(monkeypatch, kw, site):
     """⚠ 带 batch_id 时**不许**拆分支 —— 分支里那个 JOIN batch_asins 会被
     原样复制 3N 份。
 
@@ -244,7 +258,7 @@ async def test_batch_filter_uses_materialized_bset_not_branches(monkeypatch, kw)
     可能，也就不需要拆分支来防 cliff。
     """
     from common.pgdb import Database as PgDatabase
-    db, seen = _capture_sql(monkeypatch)
+    db, seen = _capture_sql(monkeypatch, site=site)
     await PgDatabase.get_results(db, limit=50, with_total=False, **kw)
     sql, params = seen[0]
     assert "WITH bset AS MATERIALIZED" in sql, sql[:400]
@@ -256,18 +270,28 @@ async def test_batch_filter_uses_materialized_bset_not_branches(monkeypatch, kw)
     if kw.get("change_filter") == "new":
         assert "ba2" in sql, "本批新增的 ba2 连接不该被一起换掉"
     assert sql.count("?") == len(params), (sql.count("?"), len(params))
-    # F-012：bset 顺带物化每行任务的站点，外层按它钉 d.marketplace。少了这一条，
-    # 加拿大批次一搜索就把同 ASIN 的美国行也带出来（R2）。片段与非搜索路径同源。
+    # F-012：外层按站点钉 d.marketplace。少了这一条，加拿大批次一搜索就把同 ASIN
+    # 的美国行也带出来（R2）。
     from common.core.dbtables import task_marketplace_sql
-    assert (f"{task_marketplace_sql('batch_asins.batch_id', 'batch_asins.asin')} "
-            "AS marketplace") in sql, sql[:600]
-    assert "JOIN bset ON bset.asin = d.asin AND bset.marketplace = d.marketplace" in sql
+    if site:
+        # 单一站点：bset 与 F-012 之前逐字相同，站点是外层连接里的**字面量**。
+        # ⚠ 不许出现 SubPlan（`FROM tasks t`）：MATERIALIZED CTE 的列没有统计，
+        #   逐行片段在这里会让规划器落回默认选择性（实测 bset 82ms -> 896ms）。
+        assert "SELECT asin FROM batch_asins WHERE batch_id = ?" in sql, sql[:600]
+        assert f"JOIN bset ON bset.asin = d.asin AND d.marketplace = {site}" in sql, sql[:600]
+        assert "FROM tasks t" not in sql, sql[:600]
+    else:
+        # 混合批次：bset 顺带物化每行任务的站点，外层按它钉 —— 片段与非搜索路径同源
+        assert (f"{task_marketplace_sql('batch_asins.batch_id', 'batch_asins.asin')} "
+                "AS marketplace") in sql, sql[:600]
+        assert "JOIN bset ON bset.asin = d.asin AND bset.marketplace = d.marketplace" in sql
 
 
-def _capture_sql_with_count(monkeypatch):
+def _capture_sql_with_count(monkeypatch, site="'amazon.com'"):
     """同 ``_capture_sql``，但 fetchone 回 ``[0]`` —— 让 count 查询也能跑完、被抓到。"""
     import contextlib
     from common.pgdb import Database as PgDatabase
+    _patch_batch_site(monkeypatch, site)
     seen = []
 
     class _Cur:
@@ -294,31 +318,43 @@ def _capture_sql_with_count(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("site", ["'amazon.com'", "'amazon.ca'", None],
+                         ids=["single-us", "single-ca", "mixed"])
 @pytest.mark.parametrize("kw", [
     dict(),
     dict(change_filter="new"),
     dict(change_filter="price_stock"),
     dict(search="qz"),                 # 短词：扁平 OR，留在 WHERE
     dict(cursor_id=7),
+    dict(sort="recent"),
+    dict(columns=["asin", "title"]),   # 窄投影
 ])
-async def test_batch_join_pins_rows_to_the_task_site(monkeypatch, kw):
+async def test_batch_join_pins_rows_to_the_task_site(monkeypatch, kw, site):
     """F-012（R1）：带 batch_id 的数据查询与 count 查询，都要按**任务行的站点**
     钉住 d.marketplace —— 不然加拿大批次把同 ASIN 的美国行也算进来（total 翻倍），
     美国批次也会多出加拿大行。
 
-    片段内联注册表常量、不加 ``?``：所以参数个数仍然与占位符一一对应，
-    而主批次连接仍以 ``JOIN batch_asins ba `` 开头（bset 分支靠它摘掉主连接）。
+    ⚠ 单一站点（绝大多数批次）钉的必须是**字面量**，连接里不许出现逐行
+    SubPlan（``FROM tasks t``）。逐行片段在 PG 上是规划器悬崖：``列 = (SubPlan)``
+    只能套默认选择性，规划器丢掉「主键倒序扫、凑够一页就停」，每次翻页都
+    Seq Scan 整张 asin_data（对抗评审 PG 16 实测：10 万行批次翻页 3.5ms -> 628ms，
+    首屏 48ms -> 1105ms）。只有证明不了单一站点（混合批次）才用逐行片段。
+
+    两种写法都不加 ``?``：参数个数仍然与占位符一一对应，主批次连接仍以
+    ``JOIN batch_asins ba `` 开头（bset 分支靠它摘掉主连接）。
     """
     from common.core.dbtables import BA_ROW_MARKETPLACE_SQL
     from common.pgdb import Database as PgDatabase
-    db, seen = _capture_sql_with_count(monkeypatch)
+    db, seen = _capture_sql_with_count(monkeypatch, site=site)
     await PgDatabase.get_results(db, batch_id=1, limit=50, with_total=True, **kw)
     data_sql, data_params = seen[0]
     count_sql, count_params = seen[-1]
     assert "COUNT(*)" in count_sql, count_sql
     for sql, params in ((data_sql, data_params), (count_sql, count_params)):
         assert ("JOIN batch_asins ba ON ba.asin = d.asin AND ba.batch_id = ? "
-                f"AND d.marketplace = {BA_ROW_MARKETPLACE_SQL}") in sql, sql[:600]
+                f"AND d.marketplace = {site or BA_ROW_MARKETPLACE_SQL}") in sql, sql[:600]
+        if site:
+            assert "FROM tasks t" not in sql, sql[:600]
         assert sql.count("?") == len(params), (sql.count("?"), len(params), sql)
 
 

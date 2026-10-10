@@ -316,7 +316,10 @@ async def api_result_detail(asin: str,
         # 不传站点时消息逐字照旧（golden result_detail_missing 钉着）
         raise HTTPException(404, f"ASIN {asin} 不存在" if mkt is None
                             else f"ASIN {asin} 在 {mkt} 不存在")
-    changes = await db.get_asin_changes(asin)
+    # 变动历史跟着**返回的那一行**的站点走：不限定的话，加拿大行的变动会混进
+    # 美国详情（不传站点的老调用方，响应在加拿大数据入库后就变了），反之亦然。
+    # 只有美国数据时，所有变动都归美国站，与改动前逐字相同。
+    changes = await db.get_asin_changes(asin, marketplace=data.get("marketplace"))
     return {"data": data, "changes": changes}
 
 

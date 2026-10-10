@@ -139,6 +139,7 @@ from common.core.timeutil import now_ts
 # F-012：站点注册表。按模块导入（而不是 `from ... import get`）——
 # `get` 这个名字在本模块里太容易和 dict.get 混起来，读的人会看错。
 from common.core import marketplace as _marketplace
+from common.core.dbtables import marketplace_mismatch_detail
 from typing import List, Optional, Tuple
 
 from common.pgdb._shared import (  # noqa: F401
@@ -270,8 +271,7 @@ async def _marketplace_mismatch(db, task_id, data) -> Tuple[str, str, Optional[s
     task_mkt = (row["marketplace"] if row else None) or _marketplace.DEFAULT_MARKETPLACE
     if task_mkt == payload_mkt:
         return task_mkt, payload_mkt, None
-    return (task_mkt, payload_mkt,
-            f"marketplace_mismatch task={task_mkt} payload={payload_mkt}")
+    return task_mkt, payload_mkt, marketplace_mismatch_detail(task_mkt, payload_mkt)
 
 
 class ResultsWriteMixin:

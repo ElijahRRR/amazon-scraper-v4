@@ -90,7 +90,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from common import config
 from common.core.searchurl import normalize_keyword
 from common.core import marketplace as _marketplace
-from common.core.dbtables import task_marketplace_sql
+from common.core.dbtables import (
+    SCREENSHOT_TASK_SITE_REJECTED_SQL,
+    task_marketplace_sql,
+)
 from common.pgdb._shared import _normalize_screenshot_path
 
 logger = logging.getLogger(__name__)
@@ -811,10 +814,11 @@ class MediaMixin:
         的美国行与加拿大行各拿各的截图。原来只按 asin 兜底，全局视图里两站的
         两行会显示同一张图（谁的 updated_at 新就是谁的）。
 
-        行里**没有** ``marketplace`` 键（窄投影 ``fields=`` 没点它）-> 不分站点，
-        与改动前相同。这里**不**把 marketplace 塞进强制投影列：那会改变
-        ``fields=`` 的返回键集（golden results_narrow_fields 钉着）；要按站点
-        回填的调用方自己点名这一列（结果页就是这么做的）。
+        行里**没有** ``marketplace`` 键 -> 不分站点，与改动前相同。两个调用方都
+        保证有这个键：get_result_by_asin 是 ``SELECT *``；get_results 的窄投影
+        （``fields=`` 没点 marketplace）在内部照样取它、回填完再摘掉 —— 返回键集
+        不变（golden results_narrow_fields 钉着），回填也不跨站点。所以这里
+        **不**把 marketplace 加进对外的强制投影列。
         """
         missing: Dict[Optional[str], List[str]] = {}
         for item in items:
@@ -867,8 +871,13 @@ class MediaMixin:
             # 补 ROLLBACK 不改返回值、不改异常类型、不改成功路径。
             try:
                 if status == "done" and file_path:
+                    # F-012 MISS-01：所属 (batch_id, asin) 任务正因「提交体站点 ≠
+                    # 任务站点」被拒收（老 worker）时，它随后传来的截图是 amazon.com
+                    # 的页面 —— 不落地，rowcount 0 -> 端点照旧回 409、删掉文件。
+                    # 美国站谓词恒假，路径与改动前相同。理由见 common/core/dbtables.py。
                     cursor = await self._db.execute(
-                        "UPDATE screenshots SET status=?, file_path=?, updated_at=? WHERE asin=? AND batch_id=?",
+                        "UPDATE screenshots SET status=?, file_path=?, updated_at=? WHERE asin=? AND batch_id=? "
+                        f"AND NOT {SCREENSHOT_TASK_SITE_REJECTED_SQL}",
                         (status_p, path_p, now, asin_p, bid)
                     )
                     updated = cursor.rowcount > 0

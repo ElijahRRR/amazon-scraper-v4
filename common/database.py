@@ -30,7 +30,12 @@ from common.core import marketplace as _marketplace
 # F-012：「批次里这一行是哪个站点」的 SQL 片段，与 PG 侧逐字共用（不含 `?`）。
 from common.core.dbtables import (
     BA_ROW_MARKETPLACE_SQL,
+    BATCH_ORPHAN_PROBE_SQL,
+    BATCH_SITE_RANGE_SQL,
     DEFAULT_MARKETPLACE_SQL,
+    SCREENSHOT_TASK_SITE_REJECTED_SQL,
+    batch_site_literal,
+    marketplace_mismatch_detail,
     task_marketplace_sql,
 )
 
@@ -2144,8 +2149,7 @@ class Database:
         task_mkt = (row["marketplace"] if row else None) or _marketplace.DEFAULT_MARKETPLACE
         if task_mkt == payload_mkt:
             return task_mkt, payload_mkt, None
-        return (task_mkt, payload_mkt,
-                f"marketplace_mismatch task={task_mkt} payload={payload_mkt}")
+        return task_mkt, payload_mkt, marketplace_mismatch_detail(task_mkt, payload_mkt)
 
     async def accept_success_result(self, task_id: int, worker_id: str, lease_epoch: int,
                                     data: dict, batch_id: int = None) -> dict:
@@ -2626,7 +2630,8 @@ class Database:
 
     async def _hydrate_screenshot_paths(self, items: List[Dict], batch_id: int = None):
         """**原地修改** items。F-012：缺截图的行按自己的站点分组兜底；行里没有
-        ``marketplace`` 键（窄投影没点它）-> 不分站点，与改动前相同。
+        ``marketplace`` 键 -> 不分站点，与改动前相同（get_results 的窄投影在内部
+        照样取 marketplace、回填完再摘掉，所以两个调用方都带着这个键）。
         语义与 PG 侧 common/pgdb/media.py 同名方法逐字一致，理由见那边。"""
         missing: Dict[Optional[str], List[str]] = {}
         for item in items:
@@ -2643,6 +2648,25 @@ class Database:
             if item["screenshot_path"] is None:
                 item["screenshot_path"] = fallback.get(
                     item.get("marketplace") or None, {}).get(item["asin"])
+
+    async def _batch_site_literal(self, batch_id) -> Optional[str]:
+        """F-012：这一批能不能把站点钉成常量 —— 站点的 SQL 字面量，或 ``None``
+        （= 用逐行片段）。判定是 ``dbtables.batch_site_literal``，与 PG 侧同名方法
+        逐字同构，理由见那边与 common/core/dbtables.py 的「批次 -> 常量站点」。
+
+        SQLite 没有 PG 那个规划器悬崖（逐行片段在这边只慢 1.5~2x），钉常量在这里
+        主要是为了**两个后端走同一个判定**：分叉的症状是同一个批次两边读出不同
+        的行，而且不报错。
+        """
+        has_orphans = None
+        async with self.read() as rc:
+            async with rc.execute(BATCH_SITE_RANGE_SQL, (batch_id,)) as c:
+                row = await c.fetchone()
+            lo, hi = (row["lo"], row["hi"]) if row else (None, None)
+            if lo is not None and lo == hi and lo != _marketplace.DEFAULT_MARKETPLACE:
+                async with rc.execute(BATCH_ORPHAN_PROBE_SQL, (batch_id,)) as c:
+                    has_orphans = (await c.fetchone()) is not None
+        return batch_site_literal(lo, hi, has_orphans)
 
     async def _hydrate_batch_task_status(self, items: List[Dict], batch_id):
         """`/api/results?batch_id=` 追加三列。**只在带 batch_id 时调用。**
@@ -2777,8 +2801,13 @@ class Database:
             screenshot_path 同上（它要就地归一化这一列）
             updated_at     `_hydrate_batch_task_status` 的 batch_asin_data_updated_at
         少任何一个都是"看起来能用、翻两页或点开截图才炸"的那种坏法。
+        （F-012：没点 ``marketplace`` 时内部还会多取它给截图回填按站点兜底，
+        回填完就从 items 里摘掉 —— 对外仍然只多这四列。）
         """
         proj = None
+        # F-012：窄投影没点 marketplace 时内部照样取它，截图回填按行的站点兜底
+        # 之后再摘掉 —— 键集不变、回填不跨站点。理由见 PG 侧同名方法。
+        drop_marketplace = False
         if columns:
             # 白名单过滤：列名会拼进 SQL。端点层已经拒绝过非法列名（422），
             # 这里是第二道 —— db 层不假设调用方一定是那个端点。
@@ -2787,6 +2816,9 @@ class Database:
                 for forced in ("id", "asin", "screenshot_path", "updated_at"):
                     if forced not in wanted:
                         wanted.append(forced)
+                if "marketplace" not in wanted:
+                    wanted.append("marketplace")
+                    drop_marketplace = True
                 proj = ", ".join(f"d.{c}" for c in wanted)
 
         sort = normalize_sort(sort)
@@ -2813,12 +2845,15 @@ class Database:
         where_params: list = []
 
         # 批次筛选 - 通过 batch_asins JOIN
-        # F-012：按任务行的站点钉住 d.marketplace，理由与片段定义见 PG 侧同名
-        # 方法的注释和 common/core/dbtables.py。片段不含 `?`，参数顺序不变。
+        # F-012：按任务行的站点钉住 d.marketplace。能证明整批同一个站点时钉
+        # 字面量，否则逐行片段 —— 与 PG 侧同一个判定（_batch_site_literal ->
+        # dbtables.batch_site_literal），理由见 PG 侧同名方法的注释和
+        # common/core/dbtables.py。两种写法都不含 `?`，参数顺序不变。
         # FTS 快路径的 `d.id IN (...)` 谓词与这个连接相互独立，不用跟着改。
         if batch_id:
+            batch_site = await self._batch_site_literal(batch_id)
             batch_join = ("JOIN batch_asins ba ON ba.asin = d.asin AND ba.batch_id = ? "
-                          f"AND d.marketplace = {BA_ROW_MARKETPLACE_SQL}")
+                          f"AND d.marketplace = {batch_site or BA_ROW_MARKETPLACE_SQL}")
             join_parts.append(batch_join)
             count_join_parts.append(batch_join)
             join_params.append(batch_id)
@@ -2933,6 +2968,10 @@ class Database:
             items.reverse()
 
         await self._hydrate_screenshot_paths(items, batch_id)
+        if drop_marketplace:
+            # 只为截图回填按站点兜底而取，调用方没点
+            for item in items:
+                item.pop("marketplace", None)
         if batch_id:
             await self._hydrate_batch_task_status(items, batch_id)
 
@@ -3115,11 +3154,22 @@ class Database:
         await self._hydrate_screenshot_paths([item])
         return item
 
-    async def get_asin_changes(self, asin: str) -> List[Dict]:
-        """获取 ASIN 的变动历史"""
-        async with self.read() as rc, rc.execute(
-            "SELECT * FROM asin_changes WHERE asin = ? ORDER BY id DESC", (asin,)
-        ) as c:
+    async def get_asin_changes(self, asin: str, marketplace: str = None) -> List[Dict]:
+        """获取 ASIN 的变动历史
+
+        F-012 ``marketplace``：给了就只要这个站点的变动（站点由变动那一行
+        (batch_id, asin) 的任务决定）；``None`` -> 与改动前相同。语义与 PG 侧
+        common/pgdb/results_read.py 同名方法逐字一致，理由见那边。
+        """
+        if marketplace is None:
+            sql = "SELECT * FROM asin_changes WHERE asin = ? ORDER BY id DESC"
+            params = (asin,)
+        else:
+            sql = ("SELECT ac.* FROM asin_changes ac WHERE ac.asin = ? "
+                   f"AND {task_marketplace_sql('ac.batch_id', 'ac.asin')} = ? "
+                   "ORDER BY ac.id DESC")
+            params = (asin, _marketplace.get(marketplace).id)
+        async with self.read() as rc, rc.execute(sql, params) as c:
             return [dict(r) for r in await c.fetchall()]
 
     # ==================== 截图操作 ====================
@@ -3138,8 +3188,12 @@ class Database:
         async with self._write_lock:
             await self._db.execute("BEGIN")
             if status == "done" and file_path:
+                # F-012 MISS-01：所属任务正因「提交体站点 ≠ 任务站点」被拒收时不落地
+                # （老 worker 随后传来的是 amazon.com 页面的截图）-> rowcount 0 ->
+                # 端点回 409。美国站谓词恒假。理由见 common/core/dbtables.py。
                 cursor = await self._db.execute(
-                    "UPDATE screenshots SET status=?, file_path=?, updated_at=? WHERE asin=? AND batch_id=?",
+                    "UPDATE screenshots SET status=?, file_path=?, updated_at=? WHERE asin=? AND batch_id=? "
+                    f"AND NOT {SCREENSHOT_TASK_SITE_REJECTED_SQL}",
                     (status, file_path, now, asin, batch_id)
                 )
                 updated = cursor.rowcount > 0

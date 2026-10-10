@@ -408,3 +408,152 @@ async def test_search_batch_takes_the_marketplace_from_the_caller(pgdb):
         await pgdb.create_search_batch(name="kw_de2", keywords=["usb hub"],
                                        search_params=params,
                                        discover_mode="discover_only")
+
+
+# ================================================================== 对抗评审之后补的（同一批修复）
+#
+# 1) 结果列表批次连接：先证明单一站点、再钉字面量；证明不了才逐行片段。
+#    逐行片段在 PG 上是规划器悬崖（`列 = (SubPlan)` 只能套默认选择性 -> 丢掉
+#    「主键倒序、凑够一页就停」-> 每次翻页 Seq Scan 整张 asin_data）。
+# 2) 窄投影没点 marketplace 时截图兜底也按行的站点。
+# 3) 站点拒收之后，老 worker 随后传来的截图不落地。
+# 4) get_asin_changes 可以按站点限定（详情端点按返回行的站点传）。
+
+
+async def _site(db, bid):
+    return await db._batch_site_literal(bid)
+
+
+async def test_batch_site_probe_pins_only_provably_single_site_batches(pgdb):
+    us, ca = await _two_sites(pgdb)
+    assert await _site(pgdb, us) == "'amazon.com'"
+    assert await _site(pgdb, ca) == "'amazon.ca'"
+    empty = await pgdb.create_batch("empty_b")
+    assert await _site(pgdb, empty) == "'amazon.com'"         # 没有任务行 -> 美国站
+    # 加拿大批次里一条没有任务行的 batch_asins：按逐行片段它是美国站 -> 不能钉
+    await pgdb._write_conn.execute(
+        "INSERT INTO batch_asins (batch_id, asin, is_new) VALUES ($1, 'B0ORPHAN01', 0)", ca)
+    assert await _site(pgdb, ca) is None
+    await pgdb._write_conn.execute(
+        "INSERT INTO batch_asins (batch_id, asin, is_new) VALUES ($1, 'B0ORPHAN01', 0)", us)
+    assert await _site(pgdb, us) == "'amazon.com'"            # 美国批次的孤儿仍是美国站
+    # 混合批次（同名合并进来另一个站点）：逐行，行集仍按每行任务的站点
+    mixed = await _batch(pgdb, "mixed_b", [_X])
+    await pgdb.create_tasks(mixed, [_Z], _CA_ZIP, marketplace=_CA)
+    assert await _site(pgdb, mixed) is None
+    for kw in ({}, {"search": "B0"}, {"search": "B0DUPE,B0CAONLY"},
+               {"columns": ["asin", "current_price"]}):
+        got = await pgdb.get_results(batch_id=mixed, **kw)
+        assert sorted((i["asin"], i["current_price"]) for i in got["items"]) == \
+            sorted([(_X, "$10.00"), (_Z, "$30.00")]), kw
+        assert got["total"] == 2, kw
+
+
+async def test_default_batch_page_keeps_the_early_stop_plan(pgdb, pgconn, monkeypatch):
+    """美国批次的首屏 / count 查询：计划里不许有 SubPlan，页查询要走主键倒序早停。
+
+    对抗评审在 PG 16 上实测（30 万行）：逐行片段让页查询变成 Seq Scan asin_data +
+    Hash Join + 每个批次行一次 SubPlan，10 万行批次翻页 3.5ms -> 628ms。
+    字面量钉法恢复 `Index Scan Backward using asin_data_pkey` + Nested Loop。
+    """
+    import contextlib
+    import json
+
+    n = 30000
+    await pgconn.execute(
+        "INSERT INTO asin_data (asin, marketplace, title, brand, current_price, "
+        "created_at, updated_at) "
+        "SELECT 'B0' || lpad(g::text, 8, '0'), 'amazon.com', 'T' || g, 'B', '1', "
+        "'2026-01-01', '2026-01-01' FROM generate_series(1, $1) g", n)
+    bid = await pgconn.fetchval("INSERT INTO batches (name) VALUES ('big') RETURNING id")
+    await pgconn.execute(
+        "INSERT INTO batch_asins (batch_id, asin, is_new) "
+        "SELECT $1, 'B0' || lpad(g::text, 8, '0'), 0 FROM generate_series(1, $2) g "
+        "WHERE g % 3 = 0", bid, n)
+    await pgconn.execute(
+        "INSERT INTO tasks (batch_id, asin, zip_code, status, marketplace) "
+        "SELECT $1, 'B0' || lpad(g::text, 8, '0'), '10001', 'done', 'amazon.com' "
+        "FROM generate_series(1, $2) g WHERE g % 3 = 0", bid, n)
+    await pgconn.execute("ANALYZE")
+
+    seen = []
+    cls = type(pgdb)
+    orig_read = cls.read
+
+    @contextlib.asynccontextmanager
+    async def recording_read(self):
+        async with orig_read(self) as rc:
+            class _Rec:
+                def execute(_self, sql, params=()):
+                    seen.append((sql, list(params)))
+                    return rc.execute(sql, params)
+            yield _Rec()
+
+    monkeypatch.setattr(cls, "read", recording_read)
+    res = await pgdb.get_results(batch_id=bid, limit=50, with_total=True)
+    monkeypatch.undo()
+    assert res["total"] == n // 3 and len(res["items"]) == 50
+
+    page = next(x for x in seen if "FROM asin_data d" in x[0] and "LIMIT" in x[0])
+    count = next(x for x in seen if "COUNT(*)" in x[0])
+    plans = {}
+    for name, (sql, params) in (("page", page), ("count", count)):
+        async with pgdb.read() as rc, rc.execute(
+                "EXPLAIN (FORMAT JSON) " + sql, params) as c:
+            plans[name] = json.dumps([dict(r) for r in await c.fetchall()])
+        assert "SubPlan" not in plans[name], (name, plans[name])
+        # 站点谓词确实在（钉的是字面量，不是什么都没钉）
+        assert "marketplace" in plans[name], (name, plans[name])
+    assert "asin_data_pkey" in plans["page"], plans["page"]
+    assert "Backward" in plans["page"], plans["page"]
+
+
+async def test_narrow_projection_screenshot_follows_the_row_site(pgdb):
+    us, ca = await _two_sites(pgdb, needs_screenshot=True)
+    assert await pgdb.update_screenshot_status(_X, us, "done", "/p/us.png") is True
+    narrow = await pgdb.get_results(batch_id=ca, columns=["asin", "current_price"])
+    shots = {i["asin"]: i["screenshot_path"] for i in narrow["items"]}
+    assert shots == {_X: None, _Z: None}
+    assert all("marketplace" not in i for i in narrow["items"])     # 键集不变
+    # 美国批次的窄投影在加拿大截图落地前后不变
+    before = await pgdb.get_results(batch_id=us, columns=["asin", "current_price"])
+    assert await pgdb.update_screenshot_status(_X, ca, "done", "/p/ca.png") is True
+    await pgdb._write_conn.execute(
+        "UPDATE asin_data SET screenshot_path = NULL WHERE marketplace = 'amazon.com'")
+    after = await pgdb.get_results(batch_id=us, columns=["asin", "current_price"])
+    assert [(i["asin"], i["screenshot_path"]) for i in after["items"]] == \
+        [(i["asin"], i["screenshot_path"]) for i in before["items"]]
+    # 全局窄投影与默认投影对同一行给出同一张截图
+    full = {i["id"]: i["screenshot_path"] for i in (await pgdb.get_results())["items"]}
+    for item in (await pgdb.get_results(columns=["asin"]))["items"]:
+        assert item["screenshot_path"] == full[item["id"]], item
+
+
+async def test_screenshot_after_a_marketplace_reject_is_refused(pgdb):
+    await _two_sites(pgdb)
+    ca = await _batch(pgdb, "ca_ss", [_X], marketplace=_CA, zip_code=_CA_ZIP,
+                      needs_screenshot=True)
+    t = (await _pulled(pgdb, "w-old"))[_X]
+    res = await _accept(pgdb, t, "w-old", "$99.99")              # 不带 marketplace
+    assert res["server_reject"] is True
+    assert await pgdb.update_screenshot_status(_X, ca, "done", "/p/old.png") is False
+    rows = await _rows(pgdb, "SELECT marketplace, screenshot_path FROM asin_data "
+                             "WHERE asin = ? ORDER BY marketplace", (_X,))
+    assert rows == [{"marketplace": _CA, "screenshot_path": None},
+                    {"marketplace": _US, "screenshot_path": None}]
+    # 重试 -> 新 worker 交对站点 -> 截图照常落地
+    await pgdb.retry_failed_tasks(ca)
+    t = (await _pulled(pgdb, "w-new"))[_X]
+    await _accept(pgdb, t, "w-new", "$13.60", marketplace=_CA)
+    assert await pgdb.update_screenshot_status(_X, ca, "done", "/p/ca.png") is True
+    assert (await pgdb.get_result_by_asin(_X, marketplace=_CA))["screenshot_path"] == "/p/ca.png"
+
+
+async def test_asin_changes_can_be_scoped_to_a_site(pgdb):
+    us, ca = await _two_sites(pgdb)
+    all_changes = await pgdb.get_asin_changes(_X)
+    assert {c["batch_id"] for c in all_changes} == {us, ca}       # 不限定：与改动前相同
+    assert {c["batch_id"] for c in await pgdb.get_asin_changes(_X, marketplace=_US)} == {us}
+    assert {c["batch_id"] for c in await pgdb.get_asin_changes(_X, marketplace="www.amazon.ca")} == {ca}
+    with pytest.raises(ValueError):
+        await pgdb.get_asin_changes(_X, marketplace="amazon.xx")

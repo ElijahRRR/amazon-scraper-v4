@@ -82,6 +82,9 @@ PUBLIC_API = (
     # `/api/results?batch_id=` 的三列批次状态。与 _hydrate_screenshot_paths
     # 同族：都是 get_results 之后的原地补齐，两个后端必须同结果。
     "_hydrate_batch_task_status",
+    # F-012：结果列表批次连接「钉常量站点还是逐行片段」的探针。两个后端必须给出
+    # 同一个判定，否则同一个批次在两个后端读出不同的行。
+    "_batch_site_literal",
     # 结果读取
     "get_batch_failures", "get_results", "get_result_by_asin", "get_asin_changes",
     "iter_results", "find_asins_by_search", "get_batch_asin_set",

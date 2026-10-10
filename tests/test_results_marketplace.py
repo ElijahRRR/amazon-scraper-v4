@@ -21,6 +21,17 @@ asin_data 的唯一键是 ``(asin, marketplace)``：同一个 ASIN 在美国站�
   * 关键词批次对注册表之外的站点放行 discover_only，库层却又按 domain 推导站点，
     请求在库层炸成 500。
 
+对抗评审之后补的四条（同一批修复）：
+
+  * 结果列表的批次连接只要用逐行片段，PG 规划器就丢掉「主键倒序、凑够一页
+    就停」的计划，每个美国批次每次翻页都扫全表。改成先证明单一站点、再钉
+    字面量（``_batch_site_literal``），混合批次才逐行 —— 这里测判定与行集，
+    SQL 形状在 tests/test_search_no_planner_cliff.py，PG 计划在 tests/pgdb；
+  * ``fields=`` 窄投影没点 marketplace 时，截图兜底不分站点 -> 美国批次视图在
+    加拿大截图落地后变了样（反之亦然）；
+  * 老 worker 的结果被拒收之后，它照常传上来的 amazon.com 截图会落进加拿大行；
+  * 详情里的 ``changes`` 不分站点 -> 美国详情混进加拿大行的变动。
+
 ------------------------------------------------------------------------
 怎么测
 ------------------------------------------------------------------------
@@ -245,6 +256,85 @@ class BatchResultsArePinnedToTheTaskSiteTests(unittest.TestCase):
                              [(X, US), (Y, US)])
 
 
+class BatchSitePinTests(unittest.TestCase):
+    """结果列表的批次连接：能证明整批同一个站点 -> 钉字面量；证明不了 -> 逐行片段。
+
+    两条路必须给出与「逐行按任务行站点」**逐行相同**的结果 —— 钉常量只是为了让
+    PG 规划器估得准（逐行片段在 PG 上让每次翻页都扫全表），不许改语义。
+    """
+
+    def _site(self, client, bid):
+        return client.portal.call(srv.db._batch_site_literal, bid)
+
+    def _add_tasks(self, client, bid, asins, zip_code, marketplace):
+        async def _go():
+            await srv.db.create_tasks(bid, list(asins), zip_code, False,
+                                      marketplace=marketplace)
+        client.portal.call(_go)
+
+    def _add_orphan(self, client, bid, asin):
+        """一条只有 batch_asins、没有 tasks 的行（F-012 之前的老数据 / 手工补的）。"""
+        async def _go():
+            async with srv.db._write_lock:
+                await srv.db._db.execute("BEGIN")
+                await srv.db._db.execute(
+                    "INSERT INTO batch_asins (batch_id, asin, is_new) VALUES (?, ?, 0)",
+                    (bid, asin))
+                await srv.db._db.execute("COMMIT")
+        client.portal.call(_go)
+
+    def test_probe_pins_single_site_batches_and_gives_up_on_mixed_ones(self):
+        with isolated_server() as (client, _ctx):
+            us = _mk_batch(client, "us_b", [X, Y])
+            ca = _mk_batch(client, "ca_b", [X, Z], marketplace=CA, zip_code=CA_ZIP)
+            empty = client.portal.call(srv.db.create_batch, "empty_b")
+            self.assertEqual(self._site(client, us), "'amazon.com'")
+            self.assertEqual(self._site(client, ca), "'amazon.ca'")
+            # 没有任务行：逐行片段对每一行都给美国站
+            self.assertEqual(self._site(client, empty), "'amazon.com'")
+            # 美国批次里的孤儿行按片段也是美国站 -> 仍可钉
+            self._add_orphan(client, us, "B0ORPHAN01")
+            self.assertEqual(self._site(client, us), "'amazon.com'")
+            # 加拿大批次里的孤儿行按片段是美国站 -> 整批不再是单一站点
+            self._add_orphan(client, ca, Y)
+            self.assertIsNone(self._site(client, ca))
+            # 同名合并进来另一个站点的任务 -> 混合批次
+            mixed = _mk_batch(client, "mixed_b", [X])
+            self._add_tasks(client, mixed, [Z], CA_ZIP, CA)
+            self.assertIsNone(self._site(client, mixed))
+
+    def test_mixed_and_orphan_batches_are_still_pinned_row_by_row(self):
+        with isolated_server() as (client, _ctx):
+            _seed_us_batch(client)
+            ca = _seed_ca_batch(client)
+            # 混合批次：X 是美国任务、Z 是加拿大任务
+            mixed = _mk_batch(client, "mixed_b", [X])
+            self._add_tasks(client, mixed, [Z], CA_ZIP, CA)
+            self.assertIsNone(self._site(client, mixed))
+            for extra in ({}, {"search": "B0"}, {"search": "B0DUPE,B0CAONLY"},
+                          {"fields": "asin,current_price"}):
+                with self.subTest(**extra):
+                    got = _results(client, batch_id=mixed, **extra)
+                    self.assertEqual(sorted((i["asin"], i["current_price"]) for i in got["items"]),
+                                     sorted([(X, "$10.00"), (Z, "$30.00")]))
+                    self.assertEqual(got["total"], 2)
+            # 加拿大批次 + 一条孤儿行（Y，只有美国行）：孤儿按片段是美国站
+            pinned = _results(client, batch_id=ca)
+            self._add_orphan(client, ca, "B0ORPHAN01")       # 没有任何 asin_data
+            self.assertEqual(_key(_results(client, batch_id=ca)["items"]),
+                             _key(pinned["items"]))
+            async def _orphan_us_row():
+                async with srv.db._write_lock:
+                    await srv.db._db.execute("BEGIN")
+                    await srv.db._db.execute("DELETE FROM tasks WHERE batch_id = ? AND asin = ?",
+                                             (ca, Y))
+                    await srv.db._db.execute("COMMIT")
+            client.portal.call(_orphan_us_row)
+            self.assertIsNone(self._site(client, ca))
+            self.assertEqual(_key(_results(client, batch_id=ca)["items"]),
+                             sorted([(X, CA), (Y, US), (Z, CA)]))
+
+
 # ============================================================ 单 ASIN 详情
 
 class ResultDetailTests(unittest.TestCase):
@@ -285,6 +375,21 @@ class ResultDetailTests(unittest.TestCase):
             r = detail("B0NOSUCH00")
             self.assertEqual((r.status_code, r.json()["detail"]),
                              (404, "ASIN B0NOSUCH00 不存在"))
+
+    def test_detail_changes_follow_the_site_of_the_returned_row(self):
+        """``changes`` 跟着返回的那一行的站点走：不传站点的美国详情在加拿大数据入库
+        前后**逐字相同**，加拿大详情只带加拿大批次的变动。"""
+        with isolated_server() as (client, _ctx):
+            us = _seed_us_batch(client)
+            before = client.get(f"/api/results/{X}").json()
+            self.assertEqual({c["batch_id"] for c in before["changes"]}, {us})
+            ca = _seed_ca_batch(client)
+            self.assertEqual(client.get(f"/api/results/{X}").json(), before)
+            got = client.get(f"/api/results/{X}", params={"marketplace": CA}).json()
+            self.assertEqual({c["batch_id"] for c in got["changes"]}, {ca})
+            # 只在加拿大才有的 ASIN：不传站点返回加拿大行，changes 也是加拿大的
+            got = client.get(f"/api/results/{Z}").json()
+            self.assertEqual({c["batch_id"] for c in got["changes"]}, {ca})
 
 
 # ============================================================ 截图
@@ -347,6 +452,87 @@ class ScreenshotsDoNotCrossSitesTests(unittest.TestCase):
             # 美国行不受影响
             self.assertEqual(self._shown(client, X, US),
                              f"/static/screenshots/us_b/{X}.png")
+
+    def test_narrow_projection_does_not_borrow_the_other_sites_screenshot(self):
+        """``fields=`` 没点 marketplace 时，截图兜底也按行的站点 —— 返回键集不变。
+
+        美国批次的窄投影在加拿大截图落地前后逐字相同（美国站不变式，``fields=``
+        是 ERP 对接文档推荐的用法）；同一行在窄投影与默认投影下给出同一张截图。
+        """
+        with isolated_server() as (client, _ctx):
+            us = _mk_batch(client, "us_b", [X], needs_screenshot=True)
+            _submit(client, _pull(client, "w-us")[X], "w-us", "$10.00")   # 美国截图没来
+
+            def narrow(**kw):
+                return _results(client, fields="asin,current_price", **kw)["items"]
+
+            before = narrow(batch_id=us)
+            ca = _mk_batch(client, "ca_b", [X], marketplace=CA, zip_code=CA_ZIP,
+                           needs_screenshot=True)
+            _submit(client, _pull(client, "w-ca")[X], "w-ca", "$13.50", marketplace=CA)
+            self._shot(client, "ca_b", X, "w-ca")
+            ca_path = f"/static/screenshots/ca_b/{X}.png"
+
+            self.assertEqual(narrow(batch_id=us), before)
+            self.assertEqual([i["screenshot_path"] for i in narrow(batch_id=ca)], [ca_path])
+            full = {i["id"]: i["screenshot_path"] for i in _results(client)["items"]}
+            for item in narrow():
+                self.assertNotIn("marketplace", item)
+                self.assertEqual(item["screenshot_path"], full[item["id"]], item)
+
+            # 反方向：美国截图落地之后，加拿大批次的窄投影也不借它
+            self._shot(client, "us_b", X, "w-us")
+            ca2 = _mk_batch(client, "ca_b2", [X], marketplace=CA, zip_code=CA_ZIP)
+            self.assertEqual(self._stored(client, X, CA), ca_path)
+            async def _clear_ca_path():
+                async with srv.db._write_lock:
+                    await srv.db._db.execute("BEGIN")
+                    await srv.db._db.execute(
+                        "UPDATE asin_data SET screenshot_path = NULL WHERE marketplace = ?", (CA,))
+                    await srv.db._db.execute("DELETE FROM screenshots WHERE batch_id = ?", (ca,))
+                    await srv.db._db.execute("COMMIT")
+            client.portal.call(_clear_ca_path)
+            for bid in (ca, ca2):
+                self.assertEqual([i["screenshot_path"] for i in narrow(batch_id=bid)], [None])
+
+    def test_screenshot_from_a_rejected_old_worker_is_refused(self):
+        """老 worker 的加拿大结果被拒收后，它照常传来的（amazon.com 页面的）截图也不落地。
+
+        重试之后新 worker 重采成功，截图照常落地；美国任务 + 老 worker 不受影响。
+        """
+        import os
+        from common import config
+
+        with isolated_server() as (client, _ctx):
+            _mk_batch(client, "ca_seed", [X], marketplace=CA, zip_code=CA_ZIP)
+            _submit(client, _pull(client, "w-new")[X], "w-new", "$13.50", marketplace=CA)
+            bid = _mk_batch(client, "ca_b", [X], marketplace=CA, zip_code=CA_ZIP,
+                            needs_screenshot=True)
+            t = _pull(client, "w-old")[X]
+            _submit(client, t, "w-old", "$99.99")              # 不带站点 -> 拒收
+            r = client.post("/api/tasks/screenshot",
+                            files={"file": (f"{X}.png", _PNG, "image/png")},
+                            data={"asin": X, "batch_name": "ca_b", "worker_id": "w-old"})
+            self.assertEqual(r.status_code, 409, r.text)
+            self.assertIsNone(self._stored(client, X, CA))
+            self.assertEqual(_rows(client, "SELECT status, file_path FROM screenshots "
+                                           "WHERE batch_id = ? AND asin = ?", (bid, X)),
+                             [{"status": "pending", "file_path": None}])
+            self.assertFalse(os.path.exists(
+                os.path.join(config.SCREENSHOT_DIR, "ca_b", f"{X}.png")))
+
+            # 重试 -> 新 worker 交对了站点 -> 截图照常落地
+            client.portal.call(srv.db.retry_failed_tasks, bid)
+            t = _pull(client, "w-new")[X]
+            _submit(client, t, "w-new", "$13.60", marketplace=CA)
+            self._shot(client, "ca_b", X, "w-new")
+            self.assertEqual(self._stored(client, X, CA), f"/static/screenshots/ca_b/{X}.png")
+
+            # 美国任务 + 老 worker（不带站点）：结果与截图都照常
+            _mk_batch(client, "us_b", [X], needs_screenshot=True)
+            _submit(client, _pull(client, "w-old")[X], "w-old", "$10.00")
+            self._shot(client, "us_b", X, "w-old")
+            self.assertEqual(self._stored(client, X, US), f"/static/screenshots/us_b/{X}.png")
 
 
 # ============================================================ 变体展开
