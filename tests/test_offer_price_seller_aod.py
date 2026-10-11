@@ -143,6 +143,25 @@ class AccordionOriginalPriceTests(unittest.TestCase):
         self.assertNotIn("a-accordion-active", stripped)
         self.assertEqual(self._orig(stripped, "B0B9R8R8NC", _CA), "$169.99")
 
+    def test_layout_without_per_row_price_blocks_reads_the_single_centre_block(self):
+        """较早的 accordion 形状：buybox 分行，中栏只有**一份**价格块（没有
+        ``apex_desktop_<行名>``）。那一份就是主推 offer 的，真实的 Was 价不能丢。
+
+        用 B0B9R8R8NC 模拟：删掉二手行的中栏块、去掉全新行中栏块的 id，只剩
+        ``#apex_desktop`` 包着全新行那份 "Was: $169.99"。buybox 里的全新行自己
+        没有划线价，所以只读「分行块 + buybox 行」会丢成 N/A（基线取得到）。
+        """
+        tree = HTMLParser(_load("dp_ca_B0B9R8R8NC_accordion_was.html.gz"))
+        tree.css_first("#apex_desktop_usedAccordionRow").decompose()
+        new_block = tree.css_first("#apex_desktop_newAccordionRow")
+        del new_block.attrs["id"]
+        html = tree.html
+        self.assertNotRegex(html, r'id="apex_desktop_[^"]*AccordionRow')
+        self.assertIn('id="apex_desktop"', html)
+        self.assertIsNone(HTMLParser(html).css_first(
+            '#newAccordionRow_0 span[data-a-strike="true"]'), "夹具前提：buybox 行自己没有划线价")
+        self.assertEqual(self._orig(html, "B0B9R8R8NC", _CA), "$169.99")
+
     def test_unrecognisable_accordion_never_falls_back_to_the_whole_page(self):
         """accordion 在、但认不出任何行 -> N/A。回落全页就是这个 bug 本身。"""
         html = _load("dp_ca_B09Y3DKJKQ_accordion.html.gz")
@@ -207,6 +226,20 @@ class WarehouseSellerIdTests(unittest.TestCase):
             "/b?node=1")
         self.assertNotEqual(mangled, html)
         self.assertEqual(self._seller(mangled), ("ADUC3URPUSR5N", "MoKitDora"))
+
+    def test_link_in_the_second_form_reads_the_second_form(self):
+        """上一条的镜像：无 seller= 的链接在**第二张**表单（二手行，Warehouse）里，
+        必须拿二手行表单的 AUJBRIGYRJ3Q8，而不是全页第一张表单（全新行）的
+        ADUC3URPUSR5N。上一条里链接恰好在第一张表单，「读全页第一张」也能过，
+        靠这一条把它分开。"""
+        html = _load("dp_ca_B09Y3DKJKQ_accordion.html.gz")
+        moved = html.replace('id="sellerProfileTriggerId"', 'id="sellerProfileTriggerId-moved"')
+        self.assertEqual(moved.count('id="sellerProfileTriggerId-moved"'), 2, "夹具前提：全新行两条链接")
+        anchor = '<input type="hidden" id="usedMerchantID" name="usedMerchantID" value="AUJBRIGYRJ3Q8">'
+        self.assertEqual(moved.count(anchor), 1, "夹具前提：二手行表单")
+        moved = moved.replace(
+            anchor, anchor + '<a id="sellerProfileTriggerId" href="/b?node=8929975011">Warehouse Deals</a>')
+        self.assertEqual(self._seller(moved), ("AUJBRIGYRJ3Q8", "Warehouse Deals"))
 
     def test_link_outside_any_form_stays_na(self):
         """链接不在任何表单里：宁可 N/A，也不拿全页第一张表单去配。"""
@@ -280,6 +313,32 @@ class OfferListingTests(unittest.TestCase):
         p = AmazonParser()
         self.assertEqual(p._slx_parse_stock_count("In Stock", HTMLParser(dp)), o["max_qty"])
         self.assertEqual(p._parse_stock_count("In Stock", lxml_html.fromstring(dp)), o["max_qty"])
+
+    def test_every_field_comes_from_the_same_offer(self):
+        """第一个报价没价格（如「加购后才显示价格」）时，价格、卖家、ID、maxQty、
+        运费、配送必须**全部**来自第二个报价。
+
+        原来退到整个 ``#aod-offer-list``：价格是列表里第一个价格（第二个报价的），
+        卖家 / maxQty / 运费却仍是列表里第一个匹配（第一个报价的）—— 导出一行里
+        拼了两个卖家。真实响应里 offer 都包在 ``#aod-offer-list`` 里；夹具只留了
+        offer 节点，这里用原样的节点把列表外壳补回来。
+        """
+        tree = HTMLParser(_load("aod_ca_B0D45YH9FL.html.gz"))
+        offers = tree.css("#aod-offer")
+        self.assertEqual(len(offers), 2, "夹具前提：两个报价")
+        for n in offers[0].css("span.a-price"):
+            n.decompose()
+        pinned = tree.css_first("#aod-pinned-offer")
+        html = (pinned.html + '<div id="aod-offer-list">'
+                + "".join(o.html for o in offers) + "</div>")
+        with _Engine(True):
+            o = AmazonParser().parse_offer_listing(html, M.get("amazon.ca"))
+            second = AmazonParser().parse_offer_listing(
+                pinned.html + offers[1].html, M.get("amazon.ca"))
+        self.assertEqual(second["seller"], "Arjinstore", "夹具前提：第二个报价")
+        self.assertEqual((o["seller"], o["seller_id"], o["max_qty"], o["shipping"]),
+                         ("Arjinstore", "A13DS8IVXZFZHA", 30, "FREE"))
+        self.assertEqual(o, second)
 
     def test_missing_max_qty_is_absent_not_guessed(self):
         html = _load("aod_ca_B0D45YH9FL.html.gz").replace(

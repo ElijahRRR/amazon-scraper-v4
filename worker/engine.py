@@ -1283,6 +1283,15 @@ class Worker:
             （这里价格必有值）；engine 的「核心字段全部缺失」判定在本分支之前、
             且排除了 No Featured Offer；``_looks_degraded_delivery`` 不看库存数。
           * 读得到 maxQty 就用它，读不到用 ``_OFFER_LISTING_UNKNOWN_QTY``。
+            ⚠ 这个 999 导出去是**非空**的 ``fast.stock_count=999``（``_int``
+            照收），严格按契约 3b「没采到就是 null」它该是 N/A。有意不在这里
+            单独改成 N/A：商品页正常路径「有货、没给数量」导出的也是 999，
+            只改这一条路，同一种状态就有了两种导出形状。要改得在解析器的
+            999 兜底处一起改（不归本组）。实际很少走到：真实 offer 全带 maxQty。
+
+        只在 selectolax 路径生效：lxml 引擎的商品页解析不产出
+        "No Featured Offer"（走不到调用这里的分支），``parse_offer_listing``
+        也只有 selectolax 实现。这是本修复之前就有的状况，不是本修复引入的。
 
         卖家：商品页上本来就没有卖家（无推荐报价），两列都是 N/A 时才把
         **同一个报价**的名字和 ID 成对填进去。只要商品页已经给了其中一个，

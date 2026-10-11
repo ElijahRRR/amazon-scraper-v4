@@ -1064,6 +1064,17 @@ class AmazonParser:
         * 是 accordion 但认不出行 -> ``[]``：调用方必须给 N/A，**不许回落全页**
           —— 回落就是这个 bug 本身。
         * 没有展开行时退到全新行（newAccordionRow_N）：页面主推的就是它。
+        * 中栏**没有任何**分行价格块（``apex_desktop_*AccordionRow``）时，再加上
+          整个 ``#apex_desktop``：那是较早的 accordion 形状 —— buybox 分行、中栏
+          只有一份价格块，而那一份就是主推 offer 的。语料里 12 张 accordion 页
+          全是分行形状，走不到这里；不加的话这种页上中栏真实的 List / Was 价
+          会被丢成 N/A（基线是取得到的）。分行块存在时不加：整块里还套着
+          二手行，加了就又是这个 bug。
+
+        已知未覆盖：只有原价按行取。现价 / 卖家仍取页面上第一个，所以假如某页
+        选中的是**二手行**（语料 66 张里没有一张是），原价会是二手行的
+        "New condition price"、现价却是全新行的价格，又成了 原价 = 现价 ——
+        根子在现价不分行，归那几个字段的修复去管，不在这里压掉划线价。
         """
         if not self._has_any_block(tree, ("buyBoxAccordion",)):
             return None
@@ -1083,8 +1094,14 @@ class AmazonParser:
         base = re.sub(r"_\d+$", "", rid)
         # 先中栏价格块（划线价实际都在这里），再 buybox 行本身（行内也有一份
         # #corePrice_feature_div）。两处都属于同一个 offer。
-        return [(f"#apex_desktop_{base}", f'//*[@id="apex_desktop_{base}"]'),
-                (f"#{rid}", f'//*[@id="{rid}"]')]
+        scopes = [(f"#apex_desktop_{base}", f'//*[@id="apex_desktop_{base}"]'),
+                  (f"#{rid}", f'//*[@id="{rid}"]')]
+        if not self._uni_first_attr(
+                tree, '[id^="apex_desktop_"][id*="AccordionRow"]',
+                '//*[starts-with(@id, "apex_desktop_") and contains(@id, "AccordionRow")]/@id',
+                'id'):
+            scopes.append(("#apex_desktop", '//*[@id="apex_desktop"]'))
+        return scopes
 
     def _slx_parse_original_price(self, tree) -> str:
         try:
@@ -2385,16 +2402,31 @@ class AmazonParser:
             if not tree:
                 return None
 
-            # 在 #aod-offer / #aod-offer-list / #aod-pinned-offer 区域内搜索
+            # 在 #aod-pinned-offer / #aod-offer / #aod-offer-list 区域内搜索
             # 这些是 Amazon AOD (All Offers Display) 的标准容器
-            offer_containers = ['#aod-pinned-offer', '#aod-offer', '#aod-offer-list']
+            #
+            # 候选是**单个报价节点**：pinned 一个，再按顺序逐个 #aod-offer（id 重复，
+            # 每个报价一个）。下面所有字段都只在同一个节点里读 —— 原来第一个
+            # #aod-offer 没价格时退到整个 #aod-offer-list，价格取到的是第二个报价的，
+            # 卖家 / 运费 / maxQty 的 css_first 却仍落在第一个报价上，一行里拼进
+            # 两个卖家。整个列表只在页面上一个 #aod-offer 都没有时才当候选
+            # （认不出单个报价的版式，保留原来的兜底）。
+            # 真实响应里第一个 #aod-offer 都有价格，结果与原来逐字段相同。
+            candidates = []
+            pinned = tree.css_first('#aod-pinned-offer')
+            if pinned is not None:
+                candidates.append(pinned)
+            offers = tree.css('#aod-offer')
+            candidates.extend(offers)
+            if not offers:
+                offer_list = tree.css_first('#aod-offer-list')
+                if offer_list is not None:
+                    candidates.append(offer_list)
 
             best_offer = {}
 
-            for container_sel in offer_containers:
-                container = tree.css_first(container_sel)
-                if not container:
-                    continue
+            for container in candidates:
+                best_offer = {}
 
                 # 价格：先试 a-offscreen，再试 whole+fraction
                 price_found = False
