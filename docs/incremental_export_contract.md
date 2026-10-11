@@ -54,7 +54,7 @@ null）。这是**纯追加**，按 `docs/erpapi_contract.md` §3.2「往成功�
 | # | 结论 | 要点 |
 |---|---|---|
 | 1 | **`slow_hash` 当不透明值用** | 算法是采集侧那一套（NFKC + 空白折叠 + 哨兵值全等归一 + 列表排序 + 图片 URL 归约到 image ID + 排序键 JSON + SHA-256，取前 16 位十六进制），**与契约文字描述的「字段排序后 sha256」不是同一个算法**。⚠ **不要按收到的 `slow` 对象自己重算再比对——两边必然不等。** 它保证的是「同页面跨进程跨引擎稳定、慢变字段真变了才变」 |
-| 2 | `fast.currency` 恒 `"USD"` | 采集侧**不采币种**，这是适配器补的常量。要真实币种需先在采集侧加抓取 |
+| 2 | `fast.currency` 按**采集来源站点**给 | F-012 起不再是常量：`scrape_params.source_marketplace` 为 `amazon.com` → `"USD"`，`amazon.ca` → `"CAD"`（取自采集侧站点注册表）。加拿大站页面上价格也显示为 `$`，**币种以这个字段为准**，不要按价格符号猜 |
 | 3 | `fast.stock_state` 值域 = `in_stock` / `out_of_stock` / `unknown` | 三值封闭集 |
 | 3b | `fast.stock_count` / `fast.delivery_days` / `fast.shipping` 的 `null` 与 `0` **不是一回事** | `null` = 这次没采到；`0` = 采到了且确实是 0（`stock_count=0` 即缺货；`shipping=0.0` 即**确认免运费**）。适配器绝不用 0 表示「没取到」，与 `price` 同一条原则。消费侧请分开处理，别用 `or 0` 兜底 |
 | 3c | `slow.variant.theme` 是**维度名**不是取值 | 形如 `"color_name/size_name"`，顺序即 Amazon `dimensions` 数组的顺序（不排序）。采集侧拿不到维度名、只产出裸值（`"Red; L"`）时，`theme` 为 `null` —— 那种情况我们确实不知道维度叫什么，编一个出来会被下游当真维度去分组。⚠ **2026-08-14 之前 `theme` 对所有真实记录恒为 `null`**（适配器自带的解析按 `:` 切，而采集侧用的是 `=`）；修复后开始有值，消费侧若此前把 `theme` 当恒空处理需要复查 |
@@ -399,6 +399,9 @@ t0+~1min  auto_retry_failed_tasks 把它重置回 pending
 
 1. **按 `(asin, zipcode)` 分组、取 `cursor` 最大的那条**，不要看到
    `parse_failed` 就下结论 —— 后面很可能跟着一条 `ok`。
+   F-012 起同一个 ASIN 可能美加两站各有记录：两站邮编形状互不相交（`10001` vs `K1V 7P8`），
+   所以这个分组键仍然不会把两站混在一起；更稳妥的写法是把 `scrape_params.source_marketplace`
+   也放进分组键。
 2. `outcome != "ok"` 的记录**只进快照表，不要 upsert 商品**（§契约正文）：
    它的 `slow`/`fast` 基本是空的，那是"本次没采到"，不是"值变成空了"。
    拿它覆盖已有数据 = 用一次失败把好数据擦掉。
