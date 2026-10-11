@@ -170,6 +170,9 @@ class ProductIDTypeIsTheCanadianUpcLabel(unittest.TestCase):
 
         一格里有怪值时丢怪值、留好码；整格都不合格就什么都不收，
         不把别的东西吞进 upc_list。
+
+        逗号 / 分号分隔在抽查页里没有真实样本，值是构造的：钉的是「换了分隔符
+        也不丢码」，形状仍与空格分隔的那一格相同。
         """
         row = _row("B0CR5D95NN.ca.html", "ProductIDType")
         cases = [
@@ -177,6 +180,10 @@ class ProductIDTypeIsTheCanadianUpcLabel(unittest.TestCase):
             ("4006381333931", "4006381333931"),                # EAN-13
             ("B0CR5D95NN 604938601102", "604938601102"),       # 混进 ASIN
             ("604938601102 604938601102", "604938601102"),     # 同格重复
+            ("673986005705, 196393154472",                     # 逗号分隔
+             "673986005705 196393154472"),
+            ("604938601102;706316511987",                      # 分号分隔
+             "604938601102 706316511987"),
             ("60493860110", ""),                               # 11 位
             ("96385074", ""),                                  # 8 位 EAN-8
             ("10604938601109", ""),                            # 14 位 GTIN-14
@@ -188,6 +195,19 @@ class ProductIDTypeIsTheCanadianUpcLabel(unittest.TestCase):
             for engine, r in _parse_all_engines(html, "B0UPC00001", "ca").items():
                 with self.subTest(value=value, engine=engine):
                     self.assertEqual(r["upc_list"], want)
+
+        # 整格不合格时**不留痕迹**：不能往 page_details 里写空串 'upc'。
+        # _slx_parse_upc / _parse_upc 判的是 ``'upc' in page_details``（键在
+        # 不在），空串会作为一个元素并进 upc_list，同页另有 ``"upc":"..."``
+        # 这条来源时导出就多一个前导逗号（",673986005705"）。
+        # 脚本里的 JSON 码与 test_parser_quality.py 的 FULL 夹具同一写法。
+        json_upc = '<script>var upcs = {"upc":"673986005705"};</script>'
+        for value in ("N/A", "B0CR5D95NN 60493860110"):
+            html = _page(_with_value(row, value)).replace(
+                "</body>", json_upc + "</body>")
+            for engine, r in _parse_all_engines(html, "B0UPC00001", "ca").items():
+                with self.subTest(value=value, json_upc=True, engine=engine):
+                    self.assertEqual(r["upc_list"], "673986005705")
 
     def test_upc_row_wins_whichever_comes_first(self):
         """同页真有 ``UPC`` 行时以它为准，``ProductIDType`` 只填空 —— 与行序无关。"""
