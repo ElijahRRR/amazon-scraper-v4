@@ -4,6 +4,10 @@
 Warehouse Deals 的卖家 ID、无推荐报价页走「查看全部报价」(aodAjaxMain) 兜底时的
 卖家与库存数。
 
+`tests/test_accordion_buy_row.py` 也用这里的 accordion 片段：配送日期 / 天数 / 运费只读
+下单那一行、会员价行被选中时现价取全新行的普通价。它在片段上做的改动（把二手行日期改成
+Tomorrow、挪动选中行、改配送价等）都在**测试里现做**并写明，夹具文件本身是原样裁剪。
+
 ## 来源
 
 | 夹具 | 来源 | 抓取时间 (UTC) | 为什么选它 |
@@ -13,6 +17,7 @@ Warehouse Deals 的卖家 ID、无推荐报价页走「查看全部报价」(aod
 | `dp_ca_B0B9R8R8NC_accordion_was.html.gz` | www.amazon.ca 商品页 | 2026-10-10 13:53 | accordion，全新行**自己**有 "Was: $169.99" —— 修完不能丢 |
 | `dp_us_B0D12731YT_accordion_prime.html.gz` | www.amazon.com 商品页 | 2026-10-11 05:49 | accordion，选中的是会员价行（primeSavingsUpsellAccordionRow），"List Price: $34.99" |
 | `dp_ca_B0CRH6FDD7_single_was.html.gz` | www.amazon.ca 商品页 | 2026-10-10 13:52 | 传统单 offer buybox，"Was: $64.99" —— 非 accordion 路径的对照 |
+| `dp_ca_B0CG19X7RN_accordion_delivery.html.gz` | www.amazon.ca 商品页 | 2026-10-10 13:52 | accordion：选中的全新行只有 Friday, October 16；未选中的二手行有 October 14 / Monday, October 12。配送日期曾被导出成 October 12 |
 | `dp_ca_B0GKNHN7Q5_warehouse.html.gz` | www.amazon.ca 商品页 | 2026-10-10 13:53 | 二手 buybox，卖家 Warehouse Deals，链接是 `/b?node=8929975011`（无 `seller=`），ID 在同一表单的 `input#merchantID` |
 | `dp_ca_B0D45YH9FL_nfo.html.gz` | www.amazon.ca 商品页 | 2026-10-10 13:53 | 无推荐报价（"No featured offers available"），`input#merchantID` 的 value 为空 |
 | `aod_ca_B0D45YH9FL.html.gz` | 同一 ASIN 的 aodAjaxMain 响应 | 2026-10-10 14:14 | 第一个报价 Botley Store / A15CBTP5BTSNTZ / $246.62 / maxQty 3，与用户导出那一行的价格、运费、配送逐字段对上 |
@@ -41,6 +46,10 @@ Warehouse Deals 的卖家 ID、无推荐报价页走「查看全部报价」(aod
 
 裁剪后逐一核对过：被测字段（原价 / 卖家 ID / 卖家名 / 品相 / 无推荐报价页的价格与库存 /
 `parse_offer_listing` 的整个返回值 / 数量下拉）在两条解析引擎上与完整页面**逐字段相同**。
+
+`dp_ca_B0CG19X7RN_accordion_delivery.html.gz` 按同一裁剪法（`#apex_desktop` + `#buyBoxAccordion`）
+后加；它与 `dp_us_B0D12731YT_accordion_prime` / `dp_us_B0CQWZR6L8_accordion` 两份一起核过：
+现价 / buybox 价 / 原价 / 运费 / 配送日期 / 配送天数 / 品相在两条引擎上与完整页面逐字段相同。
 
 ## 会过期
 

@@ -722,6 +722,20 @@ completeness_ok  ⟺  (completeness & 8) != 0  AND  (completeness & 7) == 7
 
   注意这 4 个字段**不在** `review_hash` 与 `slow_hash` 的字段集里，
   所以本条不影响复审门，也不引起哈希翻转。
+- **`stock_count` / `stock_status` 的口径（2026-10 补记，行为未变）。**
+  `stock_count` 是**字符串**形式的整数，含义按来源分：
+
+  | 取值 | 含义 |
+  |---|---|
+  | `"N"`，且 `stock_status` 形如 `Only N left in stock…` | 页面明说的剩余件数 N |
+  | 其它正整数 | **单次可购买数量上限**：页面数量下拉框的最大值；无推荐报价、走「查看全部报价」兜底（`stock_status` 为 `In Stock (via offer-listing)`）时是该报价的 `maxQty`。**不是实物库存** |
+  | `"999"` | 有货、但页面没给数量。**哨兵值，不是件数** —— 别拿去求和、比大小 |
+  | `"0"` | 缺货 / 不可售：`stock_status` 是 out of stock / unavailable，或无推荐报价且兜底也没拿到报价（`stock_status` 为 `No Featured Offer`） |
+
+  `outcome != "ok"` 的记录（如 `not_found`）上的 `"0"` 是占位值，不表示缺货。
+  `stock_status` 多数时候是页面库存文案原样（`In Stock` / `Only 3 left in stock - order soon.`），
+  另有几个采集侧写入的固定值：`Currently unavailable`、`No Featured Offer`、
+  `In Stock (via offer-listing)`；读不到时是 `"N/A"`。
 - **`screenshot_path` 是易失引用（硬性规则）。** 该键**可能缺席**（不是所有采集
   都出截图）。
   截图文件会被常规清理，采集侧**不做**独立持久化，且明确接受随机器丢失。

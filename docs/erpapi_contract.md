@@ -404,6 +404,18 @@ status.status == "completed"
 > 是**二手价**，与全新价不可混用。实例：`B0G449YVHD` 采到 `$20.70`，卖家是
 > Amazon Resale（亚马逊自营退货/开箱件）。
 
+> **`stock_count` 的口径**（2026-10 补记，行为未变）。字符串形式的整数：
+>
+> | 取值 | 含义 |
+> |---|---|
+> | `stock_status` 形如 `Only N left in stock…` 时的 `"N"` | 页面明说的剩余件数 |
+> | 其它正整数 | **单次可购买数量上限**（数量下拉框的最大值；无推荐报价、走「查看全部报价」兜底时是该报价的 `maxQty`）。**不是实物库存** |
+> | `"999"` | 有货、但页面没给数量。**哨兵值，不是件数** —— 别拿去求和、比大小 |
+> | `"0"` | 缺货 / 不可售（`stock_status` 是 out of stock / unavailable，或 `No Featured Offer` 且兜底也没拿到报价）。⚠ `stock_status` 为 `"N/A"` 时的 `"0"` 是没采到商品页（如 404）写的占位值，**不表示缺货** |
+>
+> 增量导出里同一个值是 `fast.stock_count`（int 或 null，见 §4.8 与
+> `docs/incremental_export_contract.md` 不变量 3b）。
+
 | `has_more` | 还有下一页。**翻页的唯一终止条件** |
 | `next_cursor` | 下一页的游标（`direction=next` 用）= 本页最后一行的 `id` |
 | `prev_cursor` | 上一页的游标（`direction=prev` 用）= 本页第一行的 `id` |
@@ -709,6 +721,11 @@ while True:
 ⚠ `null` ≠ `0`（`docs/incremental_export_contract.md` 不变量 3b，与
 `stock_count` 同一条）。**别写 `shipping or 0`** —— 把没采到当 0 的话落地价
 照样算得出来、看着也正常，只是**偏小**，没有任何一侧会报错。
+
+`fast.stock_count` 的口径（2026-10 补记，行为未变）：「Only N left in stock」时是 N，
+否则是**单次可购买数量上限**（不是实物库存）；`999` = 有货、数量未知（哨兵值，不是件数）；
+`0` = 缺货 / 不可售。逐项说明见 §4.3 结果字段里的 `stock_count`。`outcome != "ok"`
+的记录（如 `not_found`）上的 `0` 是占位值，不表示缺货。
 
 > 顺带说明一处**已知的不一致**，以免被当成本端点的行为：UI 导出（Excel/CSV）
 > 的虚拟列「总价」把 `N/A` 也当 0 加进总价（`server/api/export.py:_prepare_row`），
