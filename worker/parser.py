@@ -1688,72 +1688,14 @@ class AmazonParser:
                 except Exception:
                     continue
 
-            # product_type：GL 商品组（gl_xxx），来源链见 _parse_product_type
-            pt = self._parse_product_type(tree, html_text)
-            if pt:
-                d['product_type'] = pt
+            # product_type 从 JSON 中提取
+            gl = re.search(r'"gl_product_group_type":"([^"]+)"', html_text)
+            if gl:
+                d['product_type'] = gl.group(1)
         except Exception as e:
             logger.warning(f"详情解析异常: {e}")
 
         return d
-
-    # ---- product_type（商品类型）----
-    #
-    # 原来唯一的来源是页面 JSON 里的 ``"gl_product_group_type":"..."``。2026-10 抽查：
-    # 36 张加拿大页、30 张美国页、两张 CA 夹具、用户上传的两张定位页里这个键**一次都
-    # 没出现**，导出 535/535 行都是 N/A —— 这个字段两站都已经死了。
-    #
-    # 取值形状：键名就是 Amazon 的 **GL 商品组**（gl_product_group），这类值在 Amazon
-    # 全站的写法都是 ``gl_`` 前缀的小写码（gl_furniture / gl_home / gl_automotive /
-    # gl_apparel）。仓库里没有任何一条真实解析出的值可以对照（golden 的 "TestType"、
-    # pgdb 用例的 "Portable Power Bank" 都是直接塞进写入层的假数据，不经过解析器），
-    # 所以新来源**只收 gl_xxx 这一种形状**，与键名的语义一致。
-    #
-    # ⚠ 不用的几个"看着像"的来源：
-    #   * 可见标签 ``Item Type Name``（加拿大页还有 Amazon 自己拼错的 ``Item Nype Name``）
-    #     —— 卖家自填的自由文本，实测 'Chirstmas Tree' / 'birch tree'，甚至有一页填的
-    #     是型号 'AW000165'。语义是"品名"，不是商品组；
-    #   * ``data-csa-c-pt`` / ``metricParameters.productType`` / ``productTypeDefinition``
-    #     —— 那是 Amazon 的 product type（SHELF / ARTIFICIAL_TREE），另一套分类；
-    #   * ``data-gl-product-group-id`` —— 美国页 B0FRD7DBML / B0GGGQBJSB 上它是
-    #     gl_biss，同页其它来源都是 gl_furniture：挂在视频组件上，不是本商品的。
-    #   * 转义 JSON 里的 ``productGroupType`` —— 推荐位商品也带，会混进别的商品组。
-    #
-    # ⚠ 哈希影响（一次性）：product_type 在 common/slowhash.py 的 REVIEW_HASH_FIELDS 里，
-    #   "N/A" 归一成 null，null -> gl_xxx 就是一次 review_hash 翻转。所以这条来源链上线后
-    #   的第一轮重采，凡是页面上取得到商品组的商品（抽查 66/66）review_hash 都会翻一次，
-    #   复审的合取门拦不住它（前后两条都是好页，只是一个字段从占位符变成了真值）。
-    #   hash_ver 没有升；给消费侧的说明和要求写在 docs/sync_contract.md §6.5。
-    #   以后再给这个字段换来源或换形状，同样要先算这笔账。
-    _GL_GROUP_RE = re.compile(r"gl_[a-z0-9_]+")
-
-    def _parse_product_type(self, tree, html_text: str) -> Optional[str]:
-        """GL 商品组（如 ``gl_furniture``）。取不到返回 ``None``。两条引擎路径共用。
-
-        来源按优先级：
-          1. ``"gl_product_group_type":"..."`` —— 原来源，原样保留（还有页面带它时
-             行为与改动前逐字节一致）；
-          2. ``<input id="productCategory" value="gl_...">`` —— 页面级的
-             "Tell Us About a Lower Price" 表单，报的就是本商品。66 张抽查页 65 张有；
-          3. ``data-gl-product-group="gl_..."``，且同一元素带 ``data-ingress-asin``
-             —— 以旧换新侧栏，按 ASIN 挂载（5 张变体偏移页上它也跟着页面实际展示的
-             ASIN 走，与 ``_page_asin`` 一致）。66 张全有，补上第 2 条缺的那一张
-             （加拿大 B0CRGYZ4HV 是精简渲染，没有那个表单）。
-        2、3 在两站 66 张页面上取值**全部一致**。只收 ``gl_xxx`` 形状。
-        """
-        gl = re.search(r'"gl_product_group_type":"([^"]+)"', html_text or "")
-        if gl:
-            return gl.group(1)
-        for css, xpath, attr in (
-            ('input#productCategory', '//input[@id="productCategory"]/@value', 'value'),
-            ('[data-gl-product-group][data-ingress-asin]',
-             '//*[@data-gl-product-group and @data-ingress-asin]/@data-gl-product-group',
-             'data-gl-product-group'),
-        ):
-            v = self._uni_first_attr(tree, css, xpath, attr)
-            if v and self._GL_GROUP_RE.fullmatch(v):
-                return v
-        return None
 
     # ==================== lxml 解析路径 (fallback) ====================
 
@@ -3691,10 +3633,9 @@ class AmazonParser:
                 except Exception:
                     continue
 
-            # 与 selectolax 路径同一个来源链，见 _parse_product_type
-            pt = self._parse_product_type(tree, html_text)
-            if pt:
-                d['product_type'] = pt
+            gl = re.search(r'"gl_product_group_type":"([^"]+)"', html_text)
+            if gl:
+                d['product_type'] = gl.group(1)
         except Exception as e:
             logger.warning(f"详情解析异常: {e}")
 

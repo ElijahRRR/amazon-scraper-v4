@@ -1,6 +1,5 @@
-"""文本类字段的四个解析缺陷（2026-10 加拿大站抽查暴露，美国站同样复现）。
+"""文本类字段的三个解析缺陷（2026-10 加拿大站抽查暴露，美国站同样复现）。
 
-    G1 product_type  唯一来源 ``"gl_product_group_type"`` 两站页面上都已不存在
     G3 bullet_points 黑名单按子串整条删，误删卖家真实卖点
     G4 image_urls    ``"hiRes":null`` 的图整张丢（包括主图）
     G5 brand / 详情值 双 td 布局取值带首尾空格；&nbsp; 与跨标签双空格
@@ -52,69 +51,6 @@ def _fx(name: str, engine: str) -> dict:
 
 def _lines(s: str) -> list:
     return [x for x in (s or "").split("\n") if x]
-
-
-# ==========================================================================
-# G1  product_type —— GL 商品组（gl_xxx）
-# ==========================================================================
-class ProductTypeIsGlGroup(unittest.TestCase):
-
-    def test_product_category_input_on_ca_pages(self):
-        """基线：两站 535/535 行 N/A。页面上有 ``<input id="productCategory" value="gl_...">``。
-
-        两张页面上都有 ``Item Type Name`` / Amazon 拼错的 ``Item Nype Name`` 行
-        （'Harley Touring Luggage Rack' / 'bookshelf'）—— 卖家自由文本，不是商品组，
-        必须**不**进这个字段：值必须是 gl_ 码。
-        """
-        for name, want, item_type in (("ca_B09Y3DKJKQ", "gl_automotive", "Harley Touring Luggage Rack"),
-                                      ("ca_B0D4QGVN6F", "gl_furniture", "bookshelf")):
-            self.assertIn(item_type, _html(name), "夹具里该有那一行可见标签（反证用）")
-            for engine in ENGINES:
-                with self.subTest(page=name, engine=engine):
-                    self.assertEqual(_fx(name, engine)["product_type"], want)
-
-    def test_trade_in_sidesheet_when_no_product_category_input(self):
-        """加拿大 B0CRGYZ4HV 是精简渲染，没有那个表单 input；以旧换新侧栏上
-        ``data-gl-product-group`` + ``data-ingress-asin`` 是第二来源。"""
-        self.assertNotIn('id="productCategory"', _html("ca_B0CRGYZ4HV"))
-        for engine in ENGINES:
-            with self.subTest(engine=engine):
-                self.assertEqual(_fx("ca_B0CRGYZ4HV", engine)["product_type"], "gl_furniture")
-
-    def test_video_widget_group_id_is_not_this_product(self):
-        """美国 B0FRD7DBML：视频挂件的 ``data-gl-product-group-id`` 是 gl_biss，
-        同页 input 与以旧换新侧栏都是 gl_furniture。挂件在页面上排在前面。"""
-        html = _html("us_B0FRD7DBML")
-        self.assertLess(html.index("gl_biss"), html.index('id="productCategory"'))
-        for engine in ENGINES:
-            with self.subTest(engine=engine):
-                self.assertEqual(_fx("us_B0FRD7DBML", engine)["product_type"], "gl_furniture")
-
-    def test_video_widget_alone_is_not_a_source(self):
-        """守卫：只剩那个视频挂件时宁可 N/A，也不拿别的商品的组。"""
-        html = _html("us_B0FRD7DBML")
-        html = re.sub(r'<input[^>]*id="productCategory"[^>]*>', "", html)
-        html = re.sub(r'<div[^>]*data-gl-product-group="[^"]*"[^>]*></div>', "", html)
-        self.assertIn("gl_biss", html)
-        for engine in ENGINES:
-            with self.subTest(engine=engine):
-                self.assertEqual(_parse(html, "us_B0FRD7DBML", engine)["product_type"], "N/A")
-
-    def test_only_gl_shape_is_accepted(self):
-        """守卫（构造变体）：把真实 input 的 value 换成可见品名 'Bookcase'。
-        这个字段的形状是 gl_ 码；形状不对的值不收，不让两种语义混进同一列。"""
-        html = _html("ca_B0D4QGVN6F").replace('value="gl_furniture"', 'value="Bookcase"')
-        for engine in ENGINES:
-            with self.subTest(engine=engine):
-                self.assertEqual(_parse(html, "ca_B0D4QGVN6F", engine)["product_type"], "N/A")
-
-    def test_legacy_json_key_still_wins(self):
-        """守卫：还带原来那个 JSON 键的页面，行为与改动前逐字节一致（键优先）。"""
-        html = _html("ca_B0D4QGVN6F").replace(
-            "</body>", '<script>var x = {"gl_product_group_type":"gl_pc"};</script></body>')
-        for engine in ENGINES:
-            with self.subTest(engine=engine):
-                self.assertEqual(_parse(html, "ca_B0D4QGVN6F", engine)["product_type"], "gl_pc")
 
 
 # ==========================================================================
@@ -369,10 +305,10 @@ class DetailValueWhitespace(unittest.TestCase):
 
 
 # ==========================================================================
-# 两条引擎在全部夹具上对本组四个字段给出同样的答案
+# 两条引擎在全部夹具上对本组三个字段给出同样的答案
 # ==========================================================================
 class EnginesAgreeOnTextFields(unittest.TestCase):
-    FIELDS = ("product_type", "bullet_points", "image_urls", "brand")
+    FIELDS = ("bullet_points", "image_urls", "brand")
 
     def test_parity(self):
         for fn in sorted(os.listdir(_FX)):
