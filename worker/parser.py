@@ -1034,12 +1034,68 @@ class AmazonParser:
                 continue
         return None
 
+    # ---- 原价：accordion buybox 只读选中那一行 ----
+    #
+    # 2026-09 起的多 offer accordion 布局里，**每一行 offer 都有自己的一整套价格块**，
+    # 而且 id 是重复的：
+    #
+    #   #centerCol #apex_desktop
+    #       #apex_desktop_newAccordionRow   > #corePriceDisplay_desktop_feature_div
+    #       #apex_desktop_usedAccordionRow  > #corePriceDisplay_desktop_feature_div
+    #           …"New condition price: $112.99"（basisPrice，带 data-a-strike）
+    #   #buybox #buyBoxAccordion
+    #       #newAccordionRow_0.a-accordion-active > … #corePrice_feature_div
+    #       #usedAccordionRow                     > … #corePrice_feature_div
+    #
+    # 原来全页取第一个划线价，全新行自己没有划线价时就落到二手行的
+    # "New condition price"（= 全新件的现价），导出成 原价 = 现价。
+    # 实例：CA B09Y3DKJKQ / B0CG19X7RN，US B0CQWZR6L8 / B0GGGQBJSB / B0GKNHN7Q5。
+    # 做法与 #24 修 offer_condition 一致：只读 a-accordion-active 那一行；
+    # 行 id 去掉 `_N` 后缀就是中栏价格块的 `apex_desktop_<行名>`（36+30 张真实页
+    # 上 12 张 accordion 页全部对得上）。
+
+    #: 行 id 要拼进 CSS / XPath，只收字母开头的字母数字下划线；别的一律当认不出。
+    _ACCORDION_ROW_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+    def _accordion_offer_scopes(self, tree) -> Optional[List[Tuple[str, str]]]:
+        """accordion buybox 上**选中那一行 offer** 的价格作用域 ``[(css, xpath), ...]``。
+
+        * 不是 accordion 布局 -> ``None``：调用方照旧全页取（行为与原来逐字节一致）。
+        * 是 accordion 但认不出行 -> ``[]``：调用方必须给 N/A，**不许回落全页**
+          —— 回落就是这个 bug 本身。
+        * 没有展开行时退到全新行（newAccordionRow_N）：页面主推的就是它。
+        """
+        if not self._has_any_block(tree, ("buyBoxAccordion",)):
+            return None
+        rid = self._uni_first_attr(
+            tree,
+            '#buyBoxAccordion div.a-accordion-active[id*="AccordionRow"]',
+            '//*[@id="buyBoxAccordion"]//div[contains(@id, "AccordionRow")'
+            ' and contains(concat(" ", normalize-space(@class), " "),'
+            ' " a-accordion-active ")]/@id', 'id')
+        if not rid:
+            rid = self._uni_first_attr(
+                tree, '#buyBoxAccordion div[id^="newAccordionRow"]',
+                '//*[@id="buyBoxAccordion"]//div[starts-with(@id, "newAccordionRow")]/@id',
+                'id')
+        if not rid or not self._ACCORDION_ROW_ID_RE.match(rid):
+            return []
+        base = re.sub(r"_\d+$", "", rid)
+        # 先中栏价格块（划线价实际都在这里），再 buybox 行本身（行内也有一份
+        # #corePrice_feature_div）。两处都属于同一个 offer。
+        return [(f"#apex_desktop_{base}", f'//*[@id="apex_desktop_{base}"]'),
+                (f"#{rid}", f'//*[@id="{rid}"]')]
+
     def _slx_parse_original_price(self, tree) -> str:
         try:
-            for container in ['#corePrice_feature_div', '#corePriceDisplay_desktop_feature_div', '#price']:
-                node = tree.css_first(f'{container} span[data-a-strike="true"] span.a-offscreen')
-                if node:
-                    return node.text(strip=True)
+            scopes = self._accordion_offer_scopes(tree)
+            # 非 accordion：前缀为空，选择器与原来逐字节相同。
+            prefixes = [""] if scopes is None else [css + " " for css, _ in scopes]
+            for prefix in prefixes:
+                for container in ['#corePrice_feature_div', '#corePriceDisplay_desktop_feature_div', '#price']:
+                    node = tree.css_first(f'{prefix}{container} span[data-a-strike="true"] span.a-offscreen')
+                    if node:
+                        return node.text(strip=True)
         except Exception:
             pass
         return "N/A"
@@ -2096,8 +2152,12 @@ class AmazonParser:
             seller_id = m.group(1) if m else ""
             if seller_id and name:
                 return seller_id, name
-            if name:  # 拿到名字但没拿到 ID（极罕见）
-                return "N/A", name
+            if name:
+                # 拿到名字但链接里没有 seller=。不罕见：Warehouse Deals / Amazon
+                # Resale 的二手 buybox，卖家链接指向的是类目节点（实测 CA
+                # B0GKNHN7Q5：`href="/b?node=8929975011"`），所有走 Warehouse 的
+                # 二手行都会是这个形状。ID 其实就在同一张加购表单的 hidden input 里。
+                return (self._seller_link_form_merchant_id(tree) or "N/A"), name
 
         # 2) 备选：任意带 seller= 的链接（href 路径变化时兜底）
         for css, xp in (
@@ -2177,6 +2237,46 @@ class AmazonParser:
 
         return "N/A", "N/A"
 
+    #: 加购表单里装卖家 ID 的 hidden input，按优先级。`usedMerchantID` 是二手
+    #: offer 表单里的那一份（实测与 merchantID 同值，留着兜底）。
+    _FORM_MERCHANT_INPUTS = ("merchantID", "usedMerchantID")
+
+    def _seller_link_form_merchant_id(self, tree) -> Optional[str]:
+        """卖家档案链接**所在那张表单**里的 merchantID；取不到返回 None。
+
+        ⚠ 必须是"链接所在的那张"，不能是全页第一个 ``form#addToCart``：
+          accordion buybox 每一行 offer 各有一张 ``form#addToCart``（id 重复），
+          全新行和二手行的 merchantID 不同（实测 CA B09Y3DKJKQ：全新行
+          ADUC3URPUSR5N、二手行 AUJBRIGYRJ3Q8）。取错表单就是把 A 的 ID 配上
+          B 的名字 —— 比 N/A 更糟。链接不在任何表单里时宁可不填。
+
+        空值（无推荐报价页上是 ``value=""``）与非 ID 形状的值一律不收，
+        判据与 ``seller=`` 那条正则同一个字符集。
+        """
+        try:
+            if self._is_slx(tree):
+                node = tree.css_first('a#sellerProfileTriggerId')
+                form = node.parent if node is not None else None
+                while form is not None and form.tag != "form":
+                    form = form.parent
+                if form is None:
+                    return None
+                for inp in self._FORM_MERCHANT_INPUTS:
+                    for el in form.css(f'input#{inp}'):
+                        val = (el.attributes.get("value") or "").strip()
+                        if re.fullmatch(r"[A-Z0-9]+", val):
+                            return val
+                return None
+            for inp in self._FORM_MERCHANT_INPUTS:
+                for v in tree.xpath('(//a[@id="sellerProfileTriggerId"])[1]'
+                                    f'/ancestor::form[1]//input[@id="{inp}"]/@value'):
+                    val = str(v).strip()
+                    if re.fullmatch(r"[A-Z0-9]+", val):
+                        return val
+        except Exception:
+            pass
+        return None
+
     def _slx_parse_price_enhanced(self, tree, jsonld: dict, sp_data: dict,
                                   spec=None) -> str:
         """增强价格解析：CSS → JSON-LD → JS脚本数据"""
@@ -2246,10 +2346,36 @@ class AmazonParser:
 
         return ""
 
+    @staticmethod
+    def _aod_offer_max_qty(container) -> Optional[int]:
+        """AOD 单个 offer 的 maxQty（正整数）；取不到返回 None，**不猜**。
+
+        值在加购按钮的 ``data-aod-atc-action`` 属性里，是一段 JSON：
+        ``{"maxQty":3,"offerIndex":1,"minQty":1,...}``。JSON 解不开时退一步用
+        正则抠同一个键，仍拿不到就算了 —— 读不到时填什么由调用方决定。
+        """
+        try:
+            node = container.css_first('[data-aod-atc-action]')
+            raw = (node.attributes.get('data-aod-atc-action') or '') if node is not None else ''
+            if not raw:
+                return None
+            try:
+                val = json.loads(raw).get('maxQty')
+            except (ValueError, AttributeError):
+                m = re.search(r'"maxQty"\s*:\s*(\d+)', raw)
+                val = m.group(1) if m else None
+            if isinstance(val, bool):
+                return None
+            n = int(val)
+            return n if n > 0 else None
+        except (TypeError, ValueError, AttributeError):
+            return None
+
     def parse_offer_listing(self, html_text: str, spec=None) -> Optional[Dict[str, Any]]:
         """v3: 解析 /gp/offer-listing/{ASIN} 页面，提取第一个 offer 完整信息
         限定在 #aod-offer / #aod-offer-list 区域内，避免提取到推荐产品的价格
-        返回: {'price','shipping','delivery','seller','ships_from','is_fba'} 或 None
+        返回: {'price','shipping','delivery','seller','seller_id','ships_from',
+               'is_fba','max_qty'} 或 None；取不到的键不出现（seller_id / max_qty 同理）。
         """
         if not html_text or "validateCaptcha" in html_text:
             return None
@@ -2342,6 +2468,26 @@ class AmazonParser:
                     seller_node = container.css_first('#aod-offer-soldBy a')
                 if seller_node:
                     best_offer['seller'] = seller_node.text(strip=True)
+                    # 卖家 ID 就在同一个链接的 href 里
+                    # （/gp/aag/main?...&seller=A15CBTP5BTSNTZ&...），判据同 _parse_seller。
+                    sid = re.search(r"seller=([A-Z0-9]+)",
+                                    seller_node.attributes.get('href') or '')
+                    if sid:
+                        best_offer['seller_id'] = sid.group(1)
+
+                # 可购数量上限：本 offer 加购按钮上的 data-aod-atc-action JSON 里的 maxQty。
+                #
+                # 为什么是 maxQty 而不是数量下拉：两份能对照的真实样本里，同一个卖家
+                # 在商品页 select#quantity 的最大项（正常路径的 stock_count 就取它）
+                # 与 AOD 的 maxQty **相等**，而 AOD 静态 HTML 的下拉恒比它少 1：
+                #   CA B0CQWZR6L8  商品页下拉 1..24  AOD maxQty 24  AOD 下拉 1..23
+                #   CA B0DJ231D92  商品页下拉 1..5   AOD maxQty 5   AOD 下拉 1..4
+                # （12 份真实 AOD 响应里 32 个带价格的 offer 全都有 maxQty，
+                #   下拉也全都是 maxQty - 1。）
+                # 取下拉会让同一个 offer 走兜底路径比走正常路径少报 1 件。
+                max_qty = self._aod_offer_max_qty(container)
+                if max_qty:
+                    best_offer['max_qty'] = max_qty
 
                 # Ships from → FBA/FBM 判断
                 ships_node = container.css_first('#aod-offer-shipsFrom .a-color-base')
@@ -3205,10 +3351,14 @@ class AmazonParser:
 
     def _parse_original_price(self, tree) -> str:
         try:
-            for container_id in ['corePrice_feature_div', 'corePriceDisplay_desktop_feature_div', 'price']:
-                orig = tree.xpath(f'//*[@id="{container_id}"]//span[@data-a-strike="true"]//span[@class="a-offscreen"]/text()')
-                if orig:
-                    return orig[0].strip()
+            # 作用域口径同 _slx_parse_original_price（accordion 只读选中行）。
+            scopes = self._accordion_offer_scopes(tree)
+            prefixes = [""] if scopes is None else [xp for _, xp in scopes]
+            for prefix in prefixes:
+                for container_id in ['corePrice_feature_div', 'corePriceDisplay_desktop_feature_div', 'price']:
+                    orig = tree.xpath(f'{prefix}//*[@id="{container_id}"]//span[@data-a-strike="true"]//span[@class="a-offscreen"]/text()')
+                    if orig:
+                        return orig[0].strip()
         except Exception:
             pass
         return "N/A"
