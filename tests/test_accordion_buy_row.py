@@ -86,6 +86,17 @@ def _edit_row(html: str, row_id: str, old: str, new: str, expect: int) -> str:
     return html[:start] + seg.replace(old, new) + html[end:]
 
 
+def _select_used_row(html: str) -> str:
+    """B0CQWZR6L8 的变体：把 a-accordion-active 从全新行挪到二手行（模拟二手 offer
+    赢得 buybox）。其余原样。"""
+    html = _edit_row(html, "newAccordionRow_0",
+                     'class="a-box a-accordion-active celwidget"', 'class="a-box celwidget"', 1)
+    return _edit_row(html, "usedAccordionRow",
+                     'class="a-box celwidget" data-a-accordion-row-name="usedAccordionRow"',
+                     'class="a-box a-accordion-active celwidget" '
+                     'data-a-accordion-row-name="usedAccordionRow"', 1)
+
+
 def _row_times(html: str, row_id: str) -> list:
     """某一行里全部 data-csa-c-delivery-time 的值（夹具前提断言用）。"""
     return [n.attributes.get("data-csa-c-delivery-time")
@@ -203,17 +214,35 @@ class AccordionDeliveryTests(_Base):
     def test_selected_used_row_reads_the_used_row(self):
         """读的是「选中行」，不是「全新行」。B0CQWZR6L8 的变体：**改动**是把
         a-accordion-active 从全新行挪到二手行（模拟二手 offer 赢得 buybox）。
-        二手行只有 Saturday, October 17，全新行的 October 16 更快也不能报。"""
-        html = _load("dp_us_B0CQWZR6L8_accordion.html.gz")
-        html = _edit_row(html, "newAccordionRow_0",
-                         'class="a-box a-accordion-active celwidget"', 'class="a-box celwidget"', 1)
-        html = _edit_row(html, "usedAccordionRow",
-                         'class="a-box celwidget" data-a-accordion-row-name="usedAccordionRow"',
-                         'class="a-box a-accordion-active celwidget" '
-                         'data-a-accordion-row-name="usedAccordionRow"', 1)
+        二手行只有 Saturday, October 17，全新行的 October 16 更快也不能报。
+
+        已知的跨 offer 混拼（不在本用例断言里，记下来免得被当成已修）：这个变体下
+        配送 / 运费 / 品相 / 原价读的是二手行，现价与 buybox 价却仍是全新行的 $79.99
+        —— 现价只在**会员价行**被选中时换行（用户批的范围）。语料 66 张里没有一张是
+        二手行被选中的；要扩成「现价也跟下单那一行走」得用户另行同意。"""
+        html = _select_used_row(_load("dp_us_B0CQWZR6L8_accordion.html.gz"))
         date, days = self._delivery(html, "B0CQWZR6L8", _US)
         self.assertEqual(date, "October 17")
         self.assertEqual(days, self.p._pick_delivery(["Saturday, October 17"])[1])
+
+    def test_text_fallback_is_scoped_to_the_purchase_row_too(self):
+        """页面不带 data-csa-c-delivery-time 属性时，配送走「整段配送文本 + 正则」的
+        回退；那一步同样只读下单那一行。
+
+        CA B0CG19X7RN 的变体：**改动**是删掉全部 data-csa-c-delivery-time 属性
+        （5 处；节点与正文原样），逼解析走文本回退。回退要是读整页，未选中二手行
+        正文里的 "Monday, October 12" 就会被当成最快日期报出来（基线即如此）。
+        """
+        html, n = re.subn(r'\sdata-csa-c-delivery-time="[^"]*"', "",
+                          _load("dp_ca_B0CG19X7RN_accordion_delivery.html.gz"))
+        self.assertEqual(n, 5)
+        self.assertEqual(_row_times(html, "newAccordionRow_0"), [])
+        self.assertIn("Monday, October 12",
+                      HTMLParser(html).css_first("#usedAccordionRow").text(),
+                      "夹具前提：二手行正文里有更快的日期")
+        date, days = self._delivery(html, "B0CG19X7RN", _CA)
+        self.assertEqual(date, "October 16")
+        self.assertEqual(days, self.p._pick_delivery(["Friday, October 16"])[1])
 
     def test_unrecognisable_accordion_never_falls_back_to_the_whole_page(self):
         """accordion 在、但认不出任何行 -> N/A。回落全页就是这个 bug 本身。
@@ -253,15 +282,30 @@ class AccordionShippingTests(_Base):
         二手行的 data-csa-c-delivery-price="FREE" -> "$6.99"（2 处；带金额的取值形状
         真实存在，如 CA B0D12731YT 页上的 "$11.61"）。必须报选中行的 $6.99。
         """
-        html = _load("dp_us_B0CQWZR6L8_accordion.html.gz")
-        html = _edit_row(html, "newAccordionRow_0",
-                         'class="a-box a-accordion-active celwidget"', 'class="a-box celwidget"', 1)
-        html = _edit_row(html, "usedAccordionRow",
-                         'class="a-box celwidget" data-a-accordion-row-name="usedAccordionRow"',
-                         'class="a-box a-accordion-active celwidget" '
-                         'data-a-accordion-row-name="usedAccordionRow"', 1)
+        html = _select_used_row(_load("dp_us_B0CQWZR6L8_accordion.html.gz"))
         html = _edit_row(html, "usedAccordionRow", 'data-csa-c-delivery-price="FREE"',
                          'data-csa-c-delivery-price="$6.99"', 2)
+        self.assertEqual(self._shipping(html, "$42.61", _US), "$6.99")
+        for eng, r in _parse_both(html, "B0CQWZR6L8", _US).items():
+            self.assertEqual(r["buybox_shipping"], "$6.99", eng)
+
+    def test_free_over_threshold_text_of_another_row_is_ignored(self):
+        """满额免邮的文案判定（"FREE delivery … on orders over $35"）同样只看下单那一行。
+        原来把**所有行**的 #deliveryBlockMessage 文案拼成一段再判：别的行里有这句，
+        选中行自己的运费就被盖成 FREE。
+
+        B0CQWZR6L8 的变体，**改动**三处：前两处同上一条（active 挪到二手行、二手行
+        配送价 FREE -> $6.99）；第三处在**全新行**的 #deliveryBlockMessage 开头插一句
+        "FREE delivery on orders over $35.00 shipped by Amazon"。这句是合成的：66 张
+        真实页的购买框里都没有这种措辞（只在商品轮播里有 "FREE Shipping on orders over
+        $35"），句式取自这个分支要匹配的文案（见 _slx_parse_buybox_shipping 的 F-012 注释）。
+        """
+        html = _select_used_row(_load("dp_us_B0CQWZR6L8_accordion.html.gz"))
+        html = _edit_row(html, "usedAccordionRow", 'data-csa-c-delivery-price="FREE"',
+                         'data-csa-c-delivery-price="$6.99"', 2)
+        block = '<div id="deliveryBlockMessage" class="a-section a-spacing-none">'
+        html = _edit_row(html, "newAccordionRow_0", block,
+                         block + "<span>FREE delivery on orders over $35.00 shipped by Amazon</span>", 1)
         self.assertEqual(self._shipping(html, "$42.61", _US), "$6.99")
         for eng, r in _parse_both(html, "B0CQWZR6L8", _US).items():
             self.assertEqual(r["buybox_shipping"], "$6.99", eng)
@@ -315,6 +359,26 @@ class MemberPriceTests(_Base):
         self.assertEqual(got["buybox_price"], "N/A")
         self.assertEqual(self._delivery(html, "B0D12731YT", _US), ("N/A", "N/A"))
         self.assertEqual(self._shipping(html, "N/A", _US), "N/A")
+
+    def test_new_rows_own_price_block_unreadable_gives_na_not_the_center_column(self):
+        """全新行**行内**的价格块读不到 -> 现价 / buybox 价 N/A，不去中栏
+        apex_desktop_newAccordionRow 里捞：那一块「要付的价」的 a-offscreen 是空的，
+        第一个有字的是单价 $1.80 / count（B0F3CQT8G5 上是 List Price $99.99）。
+
+        B0D12731YT 的变体：**改动**是把全新行里的 #corePrice_feature_div 与
+        #apex_offerDisplay_desktop 两个 id 改名（各 1 处），模拟 Amazon 改了行内价格块。
+        """
+        html = _load("dp_us_B0D12731YT_accordion_prime.html.gz")
+        for block in ("corePrice_feature_div", "apex_offerDisplay_desktop"):
+            html = _edit_row(html, "newAccordionRow_1", f'<div id="{block}"',
+                             f'<div id="{block}_renamed"', 1)
+        self.assertEqual(
+            [n.text(strip=True) for n in HTMLParser(html).css(
+                "#apex_desktop_newAccordionRow #corePriceDisplay_desktop_feature_div span.a-offscreen")],
+            ["", "$1.80"], "夹具前提：中栏全新行块里首个有字的 a-offscreen 是单价")
+        got = self._prices(html, "B0D12731YT", _US)
+        self.assertEqual(got["current_price"], "N/A")
+        self.assertEqual(got["buybox_price"], "N/A")
 
     # ---- 反向：没选中会员价行的 accordion 页，现价一分不动 ----
     def test_new_row_selected_price_is_untouched(self):

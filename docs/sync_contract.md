@@ -728,14 +728,17 @@ completeness_ok  ⟺  (completeness & 8) != 0  AND  (completeness & 7) == 7
   | 取值 | 含义 |
   |---|---|
   | `"N"`，且 `stock_status` 形如 `Only N left in stock…` | 页面明说的剩余件数 N |
-  | 其它正整数 | **单次可购买数量上限**：页面数量下拉框的最大值；无推荐报价、走「查看全部报价」兜底（`stock_status` 为 `In Stock (via offer-listing)`）时是该报价的 `maxQty`。**不是实物库存** |
-  | `"999"` | 有货、但页面没给数量。**哨兵值，不是件数** —— 别拿去求和、比大小 |
+  | 其它正整数 | **单次可购买数量上限**：页面数量下拉框的最大值（多报价的 accordion 购买框上是**所有报价行**下拉框里的最大值，含二手行）；无推荐报价、走「查看全部报价」兜底（`stock_status` 为 `In Stock (via offer-listing)`）时是该报价的 `maxQty`。**不是实物库存** |
+  | `"999"` | 页面没给数量。**哨兵值，不是件数** —— 别拿去求和、比大小。多数伴随有货，但**有没有货以 `stock_status` 为准**：selectolax 读不到库存文案时 `stock_status` 是 `"N/A"`，`stock_count` 照样是 `"999"`。`Only …` 文案里没有数字、兜底报价没带 `maxQty` 时也是 `"999"` |
   | `"0"` | 缺货 / 不可售：`stock_status` 是 out of stock / unavailable，或无推荐报价且兜底也没拿到报价（`stock_status` 为 `No Featured Offer`） |
 
   `outcome != "ok"` 的记录（如 `not_found`）上的 `"0"` 是占位值，不表示缺货。
   `stock_status` 多数时候是页面库存文案原样（`In Stock` / `Only 3 left in stock - order soon.`），
   另有几个采集侧写入的固定值：`Currently unavailable`、`No Featured Offer`、
-  `In Stock (via offer-listing)`；读不到时是 `"N/A"`。
+  `In Stock (via offer-listing)`。读不到库存文案时：selectolax 主路径依次退到 JSON-LD、
+  页面脚本、加购按钮（有按钮记 `In Stock`），全都没有才是 `"N/A"`；lxml 回退引擎（只在
+  selectolax 不可用时走）退到 JSON-LD，再没有就写 `"In Stock"`；「See price in cart」页
+  两条引擎都直接写 `"In Stock"`。
 - **`screenshot_path` 是易失引用（硬性规则）。** 该键**可能缺席**（不是所有采集
   都出截图）。
   截图文件会被常规清理，采集侧**不做**独立持久化，且明确接受随机器丢失。

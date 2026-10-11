@@ -1071,8 +1071,8 @@ class AmazonParser:
     #
     # 同一个「整个购买框里取第一个 / 取最快」的毛病还在配送与运费上（每行各有一份
     # 配送块），以及会员价行被选中时的现价上。它们共用下面同一份行判定
-    # （_accordion_selected_row）；配送 / 运费用 _accordion_purchase_row，
-    # 会员价时的现价用 _member_price_scopes。
+    # （_accordion_selected_row；offer_condition 还留着 #24 的一份等价旧写法）；
+    # 配送 / 运费用 _accordion_purchase_row，会员价时的现价用 _member_price_scopes。
     #
     # 同类字段逐个核过（12 张 accordion 真实页）、**没改**的：库存状态取第一个
     # #availability、卖家取第一个卖家链接、FBA 判定取第一个 "Ships from"，
@@ -1100,7 +1100,7 @@ class AmazonParser:
         return rid if rid and self._ACCORDION_ROW_ID_RE.match(rid) else None
 
     def _accordion_selected_row(self, tree) -> Optional[str]:
-        """accordion buybox 上**选中那一行** offer 的 id —— 本文件唯一的一份行判定。
+        """accordion buybox 上**选中那一行** offer 的 id —— 这几个字段共用的行判定。
 
         * 不是 accordion 布局 -> ``None``：调用方照旧全页取（与原来逐字节一致）。
         * 是 accordion 但认不出行 -> ``""``：调用方必须给 N/A，**不许回落全页**
@@ -1109,6 +1109,11 @@ class AmazonParser:
 
         原价 / 配送 / 运费 / 会员价时的现价都从这里出发：各字段各认各的行，
         同一条记录里就会拼进两个 offer 的数据。
+
+        offer_condition（``_parse_offer_condition``）里还有一份等价的旧写法
+        （#24，同一条 a-accordion-active 选择器，读的是行文本、没有「退到全新行」
+        也没有 id 校验），没并过来：并的话要先在 66 张真实页上对 offer_condition
+        做一遍前后对比，不在这次改动的范围里。
         """
         if not self._has_any_block(tree, ("buyBoxAccordion",)):
             return None
@@ -1145,8 +1150,8 @@ class AmazonParser:
         """会员价行被选中时，现价 / buybox 价改读的作用域 ``[(css, xpath), ...]``。
 
         用户口径（2026-10-11）：**现价 = 普通买家能买到的价格，会员价不保留。**
-        所以选中会员价行时读全新行：buybox 里那一行本身，再加中栏同名价格块
-        （``apex_desktop_newAccordionRow``，行 id 去掉 ``_N``）。
+        所以选中会员价行时只读 buybox 里的全新行本身（行内有自己的
+        ``#corePrice_feature_div``，4 张真实页上首个 a-offscreen 就是普通价）。
 
         * 没选中会员价行（含非 accordion、认不出行）-> ``None``：调用方照旧取，
           选择器逐字节不变。只有会员价这一种情形改行，别的 accordion 页上现价
@@ -1154,8 +1159,15 @@ class AmazonParser:
         * 选中会员价行、却没有全新行 -> ``[]``：调用方给 N/A。拿会员价顶上
           就是用户否掉的那个值。
 
-        不带 ``#apex_desktop`` 整块兜底（原价那边有）：较早的单中栏形状里那一份
-        价格块是主推 offer 的 —— 会员价被选中时它就是会员价。
+        **不加**中栏同名价格块 ``apex_desktop_newAccordionRow`` 作第二作用域：
+        那一块的「要付的价」（``.apex-pricetopay-value``）的 a-offscreen 在 4 张
+        真实页上全是**空的**，块里第一个有字的 a-offscreen 是 List Price 或单价
+        （B0F3CQT8G5 ``$99.99``、B0D12731YT ``$1.80`` / count）。选择器在外层、
+        作用域在内层，行内价格块一旦读不到，就会先落到中栏的
+        ``#corePriceDisplay_desktop_feature_div`` 上拿到这种值，两条引擎还各错各的。
+        行内读不到就给 N/A，不猜。同理也不带 ``#apex_desktop`` 整块兜底（原价那边
+        有）：较早的单中栏形状里那一份价格块是主推 offer 的 —— 会员价被选中时它就是
+        会员价。
         """
         rid = self._accordion_selected_row(tree)
         if not self._is_member_price_row(rid):
@@ -1163,9 +1175,7 @@ class AmazonParser:
         new = self._accordion_new_row(tree)
         if not new:
             return []
-        base = re.sub(r"_\d+$", "", new)
-        return [(f"#{new}", f'//*[@id="{new}"]'),
-                (f"#apex_desktop_{base}", f'//*[@id="apex_desktop_{base}"]')]
+        return [(f"#{new}", f'//*[@id="{new}"]')]
 
     def _accordion_offer_scopes(self, tree) -> Optional[List[Tuple[str, str]]]:
         """accordion buybox 上**选中那一行 offer** 的价格作用域 ``[(css, xpath), ...]``。
