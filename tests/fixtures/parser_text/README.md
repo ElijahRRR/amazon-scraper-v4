@@ -10,7 +10,7 @@
 | G1 唯一来源 `"gl_product_group_type"` 两站都已不存在，535/535 行 N/A | `product_type` | `ca_B09Y3DKJKQ` `ca_B0D4QGVN6F`（`input#productCategory`）、`ca_B0CRGYZ4HV`（只有以旧换新侧栏的 `data-gl-product-group`）、`us_B0FRD7DBML`（同页 `data-gl-product-group-id="gl_biss"` 是别的商品的视频挂件，不能取） |
 | G3 黑名单按子串整条删，误删卖家真实卖点 | `bullet_points` | `ca_B0D4QGVN6F`（Smiley Customer Service: …）、`ca_B09Y3DKJKQ`（Customer Support - …）、`ca_B0D45YH9FL`（Instruction and Customer Service: …）；黑名单当初要挡的模板句 `us_B0D86XBV23`（退货弹层 "Go to your orders and start the return" 等三句） |
 | G4 `"hiRes":null` 的图整张丢 | `image_urls` | `ca_B09Y3DKJKQ`（**主图** MAIN hiRes=null）、`ca_B0FFGFT343`（第 9 张 PT08 hiRes=null） |
-| G5 双 td 布局取值带首尾空格 | `brand` 及详情值 | `ca_B09Y3DKJKQ`（`tr.po-brand` 的 td 里 span 两侧有缩进 → `' MoKitDora '`） |
+| G5 双 td 布局取值带首尾空格 | `brand` 及详情值 | `ca_B09Y3DKJKQ`（`tr.po-brand` 的 td 里 span 两侧有缩进 → `' MoKitDora '`）、`us_B0F3JB4D4Z`（只截了 byline 和 Product Overview，**有意不带**后面的 th/td 详情表：整页上详情表那一行会覆盖 po- 行，只留 po- 行才测得到制造商在双 td 分支里的 `' CHANGZHOU JUTAI ELECTRONIC CO.,LTD '`）、`ca_B0B3RDLC1J`（`#detailBullets_feature_div` 整块，测 `li > span > span.a-text-bold` 分支） |
 
 ## 截取规则
 
@@ -19,7 +19,7 @@
 （G5 测的就是空白，重新序列化会把证据洗掉）：
 
 1. 按 id 取的块（`#feature-bullets`、`#productOverview_feature_div`、
-   `#bylineInfo_feature_div`、`#a-popover-cReturnsPolicyPopover`）：
+   `#bylineInfo_feature_div`、`#a-popover-cReturnsPolicyPopover`、`#detailBullets_feature_div`）：
    从开标签到配对的闭标签，同名标签计数配平。
 2. 详情表的单行（`Item Type Name` / `Item Nype Name` / `Manufacturer`）：
    所在 `<table>` 的开标签原文 + 那一行 `<tr>…</tr>` 原文 + `</table>`。

@@ -231,6 +231,29 @@ class ColorImagesPerEntry(unittest.TestCase):
                 self.assertEqual(urls[0], "https://m.media-amazon.com/images/I/4104axN68uL._AC_.jpg")
                 self.assertEqual(len(urls), 8)
 
+    def test_duplicate_entry_is_dropped_and_order_kept(self):
+        """构造变体：把 initial 数组的第 2 个条目原文复制一份接到数组末尾（一处改动；
+        抽查页面里没撞上重复条目，但规格要求"保序去重"，不钉住的话去掉去重也全绿）。
+        复制的是原始字节区间，不经 json.dumps 重新序列化。"""
+        html = _html("ca_B09Y3DKJKQ")
+        m = re.search(r"'initial': A\.\$\.parseJSON\('(\[.*?\])'\)", html)
+        payload = m.group(1)
+        dec = json.JSONDecoder()
+        _, end1 = dec.raw_decode(payload, 1)
+        self.assertEqual(payload[end1], ",")
+        _, end2 = dec.raw_decode(payload, end1 + 1)
+        dup = payload[:-1] + "," + payload[end1 + 1:end2] + "]"
+        html = html[:m.start(1)] + dup + html[m.end(1):]
+
+        entries = _initial_entries(html)
+        self.assertEqual(entries[-1], entries[1], "变体里第 2 个条目确实重复出现在末尾")
+        want = list(dict.fromkeys(e["hiRes"] or e["large"] for e in entries))
+        self.assertEqual(len(entries), 9)
+        self.assertEqual(len(want), 8)
+        for engine in ENGINES:
+            with self.subTest(engine=engine):
+                self.assertEqual(_lines(_parse(html, "ca_B09Y3DKJKQ", engine)["image_urls"]), want)
+
     def test_js_escapes_in_alt_text_do_not_break_parsing(self):
         """构造变体：真实页面的 altText 全是 null。给 MAIN 填一个带撇号和双引号的值，
         按 Amazon 写进单引号 JS 字符串时的转义（``\\'`` 与 ``\\\\"``）。
@@ -278,6 +301,41 @@ class DetailValueWhitespace(unittest.TestCase):
         for engine in ENGINES:
             with self.subTest(engine=engine):
                 self.assertEqual(_fx("ca_B09Y3DKJKQ", engine)["brand"], "MoKitDora")
+
+    def test_double_td_branch_squashes_at_the_root(self):
+        """根因处（_slx_parse_all_details 的双 td 分支）本身。品牌在 parse_product 出口
+        还有一道归一，只看出口的 brand 测不出这一行有没有改 —— 所以直接调详情扫描。
+        lxml 路径不读双 td 行，没有对应的分支。"""
+        from selectolax.parser import HTMLParser
+        html = _html("ca_B09Y3DKJKQ")
+        d = AmazonParser()._slx_parse_all_details(HTMLParser(html), html)
+        self.assertEqual(d["brand"], "MoKitDora")
+        for k, v in d.items():
+            with self.subTest(field=k):
+                self.assertEqual(v, AmazonParser._squash_ws(v))
+
+    def test_overview_only_manufacturer_has_no_edge_spaces(self):
+        """美国 B0F3JB4D4Z 的 Product Overview 原文（片段里有意不带后面的 th/td 详情表）。
+        整页上详情表那一行排在后面、会覆盖 po- 行（_map_detail 后写的赢），所以整页看不出；
+        只有 Product Overview 的页面上制造商就只能从双 td 行取，而出口只给品牌补了一道归一，
+        制造商没有。基线 selectolax 出 ' CHANGZHOU JUTAI ELECTRONIC CO.,LTD '。
+        只测 selectolax：lxml 路径不读双 td 行（这里出 N/A，是既有的引擎差异，不归本组）。"""
+        r = _fx("us_B0F3JB4D4Z", "selectolax")
+        self.assertEqual(r["manufacturer"], "CHANGZHOU JUTAI ELECTRONIC CO.,LTD")
+        self.assertEqual(r["brand"], "SHareconn")
+
+    def test_nbsp_in_detail_bullets_li_value_both_engines(self):
+        """detailBullets 的 li 分支（``li > span > span.a-text-bold`` + 值 span），两条引擎
+        各有一处取值，各自都要归一。加拿大 B0B3RDLC1J 的真实 Manufacturer 行先原样跑一遍，
+        再把值换成带 &nbsp; 的写法（构造变体，一处改动）。基线 selectolax 出
+        'NOW\\xa0\\xa0STO'，lxml 出 'NOW\\xa0\\xa0STO\\xa0'。"""
+        html = _html("ca_B0B3RDLC1J")
+        self.assertEqual(html.count("<span>NOWSTO</span>"), 1)
+        nbsp = html.replace("<span>NOWSTO</span>", "<span>NOW&nbsp;&nbsp;STO&nbsp;</span>")
+        for engine in ENGINES:
+            with self.subTest(engine=engine):
+                self.assertEqual(_parse(html, "ca_B0B3RDLC1J", engine)["manufacturer"], "NOWSTO")
+                self.assertEqual(_parse(nbsp, "ca_B0B3RDLC1J", engine)["manufacturer"], "NOW STO")
 
     def _po_brand(self, inner: str) -> str:
         """构造变体：只替换真实 po-brand 行里那个 span 的内容。"""

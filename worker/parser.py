@@ -1645,6 +1645,13 @@ class AmazonParser:
     #   * ``data-gl-product-group-id`` —— 美国页 B0FRD7DBML / B0GGGQBJSB 上它是
     #     gl_biss，同页其它来源都是 gl_furniture：挂在视频组件上，不是本商品的。
     #   * 转义 JSON 里的 ``productGroupType`` —— 推荐位商品也带，会混进别的商品组。
+    #
+    # ⚠ 哈希影响（一次性）：product_type 在 common/slowhash.py 的 REVIEW_HASH_FIELDS 里，
+    #   "N/A" 归一成 null，null -> gl_xxx 就是一次 review_hash 翻转。所以这条来源链上线后
+    #   的第一轮重采，凡是页面上取得到商品组的商品（抽查 66/66）review_hash 都会翻一次，
+    #   复审的合取门拦不住它（前后两条都是好页，只是一个字段从占位符变成了真值）。
+    #   hash_ver 没有升；给消费侧的说明和要求写在 docs/sync_contract.md §6.5。
+    #   以后再给这个字段换来源或换形状，同样要先算这笔账。
     _GL_GROUP_RE = re.compile(r"gl_[a-z0-9_]+")
 
     def _parse_product_type(self, tree, html_text: str) -> Optional[str]:
