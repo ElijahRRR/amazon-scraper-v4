@@ -177,6 +177,47 @@ def _sym_re(spec) -> str:
 #: ``shipping`` 同理（"Shipping Weight"），两个站点都出现过。
 _PACKAGE_WORDS = ("package", "parcel", "shipping")
 
+#: 「原产国」在详情表里的**次选**标签（压紧形）。与 ``parcel`` 同一类问题：
+#: 加拿大站把 country_of_origin 这个属性渲染成 **"Country of Publication"**
+#: （实测 36 张加拿大页里 13 张是这个写法，写 "Country of Origin" 的只有 2 张；
+#: 书架、收纳柜这类非书商品也是这个标签）。判据只认 ``countryoforigin``，
+#: 于是整行走空、导出全是 N/A —— 不是页面没有，是标签对不上。
+#:
+#: ⚠ 只当**次选**：同页另有 "Country of Origin" 时以 Origin 为准。"Publication"
+#:   在书类商品上字面意思是出版国，不一定等于原产国，所以它只填空、不覆盖，
+#:   且与行序无关（Origin 行在前在后都赢，见 _map_detail）。
+#: ⚠ 判据不分站点（_map_detail 拿不到站点）。美国站 30 张对照页里这个标签
+#:   一次都没出现，那 30 张的输出逐字段不变；美国站哪天真出现、又没有 Origin 行，
+#:   按同一条规则填空 —— 同一个属性换了个标签，两站一个口径。
+_ORIGIN_FALLBACK_KEYS = ("countryofpublication",)
+
+#: 加拿大站装 UPC 的那一行，标签是 Amazon **没翻译的原始属性名**
+#: ``ProductIDType``（压紧形 ``productidtype``，不含 "upc" 三个字母）。
+#: 同一批 ASIN 在美国站同一位置写的是 "UPC"，值逐字相同（实测 5/5 对）；
+#: 美国站 30 张对照页里这个标签 0 次，美国站输出不变。
+#: 这个属性名本身是泛指「外部商品码」，可能装别的码，所以收值前要过 _gtin_codes。
+_PRODUCT_ID_KEYS = ("productidtype",)
+
+#: 能当 UPC 收的码：**纯数字**，12 位（UPC-A）或 13 位（EAN-13）。
+#: 8 位（UPC-E / EAN-8）、14 位（GTIN-14）、ISBN-10（可能带 X）都不收 ——
+#: 实测加拿大页上这一行的码全是 12 位，放宽长度只会把别的东西吞进 upc_list。
+#: 用 ``[0-9]`` 不用 ``\d``：后者在 str 正则里也认全角 / 阿拉伯-印度数字。
+_GTIN_CODE_RE = re.compile(r"[0-9]{12,13}")
+
+
+def _gtin_codes(v: str) -> List[str]:
+    """从「外部商品码」那一格里取出能当 UPC 收的码，保序去重。
+
+    一格可能有多个码，Amazon 用空格隔开（实测 ``673986005705 196393154472``）。
+    逐个过 _GTIN_CODE_RE，不合格的那个丢掉、合格的照收 —— 别因为一个怪值
+    把同格的好码一起扔了，也别把怪值吞进去。
+    """
+    out: List[str] = []
+    for tok in re.split(r"[\s,;]+", v or ""):
+        if _GTIN_CODE_RE.fullmatch(tok) and tok not in out:
+            out.append(tok)
+    return out
+
 #: BSR 值里的 "(See Top 100 in XXX)" —— 那是个导航链接的文字，不是排名。
 _BSR_NAV_RE = re.compile(r"\(\s*See Top 100[^)]*\)", re.I)
 
@@ -2735,6 +2776,13 @@ class AmazonParser:
             d['part_number'] = v
         elif 'countryoforigin' in k_flat:
             d['country_of_origin'] = v
+        elif any(w in k_flat for w in _ORIGIN_FALLBACK_KEYS):
+            # 加拿大站的 "Country of Publication"，见 _ORIGIN_FALLBACK_KEYS。
+            # 只填空：上一条 Origin 无条件写、这一条只在空时写，合起来就是
+            # 「Origin 赢」且与两行谁先谁后无关（字典迭代顺序 = 页面行序，
+            # 不能靠先到先得）。
+            if not d.get('country_of_origin'):
+                d['country_of_origin'] = v
         elif 'bestsellersrank' in k_flat:
             # "( See Top 100 in XXX )" 是个**导航链接**，不是排名 —— 去掉。
             # 放在这里（而不是各提取路径里）是因为 BSR 有两条来源：
@@ -2748,6 +2796,19 @@ class AmazonParser:
             d['date_first_available'] = v
         elif 'upc' in k_lower:
             d['upc'] = v
+        elif any(w in k_flat for w in _PRODUCT_ID_KEYS):
+            # 加拿大站的 "ProductIDType"，见 _PRODUCT_ID_KEYS。
+            #
+            # 存成**和美国站 "UPC" 那一格逐字相同**的形状：合格的码用一个空格
+            # 连起来，原样进 d['upc']，再由 _slx_parse_upc / _parse_upc 并进
+            # upc_list。不在这里拆成逗号列表 —— 美国站同一个商品（B07JN24QCB）
+            # 现在导出的就是 "673986005705 196393154472"，这里拆了就是同一件商品
+            # 两站两种形状。多码一格要不要拆，是两站一起改的事。
+            #
+            # 与 Origin / Publication 同理：真有 "UPC" 行时以它为准，这一条只填空。
+            codes = _gtin_codes(v)
+            if codes and not d.get('upc'):
+                d['upc'] = " ".join(codes)
         elif 'weight' in k_flat and 'item' in k_flat:
             d['item_weight'] = v
         elif 'weight' in k_flat and any(w in k_flat for w in _PACKAGE_WORDS):
