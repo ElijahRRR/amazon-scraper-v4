@@ -455,11 +455,78 @@ class AmazonParser:
     """Amazon 商品页面解析器"""
 
     # 垃圾文字黑名单（五点描述过滤用）
+    #
+    # 它要挡的是 Amazon 自己的**退货弹层模板句**。真实页面上（2026-10 抽查的
+    # 66 张美 / 加页面每张都有）buybox 的 "FREE Returns" 弹层里是这么一段：
+    #
+    #   <div id="creturnsHowToReturnExpanderContent" class="a-expander-content ...">
+    #     <ol> <li><span class="a-list-item">Go to your orders and start the return</span></li>
+    #          <li><span class="a-list-item">Select your preferred free shipping option</span></li>
+    #          <li><span class="a-list-item">Drop off and leave!</span></li> </ol>
+    #
+    # —— 与五点同一个 ``a-expander-content`` / ``a-list-item`` 结构，五点的兜底
+    # 选择器一旦落到它上面就会把这三句当成卖点。表里前五个词正好是这三句的切片。
+    # 判据见 `_is_bullet_boilerplate`：**不再**是"含这个词就整条删"。
     BULLET_BLACKLIST = [
         "go to your orders", "start the return", "free shipping option", "drop off",
         "leave!", "return this item", "money back", "customer service",
         "full refund", "eligible for return",
     ]
+
+    #: 卖家自己的小标题：``Smiley Customer Service: ...`` / ``Customer Support - ...`` /
+    #: ``【Customer Service】...``。开头允许最多 3 个装饰符（✅ ★ 之类）。
+    #: 小标题本身不含句末标点 —— 这样 "Drop off and leave!" 里的 ``!`` 不会被当成分隔。
+    #: 长度上限 80：抽查页面里最长的小标题 68 字符
+    #: （"Built-in LED Lights, Perfect Integration of Bookshelf and Floor Lamp："）。
+    _SELLER_HEADING_RE = re.compile(
+        r"^\W{0,3}(?:[【\[][^】\]]{1,80}[】\]]"
+        r"|[^:：.!?]{1,80}?(?:\s*[:：]|\s+[-–—|]\s))"
+    )
+
+    @classmethod
+    def _is_bullet_boilerplate(cls, text: str) -> bool:
+        """这一条是不是 Amazon 混进来的模板句（而不是卖家写的卖点）。
+
+        原判据是"小写后含黑名单任一子串就整条删"，于是卖家的真实卖点被误删
+        （2026-10 抽查 33 个加拿大商品里 3 个，美国页同样复现）：
+
+            Smiley Customer Service: Welcome to Contact Us; ...          B0D4QGVN6F
+            Customer Support - Comes with 1 luggage rack ... 24/7 customer service ...   B09Y3DKJKQ
+            Instruction and Customer Service: You could see the installation steps ...   B0D45YH9FL
+
+        区别在形状上：模板句是**一句完整的说明**，没有小标题；卖家卖点几乎都以
+        自己的「小标题：」/「小标题 - 」/【小标题】开头（抽查 347 条卖点里 344 条）。
+        所以收窄成：**含黑名单词，且不以卖家小标题开头**，才算模板句。
+
+        ⚠ 只收窄、不放宽：黑名单词一个没删。不带小标题、又恰好提到
+          "customer service" 的卖家卖点仍会被删 —— 那是原判据就有的误伤，
+          这里没有证据去动它（真实页面上没见到这种卖点）。
+        """
+        low = text.lower()
+        if not any(term in low for term in cls.BULLET_BLACKLIST):
+            return False
+        return cls._SELLER_HEADING_RE.match(text) is None
+
+    #: 空白折叠：首尾空白去掉，中间连续空白（空格 / 制表符 / 不换行空格 / 换行）
+    #: 合并成一个普通空格。Python 的 ``\s`` 对 str 是 Unicode 语义，含 ``\xa0``。
+    _WS_RUN_RE = re.compile(r"\s+")
+
+    @classmethod
+    def _squash_ws(cls, s: str) -> str:
+        """详情值 / 品牌的空白归一，口径经用户确认：首尾去掉、中间合并成一个空格。
+
+        为什么需要：selectolax 的 ``text(separator=" ", strip=True)`` 是**逐文本
+        节点** strip 再用分隔符拼接，td 里 span 两侧的缩进文本节点被 strip 成空串
+        之后**仍然各贡献一个分隔符**：
+
+            <td class="a-span9">    <span class="po-break-word">MoKitDora</span>   </td>
+            -> ' MoKitDora '
+
+        真实导出 535 行里 44 行品牌带首尾空格（' SMIBUY ' / ' MoKitDora ' ...），
+        按品牌 join / 去重时与 'SMIBUY' 是两个品牌。两个词分在两个标签里时同理会
+        拼出双空格；``&nbsp;`` 会原样留成 ``\\xa0``（lxml 的 normalize-space 也不认它）。
+        """
+        return cls._WS_RUN_RE.sub(" ", s).strip()
 
     def parse_product(self, html_text: str, asin: str, zip_code: str = "10001",
                       marketplace: str = None) -> Dict[str, Any]:
@@ -504,7 +571,18 @@ class AmazonParser:
         # 为什么不在 slowhash.normalize_text 里洗：那里只作用于**哈希输入**，
         # 不改存下来的值 —— 洗了哈希稳了，下游拿到的仍然是脏数据，而下游按
         # 品牌 join 正是最需要它干净的地方。详见 common/core/textclean.py。
-        return _clean_deep(parsed)
+        cleaned = _clean_deep(parsed)
+
+        # 品牌的空白归一在出口再做一次（根因处的修复在两个 _*parse_all_details）。
+        # 为什么出口还要一道：品牌有四五个来源（JSON-LD / 详情表 / byline /
+        # logo alt / meta keywords），只修详情表那一路保证不了"最终值"的形状。
+        # 必须排在 _clean_deep **之后**：U+200E 删掉之后才露出来的空白
+        # （"\u200e MoKitDora" -> " MoKitDora"）在之前做就漏了。
+        # 归一后成空串说明原值只有空白 —— 回到"没取到"的哨兵，与其它来源一致。
+        brand = cleaned.get("brand")
+        if isinstance(brand, str):
+            cleaned["brand"] = self._squash_ws(brand) or "N/A"
+        return cleaned
 
     # ==================== selectolax 解析路径 ====================
 
@@ -1239,7 +1317,8 @@ class AmazonParser:
             for b in bullets:
                 if len(b) < 2:
                     continue
-                if any(spam in b.lower() for spam in self.BULLET_BLACKLIST):
+                # 模板句判据见 _is_bullet_boilerplate（不再是"含词即删"）
+                if self._is_bullet_boilerplate(b):
                     continue
                 clean.append(b)
 
@@ -1329,6 +1408,81 @@ class AmazonParser:
         except Exception:
             return ""
 
+    # ---- 图片：colorImages.initial 逐张取 ----
+    #
+    # 原实现是对整段 script 跑两条正则：
+    #     re.findall('"hiRes":"(https://...)"') or re.findall('"large":"(https://...)"')
+    # 第一条**跳过** ``"hiRes":null`` 的条目，而第二条只在"一张 hiRes 都没有"时
+    # 才整体启用 —— 不是逐张兜底。于是只要某一张原图不够大（Amazon 不给 hiRes），
+    # 它就从列表里**整张消失**。2026-10 抽查实测两例：
+    #   B09Y3DKJKQ  MAIN 图 4104axN68uL 只有 500x500，hiRes=null —— **主图**丢了，
+    #               列表第 1 张变成了 PT01，"首图即主图"的约定也破了；
+    #   B0FFGFT343  第 9 张 PT08 51E41zXXguL 只有 714x401，hiRes=null。
+    #
+    # 页面上 initial 的写法（66 张美 / 加页面全部是这一种）：
+    #     'colorImages': { 'initial': A.$.parseJSON('[{"hiRes":null,"large":"...","main":{...},...}, ...]')
+    # 条目键：hiRes / large / main{url: [w, h]} / thumb / variant / altText ...
+    _COLOR_IMAGES_INITIAL_RE = re.compile(
+        r"""['"]colorImages['"]\s*:\s*\{\s*['"]initial['"]\s*:\s*(A\.\$\.parseJSON\(\s*')?(?=\[)""")
+
+    @classmethod
+    def _color_images_initial(cls, script: str) -> Optional[List[str]]:
+        """colorImages.initial 逐张取 ``hiRes or large or main 里面积最大的那张``，保序。
+
+        结构认不出来（没有 initial、JSON 解析失败、一张都取不到）返回 ``None``，
+        由调用方退回原来的整段正则 —— 认不出来的页面行为与改动前一致。
+        """
+        m = cls._COLOR_IMAGES_INITIAL_RE.search(script)
+        if not m:
+            return None
+        start = m.end()
+        try:
+            if m.group(1):
+                # parseJSON('...')：数组在一个**单引号 JS 字符串**里。字符串到第一个
+                # 未转义的 ' 结束（altText 里的撇号会写成 \'，所以不能按括号配平：
+                # JSON 串里的 \" 在 JS 源码里是 \\"，配平扫描会把它当成串结束）。
+                i, n = start, len(script)
+                while i < n and script[i] != "'":
+                    i += 2 if script[i] == "\\" else 1
+                # 只还原 JS 层的两种转义：\' -> '、\\ -> \。其余（\" \n \/ \uXXXX）
+                # 本来就是合法的 JSON 转义，原样交给 json.loads。
+                payload = re.sub(r"\\(['\\])", r"\1", script[start:i])
+                entries = json.loads(payload)
+            else:
+                # 直接是数组字面量：JSONDecoder.raw_decode 只吃一个值，后面的 JS 不管。
+                entries, _ = json.JSONDecoder().raw_decode(script, start)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(entries, list):
+            return None
+
+        def _area(wh) -> int:
+            try:
+                return int(wh[0]) * int(wh[1])
+            except (TypeError, ValueError, IndexError, KeyError):
+                return 0
+
+        urls = []
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            url = None
+            for key in ("hiRes", "large"):
+                v = e.get(key)
+                if isinstance(v, str) and v.startswith("https://"):
+                    url = v
+                    break
+            if url is None and isinstance(e.get("main"), dict):
+                cands = [(u, _area(wh)) for u, wh in e["main"].items()
+                         if isinstance(u, str) and u.startswith("https://")]
+                if cands:
+                    # max 取第一个最大值：同面积时保留页面上的先后
+                    url = max(cands, key=lambda c: c[1])[0]
+            if url:
+                urls.append(url)
+        # 保序去重：首图（页面第 1 张，即 MAIN）始终排在第 1 位
+        return list(dict.fromkeys(urls)) or None
+
     def _slx_parse_images(self, tree, html_text: str) -> str:
         try:
             img_urls = []
@@ -1336,6 +1490,10 @@ class AmazonParser:
             for script in scripts:
                 text = script.text(strip=True)
                 if text and "colorImages" in text:
+                    per_image = self._color_images_initial(text)
+                    if per_image is not None:
+                        img_urls = per_image
+                        break
                     urls = re.findall(r'"hiRes":"(https://[^"]+)"', text) or \
                            re.findall(r'"large":"(https://[^"]+)"', text)
                     # 保序去重：dict.fromkeys 在 Python 3.7+ 保留插入顺序，
@@ -1404,16 +1562,20 @@ class AmazonParser:
                     #   无分隔符拼接会把相邻元素的文字粘在一起，实测产出
                     #   "#48 inDesks & Workstations"（in 和类目名之间没有空格）。
                     #   这条**两个站点都有**，只是 BSR 这种多元素的值才看得出来。
+                    # ⚠ 而带分隔符取又有反作用：td 里 span 两侧的缩进文本节点 strip 成
+                    #   空串后仍各贡献一个分隔符 -> ' MoKitDora '。所以取完一律过
+                    #   _squash_ws（首尾去掉、中间连续空白并成一个空格），三个分支都要：
+                    #   这里的值喂给 _map_detail，型号 / 制造商 / 重量 / 尺寸 / 品牌全从这走。
                     if th and tds:
                         k = th.text(strip=True)
-                        v = tds[0].text(separator=" ", strip=True)
+                        v = self._squash_ws(tds[0].text(separator=" ", strip=True))
                         if k and v:
                             self._map_detail(d, k, v)
                     elif len(tds) >= 2:
                         # 两列 td 布局：第一列通常是加粗的 key（a-text-bold）
                         key_span = tds[0].css_first('span.a-text-bold') or tds[0]
                         k = key_span.text(strip=True)
-                        v = tds[1].text(separator=" ", strip=True)
+                        v = self._squash_ws(tds[1].text(separator=" ", strip=True))
                         if k and v and len(k) <= 50:
                             self._map_detail(d, k, v)
                 except Exception:
@@ -1429,7 +1591,7 @@ class AmazonParser:
                         spans = parent.css('span')
                         for i, sp in enumerate(spans):
                             if sp.text(strip=True) == k and i + 1 < len(spans):
-                                v = spans[i + 1].text(separator=" ", strip=True)
+                                v = self._squash_ws(spans[i + 1].text(separator=" ", strip=True))
                                 # F-012 实测修复：**大类排名**。
                                 #
                                 # BSR 那一行的结构是嵌套的，一个商品有多个排名：
@@ -1453,14 +1615,65 @@ class AmazonParser:
                 except Exception:
                     continue
 
-            # product_type 从 JSON 中提取
-            gl = re.search(r'"gl_product_group_type":"([^"]+)"', html_text)
-            if gl:
-                d['product_type'] = gl.group(1)
+            # product_type：GL 商品组（gl_xxx），来源链见 _parse_product_type
+            pt = self._parse_product_type(tree, html_text)
+            if pt:
+                d['product_type'] = pt
         except Exception as e:
             logger.warning(f"详情解析异常: {e}")
 
         return d
+
+    # ---- product_type（商品类型）----
+    #
+    # 原来唯一的来源是页面 JSON 里的 ``"gl_product_group_type":"..."``。2026-10 抽查：
+    # 36 张加拿大页、30 张美国页、两张 CA 夹具、用户上传的两张定位页里这个键**一次都
+    # 没出现**，导出 535/535 行都是 N/A —— 这个字段两站都已经死了。
+    #
+    # 取值形状：键名就是 Amazon 的 **GL 商品组**（gl_product_group），这类值在 Amazon
+    # 全站的写法都是 ``gl_`` 前缀的小写码（gl_furniture / gl_home / gl_automotive /
+    # gl_apparel）。仓库里没有任何一条真实解析出的值可以对照（golden 的 "TestType"、
+    # pgdb 用例的 "Portable Power Bank" 都是直接塞进写入层的假数据，不经过解析器），
+    # 所以新来源**只收 gl_xxx 这一种形状**，与键名的语义一致。
+    #
+    # ⚠ 不用的几个"看着像"的来源：
+    #   * 可见标签 ``Item Type Name``（加拿大页还有 Amazon 自己拼错的 ``Item Nype Name``）
+    #     —— 卖家自填的自由文本，实测 'Chirstmas Tree' / 'birch tree'，甚至有一页填的
+    #     是型号 'AW000165'。语义是"品名"，不是商品组；
+    #   * ``data-csa-c-pt`` / ``metricParameters.productType`` / ``productTypeDefinition``
+    #     —— 那是 Amazon 的 product type（SHELF / ARTIFICIAL_TREE），另一套分类；
+    #   * ``data-gl-product-group-id`` —— 美国页 B0FRD7DBML / B0GGGQBJSB 上它是
+    #     gl_biss，同页其它来源都是 gl_furniture：挂在视频组件上，不是本商品的。
+    #   * 转义 JSON 里的 ``productGroupType`` —— 推荐位商品也带，会混进别的商品组。
+    _GL_GROUP_RE = re.compile(r"gl_[a-z0-9_]+")
+
+    def _parse_product_type(self, tree, html_text: str) -> Optional[str]:
+        """GL 商品组（如 ``gl_furniture``）。取不到返回 ``None``。两条引擎路径共用。
+
+        来源按优先级：
+          1. ``"gl_product_group_type":"..."`` —— 原来源，原样保留（还有页面带它时
+             行为与改动前逐字节一致）；
+          2. ``<input id="productCategory" value="gl_...">`` —— 页面级的
+             "Tell Us About a Lower Price" 表单，报的就是本商品。66 张抽查页 65 张有；
+          3. ``data-gl-product-group="gl_..."``，且同一元素带 ``data-ingress-asin``
+             —— 以旧换新侧栏，按 ASIN 挂载（5 张变体偏移页上它也跟着页面实际展示的
+             ASIN 走，与 ``_page_asin`` 一致）。66 张全有，补上第 2 条缺的那一张
+             （加拿大 B0CRGYZ4HV 是精简渲染，没有那个表单）。
+        2、3 在两站 66 张页面上取值**全部一致**。只收 ``gl_xxx`` 形状。
+        """
+        gl = re.search(r'"gl_product_group_type":"([^"]+)"', html_text or "")
+        if gl:
+            return gl.group(1)
+        for css, xpath, attr in (
+            ('input#productCategory', '//input[@id="productCategory"]/@value', 'value'),
+            ('[data-gl-product-group][data-ingress-asin]',
+             '//*[@data-gl-product-group and @data-ingress-asin]/@data-gl-product-group',
+             'data-gl-product-group'),
+        ):
+            v = self._uni_first_attr(tree, css, xpath, attr)
+            if v and self._GL_GROUP_RE.fullmatch(v):
+                return v
+        return None
 
     # ==================== lxml 解析路径 (fallback) ====================
 
@@ -3155,7 +3368,8 @@ class AmazonParser:
                 txt = b.strip()
                 if not txt or len(txt) < 2:
                     continue
-                if any(spam in txt.lower() for spam in self.BULLET_BLACKLIST):
+                # 与 selectolax 孪生实现同一个判据（_is_bullet_boilerplate）
+                if self._is_bullet_boilerplate(txt):
                     continue
                 clean.append(txt)
 
@@ -3226,10 +3440,13 @@ class AmazonParser:
             scripts = self._get_all_text(tree, '//script[contains(text(), "colorImages")]/text()')
             if scripts:
                 script = scripts[0]
-                urls = re.findall(r'"hiRes":"(https://[^"]+)"', script) or \
-                       re.findall(r'"large":"(https://[^"]+)"', script)
-                # 保序去重：保持亚马逊页面图片原始顺序，主图排在第 1 位
-                img_urls = list(dict.fromkeys(urls))
+                # 逐张取，理由见 _color_images_initial；认不出结构才退回整段正则
+                img_urls = self._color_images_initial(script)
+                if img_urls is None:
+                    urls = re.findall(r'"hiRes":"(https://[^"]+)"', script) or \
+                           re.findall(r'"large":"(https://[^"]+)"', script)
+                    # 保序去重：保持亚马逊页面图片原始顺序，主图排在第 1 位
+                    img_urls = list(dict.fromkeys(urls))
             else:
                 img_urls = tree.xpath('//div[@id="imgTagWrapperId"]/img/@src')
             return "\n".join(img_urls)
@@ -3264,27 +3481,31 @@ class AmazonParser:
         """全页扫描：提取 Product Information 表格内容"""
         d = {}
         try:
+            # XPath 1.0 的 normalize-space 只认空格 / 制表 / 回车 / 换行，``&nbsp;``
+            # 解码出来的 \xa0 原样留下 —— 所以值再过一次 _squash_ws，与 selectolax
+            # 路径同一个口径（理由见 _squash_ws）。
             for row in tree.xpath('//th/../..//tr'):
                 try:
                     k_nodes = row.xpath('normalize-space(./th)')
-                    v_nodes = row.xpath('normalize-space(./td)')
+                    v_nodes = self._squash_ws(str(row.xpath('normalize-space(./td)')))
                     if k_nodes and v_nodes:
-                        self._map_detail(d, str(k_nodes), str(v_nodes))
+                        self._map_detail(d, str(k_nodes), v_nodes)
                 except Exception:
                     continue
 
             for s in tree.xpath('//li/span/span[contains(@class, "a-text-bold")]'):
                 try:
                     k = s.xpath('normalize-space(./text())')
-                    v = s.xpath('normalize-space(./following-sibling::span)')
+                    v = self._squash_ws(str(s.xpath('normalize-space(./following-sibling::span)')))
                     if k and v:
-                        self._map_detail(d, str(k).replace(':', ''), str(v))
+                        self._map_detail(d, str(k).replace(':', ''), v)
                 except Exception:
                     continue
 
-            gl = re.search(r'"gl_product_group_type":"([^"]+)"', html_text)
-            if gl:
-                d['product_type'] = gl.group(1)
+            # 与 selectolax 路径同一个来源链，见 _parse_product_type
+            pt = self._parse_product_type(tree, html_text)
+            if pt:
+                d['product_type'] = pt
         except Exception as e:
             logger.warning(f"详情解析异常: {e}")
 
