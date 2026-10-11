@@ -18,6 +18,7 @@ from curl_cffi.requests import AsyncSession, Response
 
 from common import config
 from common.core.searchurl import build_search_url
+from common.core import marketplace as _marketplace
 from worker.proxy import ProxyManager
 from worker.ziputil import zip_effective_in_html
 
@@ -43,19 +44,58 @@ class AmazonSession:
     每个实例维护独立的 cookie jar 和 session
     """
 
-    AMAZON_BASE = "https://www.amazon.com"
-    ZIP_CHANGE_URL = "https://www.amazon.com/gp/delivery/ajax/address-change.html"
+    # F-012：站点相关的两个 URL 从**类常量**变成**实例属性**。
+    #
+    # 改造前它们是写死的 amazon.com，也就是说「这个采集器只能采美国站」这件事
+    # 是编码在类定义里的 —— 一个 session 对象没有任何办法指向别的站点。
+    # 现在它们从 self._marketplace 派生，而 marketplace 由任务带过来。
+    #
+    # 保留原来的名字（而不是改成 self._base_url）是为了让本文件里十余处
+    # ``self.AMAZON_BASE`` 一个字不用改：property 对属性访问是透明的。
+    # 类级访问 ``AmazonSession.AMAZON_BASE`` 会拿到 property 对象而不是字符串，
+    # 但全仓库没有一处这么用（已 grep 确认），所以这条差异不影响任何调用方。
+
+    @property
+    def AMAZON_BASE(self) -> str:
+        """``https://www.amazon.ca`` —— 详情页 / 卖家页 / 首页的拼接基点。"""
+        return self._marketplace.base_url
+
+    @property
+    def ZIP_CHANGE_URL(self) -> str:
+        """glow 地址切换的 ajax 端点（按站点换主机名）。"""
+        return self._marketplace.zip_change_url
 
     def __init__(self, proxy_manager: ProxyManager, zip_code: str = None,
-                 max_clients: int = None):
+                 max_clients: int = None, marketplace: str = None):
         """
         Args:
             proxy_manager: 代理管理器
-            zip_code: 配送邮编
+            zip_code: 配送邮编（未给出时取该站点的默认投递地）
             max_clients: 连接池大小（HTTP/1.1 下为最大 TCP 连接数）
+            marketplace: 采集站点（F-012）。``None`` -> 美国站，与改造前一致。
         """
         self.proxy_manager = proxy_manager
-        self.zip_code = zip_code or config.DEFAULT_ZIP_CODE
+        # 站点不合法就抛，不静默回退成美国站 —— 悄悄换站点意味着整批数据
+        # 采错国家而没有任何一侧会响（口径与写入侧、建任务侧一致）。
+        self._marketplace = _marketplace.get(marketplace)
+        # 邮编按站点校验，形状不对就落到该站点的默认投递地。
+        #
+        # 为什么在这里兜而不是信调用方：worker 有一个**全局** zip_code
+        # （config.DEFAULT_ZIP_CODE / 服务端下发的设置），它是美国的 10001。
+        # 建加拿大站 session 时那个值会一路传到这里，而 Amazon 收到一个
+        # 形状不对的邮编**不报错**——它静默忽略，页面落到某个默认地区。
+        # 于是整批加拿大数据的价格/库存/配送都是"某个说不清的地区"的，
+        # 而日志、进度、完整度全部正常。这是本功能里最难查的一类故障，
+        # 所以这道兜底放在最靠近出口的地方。
+        if zip_code and _marketplace.validate_postal(zip_code, self._marketplace.id):
+            self.zip_code = zip_code
+        else:
+            fallback = self._default_zip()
+            if zip_code:
+                logger.warning(
+                    "📍 邮编 %r 不是%s的形状，改用该站点默认投递地 %r",
+                    zip_code, self._marketplace.label, fallback)
+            self.zip_code = fallback
         self._max_clients = max_clients or config.MAX_CLIENTS
         self._session: Optional[AsyncSession] = None
         self._initialized = False
@@ -74,6 +114,19 @@ class AmazonSession:
             self._platform = '"macOS"'
         else:
             self._platform = '"Linux"'
+
+    def _default_zip(self) -> str:
+        """该站点的默认投递地。
+
+        ``config.DEFAULT_ZIP_CODE``（环境变量，默认 '10001'）只有在它对**当前
+        站点**合法时才用得上：它是一个全局配置，而邮编形状是每站点一套。
+        部署里配了美国邮编、跑的是加拿大站任务时，回退到注册表里那个站点
+        自己的默认值，而不是把一个美国邮编 POST 给 amazon.ca。
+        """
+        configured = config.DEFAULT_ZIP_CODE
+        if _marketplace.validate_postal(configured, self._marketplace.id):
+            return configured
+        return self._marketplace.default_postal
 
     async def initialize(self) -> bool:
         """
@@ -176,8 +229,8 @@ class AmazonSession:
             headers.update({
                 "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
                 "X-Requested-With": "XMLHttpRequest",
-                "Referer": "https://www.amazon.com/",
-                "Origin": "https://www.amazon.com",
+                "Referer": f"{self.AMAZON_BASE}/",
+                "Origin": self.AMAZON_BASE,
                 "Sec-Fetch-Dest": "empty",
                 "Sec-Fetch-Mode": "cors",
                 "Sec-Fetch-Site": "same-origin",
@@ -222,7 +275,7 @@ class AmazonSession:
     async def _verify_zip_code(self, timeout: float = 8.0) -> bool:
         """验证邮编是否实际生效（用较短超时，避免验证 GET 空耗到 20s）"""
         try:
-            headers = self._build_headers(referer="https://www.amazon.com/")
+            headers = self._build_headers(referer=f"{self.AMAZON_BASE}/")
             resp = await self._session.get(
                 self.AMAZON_BASE,
                 headers=headers,
@@ -233,7 +286,8 @@ class AmazonSession:
 
             # 复用与 Tier 2a on_fetch 相同的判定逻辑（单一事实源），
             # 仅在此处补充首页语境下的日志。
-            eff = zip_effective_in_html(self.zip_code, resp.text)
+            eff = zip_effective_in_html(self.zip_code, resp.text,
+                                        self._marketplace.id)
             if eff is True:
                 logger.info(f"📍 邮编验证通过: {self.zip_code}")
                 return True
@@ -319,7 +373,10 @@ class AmazonSession:
         """构建反指纹请求头"""
         headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
+            # F-012：locale 头按站点。拿 en-US 去请求 amazon.ca 不会报错，
+            # 但 Amazon 会据此挑语言/地区变体，采回来的页面可能不是该站点
+            # 的本地形态 —— 又一条只看数据看不出来的偏差。
+            "Accept-Language": self._marketplace.accept_language,
             "Accept-Encoding": "gzip, deflate, br",
             "User-Agent": self._user_agent,
             "Upgrade-Insecure-Requests": "1",
@@ -495,6 +552,11 @@ class AmazonSession:
             return True
 
         text = response.text
+        # ⚠ F-012：这个邮箱地址**不随站点变**，故意保持写死。
+        #   amazon.ca 的拦截页正文里同样是 api-services-support@amazon.com
+        #   （已实测：本仓库开发环境的机房出口 IP 被拦，拿到的 CA 拦截页正文
+        #    里就是这一串，变的只是页尾那两个链接 —— developer.amazonservices.ca
+        #    与 associates.amazon.ca）。把它换成按站点拼会让判定失效。
         if "api-services-support@amazon.com" in text and len(text) < 20000:
             return True
 

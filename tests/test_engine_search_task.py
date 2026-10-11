@@ -137,8 +137,17 @@ class FakeSlot:
     def __init__(self, session):
         self.session = session
         self.rotations = []
+        # F-012：记下每次 ensure_ready 收到的站点，供用例断言任务站点确实传到了 slot。
+        self.ensure_ready_calls = []
 
-    async def ensure_ready(self):
+    async def ensure_ready(self, marketplace=None, zip_code=None):
+        """签名必须跟 worker/engine.py:SessionSlot.ensure_ready 一致。
+
+        F-012 给真方法加了 (marketplace, zip_code) 两个参数；这个替身没跟上
+        就会 TypeError，而 _process_* 里对 ensure_ready 的失败处理是
+        「attempt += 1 后 continue」，于是表现成"一页都没采到"而不是报错。
+        """
+        self.ensure_ready_calls.append((marketplace, zip_code))
         return True
 
     def note_success(self):
@@ -322,6 +331,27 @@ class SearchTaskTests(unittest.TestCase):
         self.assertTrue(slot.rotations, "被封必须轮换 session 换 IP")
         self.assertEqual(len(w.submitted_failures), 1)
         self.assertEqual(w.submitted_failures[0]["error_type"], error_types.BLOCKED)
+
+    def test_ca_task_marketplace_and_zip_reach_the_slot_on_every_page(self):
+        """F-012：站点与邮编必须**逐页**传到 slot —— 包括被封轮换之后那几页。
+
+        这条同时把 FakeSlot.ensure_ready_calls 从"记了没人读"变成真有断言读它。
+        """
+        pages = [
+            FakeResponse(_page_html(["B0CA000001"], has_next=True)),
+            FakeResponse("blocked", status_code=503),
+            FakeResponse(_page_html(["B0CA000002"], has_next=False)),
+        ]
+        w, slot, session = make_worker(pages)
+        task = make_task(domain="www.amazon.ca")
+        task["marketplace"] = "amazon.ca"
+        task["zip_code"] = "M5V 3L9"
+        run(w._process_search_task(task, slot))
+
+        self.assertTrue(slot.rotations, "被封必须轮换 session 换 IP")
+        self.assertGreaterEqual(len(slot.ensure_ready_calls), 2)
+        self.assertEqual({mk for mk, _ in slot.ensure_ready_calls}, {"amazon.ca"})
+        self.assertEqual({z for _, z in slot.ensure_ready_calls}, {"M5V 3L9"})
 
     def test_404_mid_pagination_is_a_boundary_not_an_error(self):
         """翻页途中拿到 404 = 没有更多结果，已抓到的照常提交。"""

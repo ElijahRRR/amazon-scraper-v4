@@ -172,11 +172,23 @@ class ZfillRuleIsSharedTests(unittest.TestCase):
     """
 
     def test_the_three_sites_share_one_object(self):
+        """三处仍然共用同一个补零函数对象。
+
+        ⚠ F-012 之后 ``server/app.py`` 的引用路径**多了一跳**：邮编归一化
+        整体搬进了 ``common/core/marketplace.py``（它现在是站点感知的），
+        app 调 ``marketplace.normalize_postal``，由后者调
+        ``_zfill_short_numeric``。所以这里不再断言
+        ``srv._zfill_short_numeric``（那个名字已经不在 app 里了），
+        改成沿新链路断言 —— **守的东西一个字没变**：三处补零必须是同一个对象。
+        """
         from common.core.zipcode import _zfill_short_numeric
+        from common.core import marketplace as mkt
         import common.pgdb.relay as relay
         import server.app as srv
         self.assertIs(relay._zfill_short_numeric, _zfill_short_numeric)
-        self.assertIs(srv._zfill_short_numeric, _zfill_short_numeric)
+        self.assertIs(mkt._zfill_short_numeric, _zfill_short_numeric)
+        # app 那一跳：它引用的就是上面这个 marketplace 模块。
+        self.assertIs(srv._marketplace, mkt)
 
     def test_relay_and_app_agree_on_short_numeric(self):
         import common.pgdb.relay as relay

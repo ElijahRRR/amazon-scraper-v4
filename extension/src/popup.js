@@ -27,6 +27,15 @@ let pageInfo = null;
 let settings = null;
 let activeTabId = null;
 
+//: 美国站的站点键（与服务端 DEFAULT_MARKETPLACE 同值）。这不是站点白名单 ——
+//  只用来决定"要不要在界面上特意标出站点"：美国站是老行为，不加标记。
+const US_SITE = 'amazon.com';
+
+/** 非美国站时返回 `（amazon.ca）` 这样的后缀，美国站返回空串。 */
+function siteNote(mkt) {
+  return mkt && mkt !== US_SITE ? `（${mkt}）` : '';
+}
+
 //: 自己是不是被 content.js 用 iframe 装在页面右侧。
 //  两个宿主的差别只有两处：面板要显示"收起"按钮，且要持续接收广播。
 const IN_PANEL = window.top !== window.self;
@@ -95,6 +104,15 @@ function renderPage(info) {
   const [cls, label] = BADGE[info.type] || BADGE.unknown;
   $('pageBadge').className = `badge ${cls}`;
   $('pageBadge').textContent = label;
+
+  // 站点徽标（F-012）：美国站也显示 —— "没显示"和"是美国站"用户分不清，
+  // 而推送正是按这个站点建批次、取邮编的。
+  const site = info.type !== 'unknown' ? (info.marketplace || '') : '';
+  $('pageSite').textContent = site;
+  $('pageSite').title = site
+    ? `本页属于 ${site}：推送会建 ${site} 的批次，并带选项页里该站点的邮编`
+    : '';
+  $('pageSite').classList.toggle('hidden', !site);
 
   ['listPanel', 'sellerPanel', 'detailPanel'].forEach((id) => $(id).classList.add('hidden'));
 
@@ -190,16 +208,19 @@ function renderRun(run) {
         no_more_pages: '已经翻到最后一页',
         push_failed: `推送失败：${run.lastError || '未知错误'}`,
         tab_closed: '标签页被关闭',
+        // 一次翻页只属于一个站点：标签页被切到别的站点就停，不把两个站点混进一个批次
+        marketplace_changed: `标签页切到了另一个站点，已停止（${run.lastError || ''}）`,
       }[run.finishedReason] || run.finishedReason;
+      const bad = run.finishedReason === 'push_failed' || run.finishedReason === 'marketplace_changed';
       status(`上次翻页采集结束（${why}）：共 ${run.pagesDone} 页 / 入队 ${run.pushedAsins} 个新 ASIN`,
-             run.finishedReason === 'push_failed' ? 'err' : 'ok');
+             bad ? 'err' : 'ok');
     }
     return;
   }
   panel.classList.remove('hidden');
   $('runProgress').textContent = `${run.pagesDone} / ${run.maxPages} 页`;
   $('runDetail').textContent =
-    `批次 ${run.batchName}，已入队 ${run.pushedAsins} 个新 ASIN。` +
+    `批次 ${run.batchName}${siteNote(run.marketplace)}，已入队 ${run.pushedAsins} 个新 ASIN。` +
     '保持该标签页打开，翻页会自动进行。';
 }
 
@@ -227,6 +248,15 @@ function renderQueue(queue) {
     title.title = item.title || '';
     li.appendChild(title);
 
+    // 非美国站的条目标出站点：提交时按站点拆成几个批次，用户得看得出来
+    if (item.marketplace && item.marketplace !== US_SITE) {
+      const m = document.createElement('span');
+      m.className = 'q-site';
+      m.textContent = item.marketplace;
+      m.title = `这一条会推到 ${item.marketplace} 的批次`;
+      li.appendChild(m);
+    }
+
     if (item.expandSeller && item.sellerId) {
       const s = document.createElement('span');
       s.className = 'q-seller';
@@ -240,7 +270,8 @@ function renderQueue(queue) {
     del.textContent = '×';
     del.title = '从队列移除';
     del.addEventListener('click', async () => {
-      const r = await bg('REMOVE_FROM_QUEUE', { asin: item.asin });
+      // 队列的键是 (asin, 站点)：同一个 ASIN 的另一个站点那条不能跟着被删
+      const r = await bg('REMOVE_FROM_QUEUE', { asin: item.asin, marketplace: item.marketplace });
       if (r.ok) renderQueue(r.queue);
     });
     li.appendChild(del);
@@ -249,8 +280,14 @@ function renderQueue(queue) {
   }
 
   const unknown = queue.filter((q) => !q.sellerId).length;
+  // 一个批次只能属于一个站点：队列里混了几个站点，提交就会拆成几个批次
+  const sites = [...new Set(queue.map((q) => q.marketplace || US_SITE))];
+  const hasSellers = queue.some((q) => q.expandSeller && q.sellerId);
+  const batchText = sites.length > 1
+    ? `按站点拆成 ${sites.length} 个商品批次（${sites.join(' / ')}）${hasSellers ? '，外加对应的卖家批次' : ''}`
+    : `一个商品批次${hasSellers ? '，外加一个卖家批次' : ''}`;
   $('queueHint').textContent = queue.length
-    ? `提交后会创建一个商品批次${queue.some((q) => q.expandSeller && q.sellerId) ? '，外加一个卖家批次' : ''}。` +
+    ? `提交后会创建${batchText}。` +
       (unknown ? ` 其中 ${unknown} 条读不到卖家，可点"补全卖家"问服务端。` : '')
     : '在商品详情页点"加入待采队列"，攒够了一次性提交。';
 }
@@ -271,6 +308,7 @@ async function doCollectList() {
       // 由 service worker 决定继续还是收尾（跨页状态只能存在那边）。
       const started = await bg('START_RUN', {
         tabId: activeTabId, kind, maxPages, pageUrl: pageInfo.url,
+        marketplace: pageInfo.marketplace,
       });
       if (!started.ok) throw new Error(started.error);
       status('翻页采集已启动，保持该标签页打开…', 'busy');
@@ -289,13 +327,13 @@ async function doCollectList() {
 
     status(`读到 ${page.asins.length} 个 ASIN，推送中…`, 'busy');
     const pushed = await bg('COLLECT_PAGE', {
-      asins: page.asins, kind, pageUrl: pageInfo.url,
+      asins: page.asins, kind, pageUrl: pageInfo.url, marketplace: pageInfo.marketplace,
     });
     if (!pushed.ok) throw new Error(pushed.error);
 
     const b = pushed.result.asin_batch;
     status(
-      `已推送到批次 ${b.batch_name}：${page.asins.length} 个 ASIN，` +
+      `已推送到批次 ${b.batch_name}${siteNote(pushed.marketplace)}：${page.asins.length} 个 ASIN，` +
       `新建 ${b.inserted_tasks} 个采集任务` +
       (page.sponsoredSkipped ? `（跳过 ${page.sponsoredSkipped} 个广告位）` : ''),
       'ok'
@@ -313,11 +351,12 @@ async function doCollectSeller() {
     status('提交整店采集任务…', 'busy');
     const r = await bg('COLLECT_PAGE', {
       sellerIds: [pageInfo.sellerId], kind: 'seller_full', pageUrl: pageInfo.url,
+      marketplace: pageInfo.marketplace,
     });
     if (!r.ok) throw new Error(r.error);
     const sb = r.result.seller_batch;
     status(
-      `已创建卖家批次 ${sb.batch_name}：${sb.inserted_tasks} 个发现任务。` +
+      `已创建卖家批次 ${sb.batch_name}${siteNote(r.marketplace)}：${sb.inserted_tasks} 个发现任务。` +
       'Server 会翻遍该店铺并把发现的 ASIN 送进详情队列。',
       'ok'
     );
@@ -337,12 +376,15 @@ async function doAddQueue() {
       sellerName: pageInfo.sellerName || null,
       expandSeller: $('expandSeller').checked && !!pageInfo.sellerId,
       url: pageInfo.url,
+      // 条目属于哪个站点（F-012）。没有的话后台按 url 推，见 page.js queueItemMarketplace
+      marketplace: pageInfo.marketplace || null,
       addedAt: Date.now(),
     };
     const r = await bg('ADD_TO_QUEUE', { item });
     if (!r.ok) throw new Error(r.error);
     renderQueue(r.queue);
-    status(r.added ? `已加入队列：${item.asin}` : `已更新队列中的 ${item.asin}`, 'ok');
+    const note = siteNote(item.marketplace);
+    status(r.added ? `已加入队列：${item.asin}${note}` : `已更新队列中的 ${item.asin}${note}`, 'ok');
   } catch (e) {
     status(e.message, 'err');
   }
@@ -354,12 +396,24 @@ async function doSubmitQueue() {
     status('提交队列…', 'busy');
     const r = await bg('SUBMIT_QUEUE');
     if (!r.ok) throw new Error(r.error);
-    const ab = r.result.asin_batch;
-    const sb = r.result.seller_batch;
-    let msg = `已提交 ${r.submitted} 个商品到批次 ${ab.batch_name}（新建 ${ab.inserted_tasks} 个任务）`;
-    if (sb) msg += `；另建卖家批次 ${sb.batch_name}，${sb.inserted_tasks} 个整店发现任务`;
-    status(msg, 'ok');
-    renderQueue([]);
+    // 一个站点一个批次（F-012）。只有美国站时就一条，文案与以前相同。
+    const lines = r.results.map(({ marketplace, result, submitted }) => {
+      const ab = result.asin_batch;
+      const sb = result.seller_batch;
+      let msg = `已提交 ${submitted} 个商品到批次 ${ab.batch_name}${siteNote(marketplace)}` +
+                `（新建 ${ab.inserted_tasks} 个任务）`;
+      if (sb) msg += `；另建卖家批次 ${sb.batch_name}，${sb.inserted_tasks} 个整店发现任务`;
+      return msg;
+    });
+    // 部分站点没推成（比如服务端不支持 amazon.de）：别的站点照样推了，
+    // 没推成的那组还在队列里 —— 两件事都要说，而且整体按"有错"显示。
+    const failed = r.failures || [];
+    for (const f of failed) {
+      lines.push(`${f.marketplace} 的 ${f.count} 个商品没提交上，仍留在队列里：${f.error}`);
+    }
+    status(lines.join('\n'), failed.length ? 'err' : 'ok');
+    const q = await bg('GET_QUEUE');   // 推送期间又加进来的条目、没推成的组都还在，照实显示
+    renderQueue(q.queue || []);
   } catch (e) {
     status(e.message, 'err');
     $('submitQueue').disabled = false;
@@ -470,10 +524,13 @@ $('resolveSellers').addEventListener('click', async () => {
     renderQueue(r.queue);
     // 补不上就如实说"补不上"，不含糊。服务端只回库里真有的 —— 查不到
     // 就是这些 ASIN 还没被采过，不是出了错。
-    status(r.resolved
+    let msg = r.resolved
       ? `补全了 ${r.resolved} 条的卖家，现在可以在队列里勾"整店"了`
-      : '没有可补全的：这些 ASIN 服务端还没采过，所以库里也没有卖家信息',
-      r.resolved ? 'ok' : 'busy');
+      : '没有可补全的：这些 ASIN 服务端还没采过，所以库里也没有卖家信息';
+    // 按站点分开问（F-012），某个站点没问成不影响别的站点，但要照实说
+    const failed = r.failures || [];
+    for (const f of failed) msg += `\n${f.marketplace} 的 ${f.count} 条没问成：${f.error}`;
+    status(msg, failed.length ? 'err' : (r.resolved ? 'ok' : 'busy'));
   } catch (e) {
     status(e.message, 'err');
     $('resolveSellers').disabled = false;

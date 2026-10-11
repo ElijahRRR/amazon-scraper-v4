@@ -15,6 +15,11 @@
 
 const $ = (id) => document.getElementById(id);
 
+//: 选项页上有单独输入框的非美国站（F-012）。美国站沿用老键 `zipCode`，
+//  其它站点存在 `zipCodes[站点]` 里 —— 规则见 page.js 的 zipFor。
+//  这只是"哪些站点有输入框"，不是"支持哪些站点"：后者由服务端注册表说了算。
+const SITE_ZIP_INPUTS = { 'amazon.ca': 'zipCodeCa' };
+
 function bg(type, payload = {}) {
   return new Promise((resolve) => {
     chrome.runtime.sendMessage({ type, ...payload }, (resp) => {
@@ -53,6 +58,9 @@ async function load() {
   $('serverUrl').value = s.serverUrl || '';
   $('adminToken').value = s.adminToken || '';
   $('zipCode').value = s.zipCode || '';
+  for (const [mkt, id] of Object.entries(SITE_ZIP_INPUTS)) {
+    $(id).value = (s.zipCodes || {})[mkt] || '';
+  }
   $('sellerDiscoverMode').value = s.sellerDiscoverMode || 'with_detail';
   $('maxPages').value = s.maxPages ?? 5;
   $('pageDelayMs').value = s.pageDelayMs ?? 2500;
@@ -71,10 +79,18 @@ async function save() {
       return null;
     }
   }
+  // zipCodes 是整个对象一起写的（SET_SETTINGS 只做浅合并），先读出现有的再改，
+  // 免得把将来别的地方写进去的站点抹掉。
+  const current = (await bg('GET_SETTINGS')).settings || {};
+  const zipCodes = { ...(current.zipCodes || {}) };
+  for (const [mkt, id] of Object.entries(SITE_ZIP_INPUTS)) {
+    zipCodes[mkt] = $(id).value.trim();
+  }
   const patch = {
     serverUrl,
     adminToken: $('adminToken').value.trim(),
     zipCode: $('zipCode').value.trim(),
+    zipCodes,
     sellerDiscoverMode: $('sellerDiscoverMode').value,
     maxPages: parseInt($('maxPages').value, 10) || 5,
     pageDelayMs: parseInt($('pageDelayMs').value, 10) || 2500,
@@ -134,7 +150,7 @@ $('test').addEventListener('click', async () => {
   }
   const i = r.info || {};
   status(
-    `连接正常。\n服务端版本 ${i.version || '?'}，默认邮编 ${i.default_zip_code || '?'}，` +
+    `连接正常。\n服务端版本 ${i.version || '?'}，默认邮编 ${i.default_zip_code || '?'}（美国站），` +
     `在线 worker ${i.workers_online ?? '?'} 个。`,
     'ok'
   );

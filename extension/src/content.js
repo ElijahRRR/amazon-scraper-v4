@@ -399,7 +399,9 @@
   // ────────────────────────────────────────────────────────────
 
   async function resumeRunIfAny() {
-    const ready = await send('CONTENT_READY');
+    // 带上 URL：跑批归属只看 tabId，用户在这个标签页里手动切到别的站点时，
+    // 后台要靠它判断"这一页还属不属于这次翻页的站点"（F-012）。
+    const ready = await send('CONTENT_READY', { pageUrl: location.href });
     if (!ready.ok || !ready.shouldCollect) return;
 
     const settingsResp = await send('GET_SETTINGS');

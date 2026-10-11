@@ -156,6 +156,7 @@ from common.pgdb.schema import (
     EVENT_PARTITION_PREFIX,
     EVENT_PARTITION_SPAN,
     EVENT_STREAM_DDL,
+    EVENT_MARKETPLACE_CHECK_MIGRATION,
     EVENT_WORKER_OUTCOMES,
     EVENT_ZIP_VERIFY_DEFAULT,
     EVENT_ZIP_VERIFY_VALUES,
@@ -368,6 +369,12 @@ def normalize_marketplace(value: Optional[str]) -> Tuple[str, bool]:
     计划 §2.3：**绝不**透传 parser 的 ``site``（那永远是硬编码的 ``"US"``）。
     集外的值在这里就地纠正 + 计数，而不是留给列上的 CHECK —— 同上，
     一条脏行不该让整条流停摆。
+
+    ⚠ F-012 之后封闭集是 ``{'amazon.com', 'amazon.ca'}``（由
+    ``common/core/marketplace.py`` 的注册表派生）。「绝不透传 parser 的 site」
+    这条**没有松动**：现在透传的是 engine 从 task 挂上来的 ``marketplace``
+    —— 那是采集参数、只有 engine 知道，与 parser 恒为 ``"US"`` 的 ``site``
+    是不同的键、不同的值域。
     """
     v = (value or "").strip().lower()
     if v in EVENT_MARKETPLACES:
@@ -1028,6 +1035,10 @@ class EventStreamMixin:
 
         for stmt in EVENT_STREAM_DDL:
             await conn.execute(stmt)
+        # F-012：老库的 marketplace CHECK 换成当前值域（含全部已存在分区）。
+        # 必须在建分区**之前**：新分区是 LIKE 父表抄出来的，父表还挂着旧约束
+        # 的话，这一轮新建的分区又会抄一份旧的走。
+        await conn.execute(EVENT_MARKETPLACE_CHECK_MIGRATION)
         # p0 必须先于父表索引建：CREATE INDEX 在父表上会自动传播到**已存在**的分区，
         # 顺序反了 p0 就少一条 recorded_at 索引（也就不能当后续分区的 LIKE 模板）。
         for stmt in event_create_first_partition_sql():
@@ -1272,6 +1283,26 @@ class EventStreamMixin:
         if padded:
             self._bump("zip_padded")
 
+        # F-012：站点从提交体里取（engine 在 _attach_collection_meta 挂的），
+        # 不再写死 EVENT_DEFAULT_MARKETPLACE。
+        #
+        # 取 ``data["marketplace"]`` 而不是 parser 的 ``site``：前者是 engine
+        # 从 task 读来的采集参数，后者恒为硬编码的 "US"。计划 §2.3 那条
+        # 「绝不透传 parser 的 site」说的是后者，没有松动。
+        #
+        # 老 worker 不提交这个键 -> None -> normalize_marketplace 落到美国站，
+        # 且**不计入 marketplace_coerced**（下面用 `is not None` 区分"没交"
+        # 与"交了个集外值"）：把灰度期的正常情况计成异常会让那个计数器
+        # 永远在响，而它是用来发现真问题的。
+        raw_mkt = data.get("marketplace")
+        marketplace, mk_coerced = normalize_marketplace(raw_mkt)
+        if mk_coerced and raw_mkt is not None:
+            self._bump("marketplace_coerced")
+            logger.warning(
+                "提交体的 marketplace=%r 不在封闭集里，纠正成 %s"
+                "（task_id=%s asin=%s）",
+                raw_mkt, marketplace, task_id, asin)
+
         body = {
             "v": EVENT_BODY_VERSION,
             "source_id": f"{st['gen']}:{uuid.uuid4()}",
@@ -1279,7 +1310,7 @@ class EventStreamMixin:
             "instance_id": st["instance_id"],
             "outcome": norm_outcome,
             "asin": asin,
-            "marketplace": EVENT_DEFAULT_MARKETPLACE,
+            "marketplace": marketplace,
             "zip_requested": zip_norm,
             "zip_requested_source": zip_requested_source or "task",
             "task_id": _as_int_or_none(task_id),

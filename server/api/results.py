@@ -75,6 +75,7 @@ from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 # `fields=` 的列名白名单。与 iter_results 的投影白名单**同一个对象** ——
 # 两处对"什么是合法列名"必须给出同一个答案。
 from common.core.asindata import _ASIN_DATA_COLUMN_SET
+from common.core import marketplace as _marketplace
 from common.core.results_sort import CursorExpired, DEFAULT_SORT, SORT_MODES
 
 
@@ -286,13 +287,39 @@ async def api_results(batch_id: int = None,
     return result
 
 
+# F-012：同一个 ASIN 在两个站点各有一行。
+#   * 不传 `marketplace`（老调用方）-> 只要美国行，没有就 404（与加站点之前一致）。
+#     原来是「取到哪行算哪行」，同 ASIN 有加拿大行时老调用方会拿到加拿大数据；
+#     也不退而给别的站点的行：只在加拿大有的 ASIN 会以加元价格冒充美国数据。
+#   * 传了 -> 只要那个站点的行，没有就 404。
+# 非法站点 -> 422 invalid_parameter，与本文件 sort / fields 的拒收口径一致
+# （不静默回退美国站：调用方以为看的是加拿大，实际看的是美国，两边都不响）。
+# 参数说明写在 Query(description=) 里而不是改函数 docstring：后者会改掉
+# openapi 的 description（承重约束 4）；新增参数本身是一处有意的 openapi 变化。
 @router.get("/api/results/{asin}")
-async def api_result_detail(asin: str):
+async def api_result_detail(asin: str,
+                            marketplace: str = Query(
+                                None,
+                                description="采集站点（如 amazon.ca）。不传 = 美国站那一行（没有就 404）。")):
     db = _srv().db
-    data = await db.get_result_by_asin(asin)
+    mkt = None
+    if marketplace is not None and marketplace.strip():
+        try:
+            mkt = _marketplace.get(marketplace).id
+        except ValueError as e:
+            raise HTTPException(422, {
+                "error": "invalid_parameter",
+                "message": str(e),
+                "parameter": "marketplace"})
+    data = await db.get_result_by_asin(asin, marketplace=mkt)
     if not data:
-        raise HTTPException(404, f"ASIN {asin} 不存在")
-    changes = await db.get_asin_changes(asin)
+        # 不传站点时消息逐字照旧（golden result_detail_missing 钉着）
+        raise HTTPException(404, f"ASIN {asin} 不存在" if mkt is None
+                            else f"ASIN {asin} 在 {mkt} 不存在")
+    # 变动历史跟着**返回的那一行**的站点走：不限定的话，加拿大行的变动会混进
+    # 美国详情（不传站点的老调用方，响应在加拿大数据入库后就变了），反之亦然。
+    # 只有美国数据时，所有变动都归美国站，与改动前逐字相同。
+    changes = await db.get_asin_changes(asin, marketplace=data.get("marketplace"))
     return {"data": data, "changes": changes}
 
 

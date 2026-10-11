@@ -220,14 +220,16 @@ status.status == "completed"
 |---|---|---|---|---|---|
 | `file` | form file | `.xlsx` / `.csv` / `.txt` | ✅ | — | **≤ 50 MB**，超出 413（`MAX_UPLOAD_BYTES`，`server/app.py:891`） |
 | `batch_name` | form | str | ❌ | `batch_YYYYMMDD_HHMMSS`（**东八区**，`server/app.py:363`） | 不许含 `/`、`\`、`\x00`、`..`（路径穿越校验，`server/app.py:1040-1050`）；批次名会直接拼成截图目录名 |
-| `zip_code` | form | str | ❌ | 服务端运行期设置 / `config.DEFAULT_ZIP_CODE` | 5 位数字 |
+| `zip_code` | form | str | ❌ | 服务端运行期设置 / `config.DEFAULT_ZIP_CODE`；非美国站：运行期设置对该站点合法才用，否则该站点默认（加拿大站 `K1V 7P8`） | 美国站：**原样透传、不校验**（历史行为，golden 钉着）；非美国站：必须是该站点邮编形状，否则 400 |
 | `needs_screenshot` | form | bool | ❌ | `false` | — |
 | `callback_url` | form | str | ❌ | `null` | 必须 `http(s)://` + **公网**域名/IP，否则 400（SSRF 校验，`_is_safe_callback_url`）。IP 字面量不做 DNS 解析 |
 | `external_id` | form | str | ❌ | `null` | **截断到 120 字符**（`server/app.py:1167`），超出部分静默丢弃 |
 | `expand_variants` | form | bool | ❌ | `false` | 开启后批次完成判定会多轮展开变体，见 §6.3 |
+| `marketplace` | form | str | ❌ | 美国站 `amazon.com` | F-012。`amazon.ca` / `www.amazon.ca` / `https://www.amazon.ca/`，大小写不限。不在站点注册表里 → 400（不建批次，不静默回退美国站）。一个批次只属于一个站点 |
 
 **文件格式**：
-- `xlsx` / `csv`：A 列 = ASIN，B 列（可选）= 该 ASIN 单独的邮编（5 位数字）。
+- `xlsx` / `csv`：A 列 = ASIN，B 列（可选）= 该 ASIN 单独的邮编，形状随站点
+  （美国站 5 位数字；加拿大站 `K1V 7P8` 这种，大小写与空格归一化）。
   A 列不是 ASIN 时，退化为扫描整行找 ASIN（不带邮编）。
 - `txt`：每行一个 ASIN，无邮编列。
 
@@ -260,7 +262,8 @@ status.status == "completed"
 | `total_asins` | 文件里识别出的**去重后**有效 ASIN 数 |
 | `inserted` | 实际入队的任务数。**200 时恒等于 `total_asins`** —— 批次是全新的，`tasks` 表里不可能有它的行。实测 4 组（含文件内重复、跨批次重复 ASIN、500 行）全部相等 |
 | `per_asin_zip_count` | B 列指定了合法邮编的 ASIN 数 |
-| `invalid_zip_rows` | B 列非空但不是合法 5 位邮编的行数（这些行的 ASIN **照样入队**，用批次邮编） |
+| `invalid_zip_rows` | B 列非空但不符合**该批次站点**邮编形状的行数（美国站即合法 5 位邮编；这些行的 ASIN **照样入队**，用批次邮编） |
+| `marketplace` | **只在非美国站批次出现**（F-012）：该批次的站点键，如 `"amazon.ca"`。美国站批次的键集合与加这个字段之前完全相同 |
 | `callback_url` | **批次实际存下来的**值，不是请求里的值 |
 | `status_url` | 直接可打的轮询地址 |
 
@@ -603,7 +606,7 @@ while True:
 | `zip_not_effective` | 邮编设置多次重发仍未生效（页面仍显示默认配送地区） |
 | `session_not_ready` | worker 本地 session 迟迟未就绪（冷启动/轮换中超时） |
 | `discover_failed` | 卖家店铺发现阶段失败（找不到任何在售 ASIN） |
-| `server_reject` | server 端二次校验判定这条结果本身不合法，直接判失败——**不是** worker 上报的原始类型，是 server 改写的 |
+| `server_reject` | server 端二次校验判定这条结果本身不合法，直接判失败——**不是** worker 上报的原始类型，是 server 改写的。F-012：结果的站点与任务的站点不一致（典型是没升级的老 worker 领到了加拿大任务）也走这一条，`error_detail` 形如 `marketplace_mismatch task=amazon.ca payload=amazon.com`，该结果不会写进任何一行 `asin_data` |
 | `unknown` | worker 上报的 `error_type` 不在此表中，server 入口已改写成 `unknown`；原始值会被保留在 `error_detail` 开头（形如 `[unrecognized_type:xxx] 原始 detail`），不丢信息 |
 
 > `error_type` 只是短代码；`error_detail` 才是给人看的具体信息（HTTP 状态码、
@@ -761,6 +764,7 @@ xlsx/csv 再 multipart 上传。两者在采集侧共用同一个函数
 | `callback_url` | 否 | `null` | 同 §4.1，走同一套 SSRF 校验 |
 | `external_id` | 否 | `null` | 原样回传，上限 120 字符 |
 | `expand_variants` | 否 | `false` | 自动展开变体 |
+| `marketplace` | 否 | 美国站 `amazon.com` | F-012，规则同 §4.1 的 `marketplace`。不传 / `null` / `""` = 美国站；非法 → 400 且不建批次。邮编（`items[].zip_code`、顶层 `zip_code`）按该站点校验与取默认 |
 
 **邮编优先级**：`items[].zip_code` > 顶层 `zip_code` > 服务端默认。
 
@@ -774,7 +778,8 @@ xlsx/csv 再 multipart 上传。两者在采集侧共用同一个函数
 |---|---|---|
 | 400 | `"请求体不是合法 JSON"` / `"请求体必须是 JSON 对象"` | 体坏了 / 顶层不是对象 |
 | 400 | `"未找到有效 ASIN"` | 过滤后一个 ASIN 都不剩 |
-| 400 | `"非法邮编: xxx"` | **整批**邮编非法（逐 ASIN 的非法邮编不致命，见下） |
+| 400 | `"非法邮编: xxx"` | **整批**邮编非法（逐 ASIN 的非法邮编不致命，见下）。非美国站的消息额外带站点名与邮编示例，如 `非法邮编: '10001'（加拿大站需要 'K1V 7P8' 这种形状）` |
+| 400 | `"不支持的站点: ..."` | `marketplace` 不在站点注册表里 |
 | 400 | `"非法批次名"` | 批次名含 `/` `\\` `..` 等，会穿出截图目录 |
 | 400 | 对象，`error = "conflicting_zip_for_asin"` | 同一次推送里给同一 ASIN 两个**不同**邮编，见下 |
 | 409 | 对象，`error = "batch_name_conflict"` | 撞名，形状同 §4.1 |
@@ -802,10 +807,10 @@ xlsx B 列的方式一致：一列几万行里有一格脏数据就整批失败�
 * **数据**必须走 `GET /api/export/incremental`（§4.8），按
   `scrape_params.zipcode` 分辨。
 
-> ⚠ **不要用快照类端点取多邮编数据。** `asin_data.asin` 是 `UNIQUE`，全库每个
-> ASIN 只有一行，后采的覆盖先采的；而 `GET /api/results?batch_id=` 的
-> `batch_id` 只用来**挑 ASIN**，数据仍取那一行全局快照
-> （`common/pgdb/results_read.py:156`，`JOIN batch_asins ba ON ba.asin = d.asin`）。
+> ⚠ **不要用快照类端点取多邮编数据。** `asin_data` 的唯一键是 `(asin, marketplace)`
+> （F-012 之前只有 `asin`），**同一站点**内每个 ASIN 只有一行，后采的覆盖先采的；
+> 而 `GET /api/results?batch_id=` 的 `batch_id` 只用来**挑 ASIN 并钉住站点**
+> （按该批任务行的站点取那一行），数据仍是该站点的全局快照。
 > 结果：同一 ASIN 的两个邮编批次，`GET /api/results` 与
 > `GET /api/export/{batch_name}` 返回**完全相同的行**，且不报任何错。
 > 逐邮编准确的只有 §4.8 这一条路。

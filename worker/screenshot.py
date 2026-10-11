@@ -196,6 +196,14 @@ class ScreenshotWorker:
             return
 
         # 注入 <base>
+        #
+        # ⚠ F-012：这里写死 amazon.com 是**兜底**，不是主路径。
+        #   正常情况下 engine 在写盘前就按站点注入好了
+        #   （worker/engine.py:_inject_base_href），所以下面这个 if 不成立。
+        #   走到这里只有两种情况：改造前就躺在磁盘上的老文件，或者别的进程
+        #   塞进来的 HTML —— 两者都只可能是美国站的，所以兜底值是对的。
+        #   判据（前 2000 字符里有没有 "<base "）与 engine 侧**必须一致**，
+        #   否则会重复注入两个 <base>，浏览器只认第一个、而哪个在前不确定。
         lower = html[:2000].lower()
         if "<base " not in lower:
             pos = lower.find("<head")

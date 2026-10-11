@@ -42,7 +42,9 @@ from datetime import timedelta
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from typing import Optional
 
-from common import config
+# 起别名：`api_create_schedule` 有个同名 Form 参数 `marketplace`，会遮蔽
+# 模块级同名 import（同 server/api/batches.py）。
+from common.core import marketplace as _mkt
 from common.core.timeutil import now_ts
 
 
@@ -64,7 +66,7 @@ def _save_schedules(schedules: list):
     _s._save_settings()
 
 
-async def _resolve_asins(source_file: str) -> list:
+async def _resolve_asins(source_file: str, spec: "_mkt.MarketplaceSpec") -> list:
     """定时任务要采的 ASIN 清单。
 
     **空 `source_file` = 全库**，这是 `_auto_scrape_scheduler` 一直以来的语义
@@ -74,6 +76,9 @@ async def _resolve_asins(source_file: str) -> list:
     以前 `api_run_schedule_now` 是直接 `_extract_asins_from_file(source_file)`，
     对全库任务（`source_file=""`）恒返回空列表 -> 400「ASIN 文件为空或不存在」，
     也就是**全库定时任务点「立即执行」永远失败**，而它自动触发时明明是好的。
+
+    F-012 blocker 3：「全库」= **本定时任务那个站点**的全库。不按站点取的话，
+    美国定时任务会把只在加拿大站采过的 ASIN 当成美国任务去采。
     """
     _s = _srv()
     if source_file and os.path.isfile(source_file):
@@ -81,7 +86,67 @@ async def _resolve_asins(source_file: str) -> list:
     if source_file:
         # 指定了文件却找不到 —— 这是真的坏了，不能悄悄降级成全库跑一遍
         return []
-    return await _s.db.get_all_asins()
+    return await _s.db.get_all_asins(marketplace=spec.id)
+
+
+# ---------------------------------------------------------------------------
+# F-012 blocker 3：定时任务的站点与邮编
+#
+# 存储形状：sched dict 上两个**可选**键 `marketplace`（规范站点键）与
+# `zip_code`（已按该站点归一）。老定时任务（以及不传这两个字段的老客户端
+# 新建的定时任务）没有这两个键 -> 美国站 + 全局邮编原样，与改造前逐字节一致。
+# 不回填老数据：回填会让下一次 `_save_settings` 把老 JSON 改写掉。
+#
+# 下面三个函数由「立即执行」与 `server/app.py:_auto_scrape_scheduler` 共用，
+# 两条路径各写一份必然会漂 —— 漂了之后两边都不报错，只是一条路采错站点。
+# ---------------------------------------------------------------------------
+
+def _schedule_spec(sched: dict) -> "_mkt.MarketplaceSpec":
+    """定时任务存的站点 -> spec。缺键 / None / 空串 -> 美国站。
+
+    存储值**每次都重新校验**，不信任创建时的校验：`PUT /api/settings` 能把
+    整个 `auto_scrape_schedules` 列表原样覆盖，里面可以是任何东西。
+    不合法 -> HTTPException(400)（与 HTTP 入口同一个解析函数，口径不会漂）；
+    自动调度那边接住它、记日志、跳过**这一条**。
+    """
+    try:
+        return _srv()._resolve_marketplace(sched.get("marketplace"))
+    except HTTPException as e:
+        raise HTTPException(
+            400, f"定时任务 {sched.get('id')} 存的站点不可用：{e.detail}") from None
+
+
+def _schedule_zip(sched: dict, spec: "_mkt.MarketplaceSpec") -> str:
+    """定时任务这一次用哪个邮编。
+
+    自己存了邮编、且对该站点合法 -> 用它；否则 -> 该站点的默认邮编
+    （美国站 = 全局设置原样，与改造前一致；其它站点见 `_site_default_zip`）。
+    存的值不合法时不中断（同上，存储值可能被 PUT /api/settings 改坏），
+    但记一条 warning —— 静默换邮编不能连日志都没有。
+    """
+    _s = _srv()
+    own = sched.get("zip_code")
+    if own:
+        nz = _s._normalize_zip(own, spec.id)
+        if nz:
+            return nz
+        _s.logger.warning(
+            f"定时任务 {sched.get('id')} 存的邮编 {own!r} 不是{spec.label}的形状，"
+            f"本次改用该站点默认邮编")
+    return _s._site_default_zip(spec)
+
+
+def _auto_batch_prefix(sched: dict, spec: "_mkt.MarketplaceSpec") -> str:
+    """定时任务批次名的前缀（后面由 `_batch_name` 接秒级时间戳）。
+
+    美国站与改造前一字不差：`auto_{name}`。其它站点追加站点键
+    （`auto_{name}_amazon.ca`）：两个**同名同时刻**的定时任务会在同一秒拼出同一个
+    批次名，而 `create_batch` 撞名返回的是既有批次 id —— 美国与加拿大的任务就会
+    并进同一个批次，一个批次混两个站点（下游按批次取数全都假设一批一站点），
+    两站都有的 ASIN 还会被 tasks 的 UNIQUE(batch_id, asin) 静默吃掉一边。
+    """
+    p = f"auto_{sched.get('name', 'task')}"
+    return p if spec.id == _mkt.DEFAULT_MARKETPLACE else f"{p}_{spec.id}"
 
 
 @router.get("/api/schedules")
@@ -95,13 +160,20 @@ async def api_create_schedule(request: Request,
                               name: str = Form(""),
                               time_str: str = Form(..., alias="time"),
                               interval_days: int = Form(1),
-                              needs_screenshot: bool = Form(False)):
+                              needs_screenshot: bool = Form(False),
+                              marketplace: str = Form(""),
+                              zip_code: str = Form("")):
     """创建定时采集任务。
 
     `file` 可选：
       * **带文件** —— 定时采集文件里的那批 ASIN；
       * **不带文件** —— 定时采集**全库** ASIN（`source_file` 存空串，
-        调度时现取 `db.get_all_asins()`）。
+        调度时现取该站点的 `db.get_all_asins(marketplace=...)`）。
+
+    `marketplace` 可选：不传 / 空 = 美国站 `amazon.com`（与加这个字段之前一致）；
+    `amazon.ca`（也收 `www.amazon.ca` 等写法）= 加拿大站；不在站点注册表里 -> 400。
+    `zip_code` 可选：本定时任务固定用的邮编，必须是该站点的形状，否则 400；
+    不传则每次执行时取该站点的默认邮编。两个字段都只在传了时才存进定时任务。
 
     不带文件这条路以前是另一个端点 `POST /api/auto-scrape/schedules`
     （`api_legacy_add_schedule`）。那个端点与本端点写的是同一份
@@ -120,6 +192,17 @@ async def api_create_schedule(request: Request,
 
     if interval_days < 1:
         raise HTTPException(400, "间隔天数至少为 1")
+
+    # F-012 blocker 3：站点与邮编在**写文件之前**校验 —— 400 时 _SCHEDULES_DIR
+    # 里不能留下一个没有定时任务指向的孤儿文件。
+    spec = _s._resolve_marketplace(marketplace)
+    sched_zip = None
+    if zip_code and zip_code.strip():
+        # 这是个新字段，没有需要兼容的旧行为，所以美国站也照样校验
+        # （与 /api/upload 的批次邮编不同，那边美国站要保持原样透传）。
+        sched_zip = _s._normalize_zip(zip_code, spec.id)
+        if not sched_zip:
+            raise _s._site_zip_error(zip_code, spec)
 
     sched_id = f"sched_{uuid.uuid4().hex[:8]}"
 
@@ -154,6 +237,10 @@ async def api_create_schedule(request: Request,
     yesterday = (_s._cn_now() - timedelta(days=interval_days)).strftime("%Y-%m-%d")
 
     default_name = f"定时任务-{time_str}" if has_file else f"全库采集-{time_str}"
+    if spec.id != _mkt.DEFAULT_MARKETPLACE:
+        # 非美国站的默认名带站点名：同一时刻的美国与加拿大定时任务不给名字时
+        # 默认名会一模一样，列表里分不出来，批次名也只差 _auto_batch_prefix 那个后缀。
+        default_name = f"{spec.label}-{default_name}"
     sched = {
         "id": sched_id,
         "name": name or default_name,
@@ -166,6 +253,13 @@ async def api_create_schedule(request: Request,
         "last_run_date": yesterday,
         "created_at": now_ts(),
     }
+    # 只在调用方给了时才存：老客户端建出来的定时任务（以及它在响应 / GET
+    # /api/schedules / runtime_settings.json 里的样子）与改造前逐字节一致。
+    # 读的一侧把缺键当美国站 + 默认邮编，见 _schedule_spec / _schedule_zip。
+    if marketplace and marketplace.strip():
+        sched["marketplace"] = spec.id
+    if sched_zip:
+        sched["zip_code"] = sched_zip
 
     schedules = _get_schedules()
     schedules.append(sched)
@@ -243,25 +337,37 @@ async def api_run_schedule_now(sched_id: str):
     if target is None:
         raise HTTPException(404, "定时任务不存在")
 
+    # F-012 blocker 3：站点先于一切 —— 「全库」取哪个站点、批次名、邮编都看它；
+    # 存的值不合法 -> 400，且必须在 create_batch 之前（否则留下一个空批次）。
+    spec = _schedule_spec(target)
+
     source_file = target.get("source_file", "")
     # 空 source_file = 全库，与 _auto_scrape_scheduler 同一套判定（见 _resolve_asins）
-    asin_list = await _resolve_asins(source_file)
+    asin_list = await _resolve_asins(source_file, spec)
     if not asin_list:
-        raise HTTPException(
-            400,
-            "ASIN 文件为空或不存在" if source_file else "全库没有任何 ASIN 可采")
+        if source_file:
+            msg = "ASIN 文件为空或不存在"
+        elif spec.id == _mkt.DEFAULT_MARKETPLACE:
+            msg = "全库没有任何 ASIN 可采"
+        else:
+            msg = f"{spec.label}全库没有任何 ASIN 可采"
+        raise HTTPException(400, msg)
 
     now = _s._cn_now()  # last_run 用中国时间
     # P4.7：**分钟 -> 秒**（有意的行为改动，见 _batch_name 的 docstring）。
     # 这一处和 _auto_scrape_scheduler 那一处正是会互相撞名的两个。
-    batch_name = _s._batch_name(f"auto_{target.get('name', 'task')}")
-    zc = _s._runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE)
+    batch_name = _s._batch_name(_auto_batch_prefix(target, spec))
+    zc = _schedule_zip(target, spec)
     ns = target.get("needs_screenshot", False)
     batch_id = await _s.db.create_batch(batch_name, ns, is_auto=True)
-    await _s.db.create_tasks(batch_id, asin_list, zc, ns)
+    await _s.db.create_tasks(batch_id, asin_list, zc, ns, marketplace=spec.id)
 
     target["last_run_date"] = now.strftime("%Y-%m-%d")
     _save_schedules(schedules)
     _s.logger.info(f"手动执行定时任务: {batch_name}, {len(asin_list)} ASINs")
 
-    return {"ok": True, "batch_id": batch_id, "batch_name": batch_name, "asin_count": len(asin_list)}
+    resp = {"ok": True, "batch_id": batch_id, "batch_name": batch_name, "asin_count": len(asin_list)}
+    # 同 /api/upload：站点只在非美国站时回显，美国站响应逐字节不变
+    if spec.id != _mkt.DEFAULT_MARKETPLACE:
+        resp["marketplace"] = spec.id
+    return resp

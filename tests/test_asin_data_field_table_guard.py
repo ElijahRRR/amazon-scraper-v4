@@ -289,18 +289,24 @@ class AsinDataFieldTableGuard(unittest.TestCase):
         self.assertIn("title_bullets_hash", _INTERNAL_FIELDS)
         self.assertNotIn("title_bullets_hash", EXPORTABLE_FIELDS)
         # 43 -> 44：2026-08 新增 subtitle。44 -> 45：2026-09 新增 offer_condition。
-        # 两者**都是**导出面的字段（不是内部字段）——品相是给人看的业务信息，
-        # 二手件的价格不能和全新价混着用，导出里必须能分辨。
+        # 45 -> 46：F-012 新增 marketplace（采集来源站点）。
+        # 三者**都是**导出面的字段（不是内部字段）——品相是给人看的业务信息，
+        # 二手件的价格不能和全新价混着用，导出里必须能分辨；而站点更甚：
+        # 开了加拿大站之后，同一个 ASIN 在导出里会有**两行**（唯一键是
+        # (asin, marketplace)），不给出站点列的话这两行看起来就是重复数据，
+        # 价格还不一样 —— 那是最容易被当成 bug 的一种正确结果。
         # 这个数字不是形式主义：它逼着"往 AsinData 加字段"这件事必须是一次
         # 有意识的编辑 —— 加错了（比如把本该内部的哈希列加进来）这里当场红。
-        self.assertEqual(len(EXPORTABLE_FIELDS), 45)
+        self.assertEqual(len(EXPORTABLE_FIELDS), 46)
         self.assertIn("subtitle", EXPORTABLE_FIELDS)
         self.assertIn("offer_condition", EXPORTABLE_FIELDS)
+        self.assertIn("marketplace", EXPORTABLE_FIELDS)
         # 新列落在 total_price **之前**：total_price 是 EXPORTABLE_FIELDS
         # 末尾追加的合成列，不是 dataclass 字段。既有列一列没动、没有重排。
         self.assertEqual(EXPORTABLE_FIELDS[-1], "total_price")
-        self.assertEqual(EXPORTABLE_FIELDS[-2], "offer_condition")
-        self.assertEqual(EXPORTABLE_FIELDS[-3], "subtitle")
+        self.assertEqual(EXPORTABLE_FIELDS[-2], "marketplace")
+        self.assertEqual(EXPORTABLE_FIELDS[-3], "offer_condition")
+        self.assertEqual(EXPORTABLE_FIELDS[-4], "subtitle")
 
     # ---------------------------------------------------------------- 迁移面
     def test_every_alter_added_column_sits_at_the_tail_of_both_ddls(self):
