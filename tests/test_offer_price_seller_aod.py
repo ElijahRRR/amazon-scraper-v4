@@ -126,6 +126,17 @@ class AccordionOriginalPriceTests(unittest.TestCase):
             "#apex_desktop_newAccordionRow").text(), "夹具前提：全新行自己的 List 价")
         self.assertEqual(self._orig(html, "B0CRGYZ4HV"), "$44.99")
 
+    def test_selected_prime_row_reads_the_new_rows_strike_price(self):
+        """B0D12731YT：选中的是会员价行，"List Price: $34.99" 在它自己的价格块里
+        （#apex_desktop_primeSavingsUpsellAccordionRow），是相对会员价 $26.99 标的。
+        用户口径（2026-10-14）：原价跟现价同一行 —— 全新行（现价 $35.99 就读它），
+        而全新行自己没有划线价 -> N/A。原来报 $34.99，原价 < 现价。
+        全新行自己标了划线价的页（B0F3CQT8G5）见 tests/test_accordion_buy_row.py。"""
+        html = _load("dp_us_B0D12731YT_accordion_prime.html.gz")
+        self.assertIn("$34.99", HTMLParser(html).css_first(
+            "#apex_desktop_primeSavingsUpsellAccordionRow").text(), "夹具前提：会员价行有 List 价")
+        self.assertEqual(self._orig(html, "B0D12731YT"), "N/A")
+
     def test_single_offer_layout_is_untouched(self):
         """非 accordion（B0CRH6FDD7，"List Price: $49.99"）：选择器与原来逐字节相同。"""
         html = _load("dp_us_B0CRH6FDD7_single_list.html.gz")

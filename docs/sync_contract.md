@@ -722,6 +722,46 @@ completeness_ok  ⟺  (completeness & 8) != 0  AND  (completeness & 7) == 7
 
   注意这 4 个字段**不在** `review_hash` 与 `slow_hash` 的字段集里，
   所以本条不影响复审门，也不引起哈希翻转。
+- **`stock_count` / `stock_status` 的口径（2026-10 补记，行为未变）。**
+  `stock_count` 是**字符串**形式的整数，含义按来源分：
+
+  | 取值 | 含义 |
+  |---|---|
+  | `"N"`，且 `stock_status` 形如 `Only N left in stock…` | 页面明说的剩余件数 N |
+  | 其它正整数 | **单次可购买数量上限**：页面数量下拉框的最大值（多报价的 accordion 购买框上是**所有报价行**下拉框里的最大值，含二手行）；无推荐报价、走「查看全部报价」兜底（`stock_status` 为 `In Stock (via offer-listing)`）时是该报价的 `maxQty`。**不是实物库存** |
+  | `"999"` | 页面没给数量。**哨兵值，不是件数** —— 别拿去求和、比大小。多数伴随有货，但**有没有货以 `stock_status` 为准**：selectolax 读不到库存文案时 `stock_status` 是 `"N/A"`，`stock_count` 照样是 `"999"`。`Only …` 文案里没有数字、兜底报价没带 `maxQty` 时也是 `"999"` |
+  | `"0"` | 缺货 / 不可售：`stock_status` 是 out of stock / unavailable，或无推荐报价且兜底也没拿到报价（`stock_status` 为 `No Featured Offer`） |
+
+  `outcome != "ok"` 的记录（如 `not_found`）上的 `"0"` 是占位值，不表示缺货。
+  `stock_status` 多数时候是页面库存文案原样（`In Stock` / `Only 3 left in stock - order soon.`），
+  另有几个采集侧写入的固定值：`Currently unavailable`、`No Featured Offer`、
+  `In Stock (via offer-listing)`。读不到库存文案时：selectolax 主路径依次退到 JSON-LD、
+  页面脚本、加购按钮（有按钮记 `In Stock`），全都没有才是 `"N/A"`；lxml 回退引擎（只在
+  selectolax 不可用时走）退到 JSON-LD，再没有就写 `"In Stock"`；「See price in cart」页
+  两条引擎都直接写 `"In Stock"`。
+- **`delivery_date` / `delivery_time` 的口径（2026-10 补记，行为未变）。**
+  `delivery_date` 是页面显示的**最快**配送日期：把购买框里所有配送消息的日期拿来比，
+  取最早的一个。多报价的 accordion 购买框上只看普通买家下单的那一行（选中行；选中的是
+  会员价行时看全新报价行），认不出那一行时是 `"N/A"`，不回落整页。所以它**可能是需要
+  Prime 会员的日期**（`Or Prime members get FREE delivery Tomorrow`）或加急配送的日期
+  （`Or fastest delivery …`，可能另收运费），不一定是标准免费配送的日期；`buybox_shipping`
+  一般取的是第一条配送消息的运费（另有 Prime 会员免运、满额免运的判定，见
+  `worker/parser.py` 的 `_slx_parse_buybox_shipping` / `_parse_buybox_shipping`），两者不一定是同一档配送。
+  ⚠ lxml 回退引擎（只在 selectolax 不可用时走）在页面没有 `data-csa-c-delivery-time` 时
+  退到整页 class 里含 `delivery-message` 的文本，会把推荐 / 广告商品卡片上的日期
+  （如 `FREE delivery Oct 15 - 19`）也算进去：这时 `delivery_date` 不是本商品的，形状也可能是
+  缩写月份（`"Oct 15"`）；selectolax 主路径这时是 `"N/A"`。
+
+  | 字段 | 形状 |
+  |---|---|
+  | `delivery_date` | `"Today"` / `"Tomorrow"`（页面写的就是这个词时）或 `"October 16"`（月 + 日，不带星期）。页面给的是区间（`October 16 - 20`）时取第一天。读不到是 `"N/A"` |
+  | `delivery_time` | **字符串**形式的整数：从采集当天到 `delivery_date` 的天数，`Today` = `"0"`、`Tomorrow` = `"1"`，其余按日历日相减。「当天」是 Worker 解析页面时的本机日期，不是站点当地日期：`Today` / `Tomorrow` 是页面按站点当地日期写的，月 + 日的日期才按 Worker 本机日期相减，两边日期不同（时区）时会差一天。⚠ 月 + 日的日期**不晚于** Worker 本机当天时（离线重解析旧页面，或 Worker 本机日期已过了页面上的日期）会被当成明年，天数变成 `"363"`–`"365"` 左右 —— 是异常值，不是送达天数。`delivery_date` 为 `"N/A"` 时也是 `"N/A"` |
+
+  例外：无推荐报价、走「查看全部报价」兜底（`stock_status` 为 `In Stock (via offer-listing)`）
+  时，`delivery_date` 换成该报价**第一条**配送消息里的日期原文（不比快慢，可能带星期、
+  可能是区间，如 `Monday, October 26` / `October 19 - 21`；那条消息里认不出日期时是去掉
+  `FREE delivery` / `Details` 等字样后的消息文本，最多 60 个字符）；`delivery_time` 不随之重算，
+  仍是商品页上的值（这种页上恒为 `"N/A"`）。
 - **`screenshot_path` 是易失引用（硬性规则）。** 该键**可能缺席**（不是所有采集
   都出截图）。
   截图文件会被常规清理，采集侧**不做**独立持久化，且明确接受随机器丢失。

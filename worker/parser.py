@@ -799,6 +799,13 @@ class AmazonParser:
 
     def _slx_parse_current_price(self, tree) -> str:
         try:
+            # 会员价行被选中时改读全新行（见 _member_price_scopes）。其余情形前缀为空，
+            # 选择器与原来逐字节相同。选择器在外层、作用域在内层：优先级照旧，
+            # 只是当会员价行不存在。
+            scopes = self._member_price_scopes(tree)
+            if scopes == []:
+                return "N/A"
+            prefixes = [""] if scopes is None else [css + " " for css, _ in scopes]
             # 方法1: 价格容器内的 a-offscreen（限定到价格区域，避免全页匹配）
             price_selectors = [
                 '#corePrice_feature_div span.a-offscreen',
@@ -810,7 +817,7 @@ class AmazonParser:
                 '#priceToPay span.a-offscreen',
                 '#apex_offerDisplay_desktop span.a-offscreen',
             ]
-            for sel in price_selectors:
+            for sel in [pre + s for s in price_selectors for pre in prefixes]:
                 node = tree.css_first(sel)
                 if node:
                     p = node.text(strip=True)
@@ -820,8 +827,9 @@ class AmazonParser:
                     if p and re.search(r'(?:CNY|EUR|GBP|JPY|¥|€|£)\s*[\d,]+\.?\d*', p):
                         return f"[非USD]{p}"
             # 方法2: 拆分整数+小数（限定到价格容器）
-            for container in ['#corePrice_feature_div', '#corePriceDisplay_desktop_feature_div',
-                              '#corePrice_desktop', '#price', '#apex_offerDisplay_desktop']:
+            containers = ['#corePrice_feature_div', '#corePriceDisplay_desktop_feature_div',
+                          '#corePrice_desktop', '#price', '#apex_offerDisplay_desktop']
+            for container in [pre + c for c in containers for pre in prefixes]:
                 prefix = f'{container} ' if container else ''
                 whole_node = tree.css_first(f'{prefix}span.a-price-whole')
                 frac_node = tree.css_first(f'{prefix}span.a-price-fraction')
@@ -835,6 +843,13 @@ class AmazonParser:
         return "N/A"
 
     def _slx_parse_buybox_price(self, tree) -> Optional[str]:
+        # 作用域口径同 _slx_parse_current_price：会员价行被选中时只读全新行。
+        # 那时前两条（#tabular-buybox / #buybox）是行的祖先，加了前缀就不再命中，
+        # 落到后面行内的价格容器上 —— 正是要的。其余情形选择器逐字节不变。
+        scopes = self._member_price_scopes(tree)
+        if scopes == []:
+            return None
+        prefixes = [""] if scopes is None else [css + " " for css, _ in scopes]
         selectors = [
             '#tabular-buybox span.a-offscreen',
             '#buybox span.a-offscreen',
@@ -845,7 +860,7 @@ class AmazonParser:
             '#corePriceDisplay_desktop_feature_div span.a-offscreen',
             '#apex_offerDisplay_desktop span.a-offscreen',
         ]
-        for sel in selectors:
+        for sel in [pre + s for s in selectors for pre in prefixes]:
             try:
                 nodes = tree.css(sel)
                 for node in nodes:
@@ -856,7 +871,7 @@ class AmazonParser:
                 continue
         return None
 
-    # ---- 原价：accordion buybox 只读选中那一行 ----
+    # ---- accordion buybox：原价 / 配送 / 运费 / 会员价时的现价只读下单那一行 ----
     #
     # 2026-09 起的多 offer accordion 布局里，**每一行 offer 都有自己的一整套价格块**，
     # 而且 id 是重复的：
@@ -864,39 +879,64 @@ class AmazonParser:
     #   #centerCol #apex_desktop
     #       #apex_desktop_newAccordionRow   > #corePriceDisplay_desktop_feature_div
     #       #apex_desktop_usedAccordionRow  > #corePriceDisplay_desktop_feature_div
-    #           …"New condition price: $79.99"（basisPrice，带 data-a-strike）
+    #           …"New Condition Price: $79.99"（basisPrice，带 data-a-strike）
     #   #buybox #buyBoxAccordion
     #       #newAccordionRow_0.a-accordion-active > … #corePrice_feature_div
     #       #usedAccordionRow                     > … #corePrice_feature_div
     #
     # 原来全页取第一个划线价，全新行自己没有划线价时就落到二手行的
-    # "New condition price"（= 全新件的现价），导出成 原价 = 现价。
+    # "New Condition Price"（= 全新件的现价），导出成 原价 = 现价。
     # 实例（美国页）：B0CQWZR6L8 $79.99、B0GGGQBJSB $39.99、B0GKNHN7Q5 $119.99。
     # 做法与 #24 修 offer_condition 一致：只读 a-accordion-active 那一行；
     # 行 id 去掉 `_N` 后缀就是中栏价格块的 `apex_desktop_<行名>`（30 张美国真实页
-    # 里的 9 张 accordion 页全部对得上）。
+    # 里的 9 张 accordion 页全部对得上）。选中的是会员价行时改读全新行（与现价同一行，
+    # 见 _accordion_offer_scopes）。
+    #
+    # 同一个「整个购买框里取第一个 / 取最快」的毛病还在配送与运费上（每行各有一份
+    # 配送块），以及会员价行被选中时的现价上。它们共用下面同一份行判定
+    # （_accordion_selected_row；offer_condition 还留着 #24 的一份等价旧写法）；
+    # 原价 / 配送 / 运费用 _accordion_purchase_row，会员价时的现价用 _member_price_scopes。
+    #
+    # 同类字段逐个核过（抽查的 accordion 真实页）、**没改**的：库存状态取第一个
+    # #availability、卖家取第一个卖家链接、FBA 判定取第一个 "Ships from"，
+    # 选中行（或会员价行后面的全新行，两者卖家 / 发货方相同）都排在 DOM 最前，
+    # 抽查页上取到的都是对的那一行。库存数的数量下拉是**所有行**取最大值，
+    # 抽查页上都等于下单那一行的值（二手行的上限更小）。没有真实页面证据，不动。
 
     #: 行 id 要拼进 CSS / XPath，只收字母开头的字母数字下划线；别的一律当认不出。
     _ACCORDION_ROW_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
-    def _accordion_offer_scopes(self, tree) -> Optional[List[Tuple[str, str]]]:
-        """accordion buybox 上**选中那一行 offer** 的价格作用域 ``[(css, xpath), ...]``。
+    #: 会员价行（buybox 上标 "Prime Member Price"）。它不是一个独立的 offer，而是
+    #: **同一个全新 offer 给 Prime 会员的价格**：行里只有会员价、卖家与发货方，
+    #: 没有配送承诺、没有数量下拉、没有库存文案。普通买家实际下单的是紧随其后的
+    #: 全新行 newAccordionRow_N。美国站 4 张真实页全是这个形状：
+    #: B0D12731YT $26.99（普通 $35.99）/ B0DGLHZBJR $44.99（$47.99）/
+    #: B0F3CQT8G5 $79.99（$84.99）/ B0FFGFT343 $44.64（$49.99）。
+    _MEMBER_PRICE_ROW = "primeSavingsUpsellAccordionRow"
 
-        * 不是 accordion 布局 -> ``None``：调用方照旧全页取（行为与原来逐字节一致）。
-        * 是 accordion 但认不出行 -> ``[]``：调用方必须给 N/A，**不许回落全页**
-          —— 回落就是这个 bug 本身。
+    def _accordion_new_row(self, tree) -> Optional[str]:
+        """buybox 上全新报价行（newAccordionRow_N）的 id；没有或 id 不安全 -> None。"""
+        rid = self._uni_first_attr(
+            tree, '#buyBoxAccordion div[id^="newAccordionRow"]',
+            '//*[@id="buyBoxAccordion"]//div[starts-with(@id, "newAccordionRow")]/@id',
+            'id')
+        return rid if rid and self._ACCORDION_ROW_ID_RE.match(rid) else None
+
+    def _accordion_selected_row(self, tree) -> Optional[str]:
+        """accordion buybox 上**选中那一行** offer 的 id —— 这几个字段共用的行判定。
+
+        * 不是 accordion 布局 -> ``None``：调用方照旧全页取（与原来逐字节一致）。
+        * 是 accordion 但认不出行 -> ``""``：调用方必须给 N/A，**不许回落全页**
+          —— 回落就是读到别的行，正是这一串 bug 本身。
         * 没有展开行时退到全新行（newAccordionRow_N）：页面主推的就是它。
-        * 中栏**没有任何**分行价格块（``apex_desktop_*AccordionRow``）时，再加上
-          整个 ``#apex_desktop``：那是较早的 accordion 形状 —— buybox 分行、中栏
-          只有一份价格块，而那一份就是主推 offer 的。抽查的 accordion 页全是分行
-          形状，走不到这里；不加的话这种页上中栏真实的 List / Was 价会被丢成
-          N/A（改动前是取得到的）。分行块存在时不加：整块里还套着二手行，
-          加了就又是这个 bug。
 
-        已知未覆盖：只有原价按行取。现价 / 卖家仍取页面上第一个，所以假如某页
-        选中的是**二手行**（抽查页里没有一张是），原价会是二手行的
-        "New condition price"、现价却是全新行的价格，又成了 原价 = 现价 ——
-        根子在现价不分行，归那几个字段的修复去管，不在这里压掉划线价。
+        原价 / 配送 / 运费 / 会员价时的现价都从这里出发：各字段各认各的行，
+        同一条记录里就会拼进两个 offer 的数据。
+
+        offer_condition（``_parse_offer_condition``）里还有一份等价的旧写法
+        （#24，同一条 a-accordion-active 选择器，读的是行文本、没有「退到全新行」
+        也没有 id 校验），没并过来：并的话要先在真实页上对 offer_condition
+        做一遍前后对比，不在这次改动的范围里。
         """
         if not self._has_any_block(tree, ("buyBoxAccordion",)):
             return None
@@ -907,28 +947,116 @@ class AmazonParser:
             ' and contains(concat(" ", normalize-space(@class), " "),'
             ' " a-accordion-active ")]/@id', 'id')
         if not rid:
-            rid = self._uni_first_attr(
-                tree, '#buyBoxAccordion div[id^="newAccordionRow"]',
-                '//*[@id="buyBoxAccordion"]//div[starts-with(@id, "newAccordionRow")]/@id',
-                'id')
+            rid = self._accordion_new_row(tree)
         if not rid or not self._ACCORDION_ROW_ID_RE.match(rid):
+            return ""
+        return rid
+
+    def _is_member_price_row(self, rid: Optional[str]) -> bool:
+        return bool(rid) and re.sub(r"_\d+$", "", rid) == self._MEMBER_PRICE_ROW
+
+    def _accordion_purchase_row(self, tree) -> Optional[str]:
+        """普通买家实际下单的那一行：选中行；选中的是会员价行时换成全新行。
+
+        配送日期 / 天数 / 运费用它：会员价行**不带配送信息**，只读它会恒为 N/A；
+        而回落全页又会读到别的行（用户实测美国 B0CQWZR6L8：未选中的二手行有 Prime
+        「Tomorrow」，选中的全新行是更晚的日期，入库成了 Tomorrow；美国 B0FFGFT343：
+        选中会员价行，全页最快的 October 15 不是全新行的，全新行是 October 16）。
+        原价也用它（经 ``_accordion_offer_scopes``）：会员价行的 List / Typical 是
+        相对会员价标的，配上全新行的现价会出现 原价 ≤ 现价。
+        返回值语义同 ``_accordion_selected_row``；会员价行被选中却找不到全新行时
+        给 ``""``（N/A），不猜。
+        """
+        rid = self._accordion_selected_row(tree)
+        if self._is_member_price_row(rid):
+            return self._accordion_new_row(tree) or ""
+        return rid
+
+    def _member_price_scopes(self, tree) -> Optional[List[Tuple[str, str]]]:
+        """会员价行被选中时，现价 / buybox 价改读的作用域 ``[(css, xpath), ...]``。
+
+        用户口径（2026-10-11）：**现价 = 普通买家能买到的价格，会员价不保留。**
+        所以选中会员价行时只读 buybox 里的全新行本身（行内有自己的
+        ``#corePrice_feature_div``，4 张真实页上首个 a-offscreen 就是普通价）。
+
+        * 没选中会员价行（含非 accordion、认不出行）-> ``None``：调用方照旧取，
+          选择器逐字节不变。只有会员价这一种情形改行，别的 accordion 页上现价
+          本来就取到选中行（选中行在 DOM 里排第一，抽查的真实页都是）。
+        * 选中会员价行、却没有全新行 -> ``[]``：调用方给 N/A。拿会员价顶上
+          就是用户否掉的那个值。
+
+        **不加**中栏同名价格块 ``apex_desktop_newAccordionRow`` 作第二作用域：
+        那一块的「要付的价」（``.apex-pricetopay-value``）的 a-offscreen 在 4 张
+        真实页上全是**空的**，块里第一个有字的 a-offscreen 是 List Price 或单价
+        （B0F3CQT8G5 ``$99.99``、B0D12731YT ``$1.80`` / count）。选择器在外层、
+        作用域在内层，行内价格块一旦读不到，就会先落到中栏的
+        ``#corePriceDisplay_desktop_feature_div`` 上拿到这种值，两条引擎还各错各的。
+        行内读不到就给 N/A，不猜。同理也不带 ``#apex_desktop`` 整块兜底（原价那边
+        只在没选中会员价行时带）：较早的单中栏形状里那一份价格块是主推 offer 的
+        —— 会员价被选中时它就是会员价。
+        """
+        rid = self._accordion_selected_row(tree)
+        if not self._is_member_price_row(rid):
+            return None
+        new = self._accordion_new_row(tree)
+        if not new:
+            return []
+        return [(f"#{new}", f'//*[@id="{new}"]')]
+
+    def _accordion_offer_scopes(self, tree) -> Optional[List[Tuple[str, str]]]:
+        """accordion buybox 上**下单那一行 offer** 的原价作用域 ``[(css, xpath), ...]``。
+
+        行用 ``_accordion_purchase_row``：选中行；选中的是会员价行时换成全新行
+        newAccordionRow_N —— 与现价 / buybox 价同一行（``_member_price_scopes``）。
+
+        * 不是 accordion 布局 -> ``None``：调用方照旧全页取（行为与原来逐字节一致）。
+        * 是 accordion 但认不出行 -> ``[]``：调用方必须给 N/A，**不许回落全页**
+          —— 回落就是这个 bug 本身。会员价行被选中却没有全新行也是 ``[]``。
+        * 没有展开行时退到全新行（newAccordionRow_N）：页面主推的就是它。
+        * 中栏**没有任何**分行价格块（``apex_desktop_*AccordionRow``）时，再加上
+          整个 ``#apex_desktop``：那是较早的 accordion 形状 —— buybox 分行、中栏
+          只有一份价格块，而那一份就是主推 offer 的。抽查的 accordion 页全是分行
+          形状，走不到这里；不加的话这种页上中栏真实的 List / Was 价会被丢成
+          N/A（改动前是取得到的）。分行块存在时不加：整块里还套着二手行，
+          加了就又是这个 bug。选中会员价行时也不加：那时主推的是会员价，
+          中栏那一份就是会员价的（同 ``_member_price_scopes`` 不带它的理由）。
+
+        会员价行被选中时**原价读全新行**（用户口径 2026-10-14：原价跟现价同一行，
+        那一行没有划线价就是 N/A）。原来读会员价行，可那一行的 List / Typical 是
+        相对会员价标的，配上全新行的普通价就成了 原价 ≤ 现价：美国站 B0D12731YT
+        List $34.99 / 现价 $35.99、B0DGLHZBJR $47.99 = $47.99、B0FFGFT343 Typical
+        $46.99 / $49.99 —— 这三张页的全新行自己没有划线价，现在是 N/A。
+        B0F3CQT8G5 的全新行自己标了 List $99.99（中栏 apex_desktop_newAccordionRow），
+        结果不变。
+
+        已知未覆盖：现价只在「选中会员价行」时改行，卖家仍取页面上第一个。假如某页
+        选中的是**二手行**（抽查页里没有一张是），原价会是二手行的
+        "New Condition Price"、现价却是全新行的价格，又成了 原价 = 现价 ——
+        根子在现价不分行，归那几个字段的修复去管，不在这里压掉划线价。
+        """
+        rid = self._accordion_purchase_row(tree)
+        if rid is None:
+            return None
+        if not rid:
             return []
         base = re.sub(r"_\d+$", "", rid)
         # 先中栏价格块（划线价实际都在这里），再 buybox 行本身（行内也有一份
         # #corePrice_feature_div）。两处都属于同一个 offer。
         scopes = [(f"#apex_desktop_{base}", f'//*[@id="apex_desktop_{base}"]'),
                   (f"#{rid}", f'//*[@id="{rid}"]')]
-        if not self._uni_first_attr(
+        if (not self._uni_first_attr(
                 tree, '[id^="apex_desktop_"][id*="AccordionRow"]',
                 '//*[starts-with(@id, "apex_desktop_") and contains(@id, "AccordionRow")]/@id',
-                'id'):
+                'id')
+                and not self._is_member_price_row(self._accordion_selected_row(tree))):
             scopes.append(("#apex_desktop", '//*[@id="apex_desktop"]'))
         return scopes
 
     def _slx_parse_original_price(self, tree) -> str:
         try:
+            # accordion 只读下单那一行（会员价行被选中时是全新行，与现价同一行；
+            # 见 _accordion_offer_scopes）。非 accordion：前缀为空，选择器与原来逐字节相同。
             scopes = self._accordion_offer_scopes(tree)
-            # 非 accordion：前缀为空，选择器与原来逐字节相同。
             prefixes = [""] if scopes is None else [css + " " for css, _ in scopes]
             for prefix in prefixes:
                 for container in ['#corePrice_feature_div', '#corePriceDisplay_desktop_feature_div', '#price']:
@@ -941,7 +1069,16 @@ class AmazonParser:
 
     def _slx_parse_buybox_shipping(self, tree, current_price: Optional[str]) -> str:
         try:
-            delivery_nodes = tree.css('div#deliveryBlockMessage *')
+            # accordion：每一行 offer 各有一份 #deliveryBlockMessage（id 重复）。
+            # 原来把**所有行**的文案拼成一段再判，并取**全页第一个**
+            # data-csa-c-delivery-price —— 选中行不排第一（二手行被选中）时读到的是
+            # 别的行的运费。只读普通买家下单的那一行（_accordion_purchase_row）；
+            # 认不出行给 N/A。非 accordion：前缀为空，选择器与原来逐字节相同。
+            row = self._accordion_purchase_row(tree)
+            if row == "":
+                return "N/A"
+            scope = "" if row is None else f"#{row} "
+            delivery_nodes = tree.css(f'{scope}div#deliveryBlockMessage *')
             delivery_block = " ".join(n.text(strip=True) for n in delivery_nodes if n.text(strip=True))
 
             # Prime 免费配送
@@ -961,13 +1098,13 @@ class AmazonParser:
                 return "N/A"
 
             # data-csa-c-delivery-price 属性
-            dp_node = tree.css_first('span[data-csa-c-delivery-price]')
+            dp_node = tree.css_first(f'{scope}span[data-csa-c-delivery-price]')
             if dp_node:
                 dp = dp_node.attributes.get('data-csa-c-delivery-price', '')
                 if dp:
                     return dp.strip()
 
-            # 兜底
+            # 兜底（2026-10 抽查的真实页上都没有这个节点，不属于 accordion 的行结构，照旧全页取）
             shipping = self._slx_text(tree, [
                 'div#mir-layout-loaded-comparison-row-2 span',
             ])
@@ -1125,11 +1262,21 @@ class AmazonParser:
 
     def _slx_parse_delivery(self, tree) -> Tuple[str, str]:
         try:
+            # 语义不变：报**能看到的最快**配送（含 Prime 会员专享，见 _pick_delivery），
+            # 只是在 accordion 页上把「能看到」收窄到普通买家下单的那一行
+            # （_accordion_purchase_row）。原来全页取最快，未选中的行更快时就报了别的行的
+            # 日期（用户实测美国 B0CQWZR6L8：二手行 Prime「Tomorrow」入库；美国
+            # B0FFGFT343：选中会员价行，全新行 October 16，导出 October 15）。
+            # 认不出行给 N/A；非 accordion：前缀为空，选择器与原来逐字节相同。
+            row = self._accordion_purchase_row(tree)
+            if row == "":
+                return "N/A", "N/A"
+            scope = "" if row is None else f"#{row} "
             # 优先直接读 data-csa-c-delivery-time 属性（权威、格式稳定 "Weekday, Month Day"），
             # 比抓子元素文本鲁棒：有的模板日期是属性所在 span 的直接文本节点，
             # 旧的 '[attr] *' 选择器抓不到任何子元素 → 返回 N/A。
             candidates: List[str] = []
-            for n in tree.css('[data-csa-c-delivery-time]'):
+            for n in tree.css(f'{scope}[data-csa-c-delivery-time]'):
                 raw = (n.attributes.get('data-csa-c-delivery-time') or "").strip()
                 if raw:
                     candidates.append(raw)
@@ -1137,8 +1284,8 @@ class AmazonParser:
             # 回退：页面不带该属性时，用整段配送文本 + 正则（覆盖老/异形模板）。
             if not candidates:
                 texts = []
-                for n in tree.css('[data-csa-c-delivery-time] *, div.delivery-message *, '
-                                  'div#deliveryBlockMessage *'):
+                for n in tree.css(f'{scope}[data-csa-c-delivery-time] *, {scope}div.delivery-message *, '
+                                  f'{scope}div#deliveryBlockMessage *'):
                     t = n.text(strip=True)
                     if t:
                         texts.append(t)
@@ -2982,6 +3129,11 @@ class AmazonParser:
 
     def _parse_current_price(self, tree) -> str:
         try:
+            # 作用域口径同 _slx_parse_current_price（会员价行被选中时只读全新行）。
+            scopes = self._member_price_scopes(tree)
+            if scopes == []:
+                return "N/A"
+            prefixes = [""] if scopes is None else [xp for _, xp in scopes]
             # 限定到价格容器内（避免全页匹配 a-offscreen）
             price_xpaths = [
                 '//*[@id="corePrice_feature_div"]//span[@class="a-offscreen"]/text()',
@@ -2992,7 +3144,7 @@ class AmazonParser:
                 '//*[@id="priceToPay"]//span[@class="a-offscreen"]/text()',
                 '//*[@id="apex_offerDisplay_desktop"]//span[@class="a-offscreen"]/text()',
             ]
-            for xp in price_xpaths:
+            for xp in [pre + x for x in price_xpaths for pre in prefixes]:
                 vals = tree.xpath(xp)
                 for v in vals:
                     if isinstance(v, str) and "$" in v:
@@ -3000,19 +3152,25 @@ class AmazonParser:
             # fallback: 拆分整数+小数（限定到价格容器）
             for container_id in ['corePrice_feature_div', 'corePriceDisplay_desktop_feature_div',
                                  'price', 'apex_offerDisplay_desktop']:
-                whole = tree.xpath(f'//*[@id="{container_id}"]//span[@class="a-price-whole"]/text()')
-                frac = tree.xpath(f'//*[@id="{container_id}"]//span[@class="a-price-fraction"]/text()')
-                if whole and frac:
-                    w = whole[0].strip().replace('.', '')
-                    f = frac[0].strip()
-                    if w and f:
-                        return f"${w}.{f}"
+                for pre in prefixes:
+                    whole = tree.xpath(f'{pre}//*[@id="{container_id}"]//span[@class="a-price-whole"]/text()')
+                    frac = tree.xpath(f'{pre}//*[@id="{container_id}"]//span[@class="a-price-fraction"]/text()')
+                    if whole and frac:
+                        w = whole[0].strip().replace('.', '')
+                        f = frac[0].strip()
+                        if w and f:
+                            return f"${w}.{f}"
             # 全局 fallback 已移除，避免匹配推荐区域价格
         except Exception:
             pass
         return "N/A"
 
     def _parse_buybox_price(self, tree) -> Optional[str]:
+        # 作用域口径同 _slx_parse_buybox_price。
+        scopes = self._member_price_scopes(tree)
+        if scopes == []:
+            return None
+        prefixes = [""] if scopes is None else [xp for _, xp in scopes]
         xpaths = [
             '//*[@id="tabular-buybox"]//span[@class="a-offscreen"]/text()',
             '//*[@id="buybox"]//span[@class="a-offscreen"]/text()',
@@ -3023,7 +3181,7 @@ class AmazonParser:
             '//*[@id="corePriceDisplay_desktop_feature_div"]//span[@class="a-offscreen"]/text()',
             '//*[@id="apex_offerDisplay_desktop"]//span[@class="a-offscreen"]/text()',
         ]
-        for xp in xpaths:
+        for xp in [pre + x for x in xpaths for pre in prefixes]:
             try:
                 vals = tree.xpath(xp)
                 for v in vals:
@@ -3035,7 +3193,8 @@ class AmazonParser:
 
     def _parse_original_price(self, tree) -> str:
         try:
-            # 作用域口径同 _slx_parse_original_price（accordion 只读选中行）。
+            # 作用域口径同 _slx_parse_original_price（accordion 只读下单那一行，
+            # 见 _accordion_offer_scopes）。
             scopes = self._accordion_offer_scopes(tree)
             prefixes = [""] if scopes is None else [xp for _, xp in scopes]
             for prefix in prefixes:
@@ -3049,7 +3208,12 @@ class AmazonParser:
 
     def _parse_buybox_shipping(self, tree, current_price: Optional[str]) -> str:
         try:
-            delivery_texts = self._get_all_text(tree, '//div[@id="deliveryBlockMessage"]//text()')
+            # 作用域口径同 _slx_parse_buybox_shipping（accordion 只读下单那一行）。
+            row = self._accordion_purchase_row(tree)
+            if row == "":
+                return "N/A"
+            scope = "" if row is None else f'//*[@id="{row}"]'
+            delivery_texts = self._get_all_text(tree, f'{scope}//div[@id="deliveryBlockMessage"]//text()')
             delivery_block = " ".join(delivery_texts)
 
             if "prime members get free delivery" in delivery_block.lower():
@@ -3066,7 +3230,7 @@ class AmazonParser:
                             return "FREE"
                 return "N/A"
 
-            dp = tree.xpath('//span[@data-csa-c-delivery-price]/@data-csa-c-delivery-price')
+            dp = tree.xpath(f'{scope}//span[@data-csa-c-delivery-price]/@data-csa-c-delivery-price')
             if dp:
                 return dp[0].strip()
 
@@ -3140,19 +3304,23 @@ class AmazonParser:
 
     def _parse_delivery(self, tree) -> Tuple[str, str]:
         try:
-            # 与 selectolax 路径一致：优先直接读 data-csa-c-delivery-time 属性值；
-            # 无属性时回退整段配送文本。
+            # 与 selectolax 路径一致：accordion 只读下单那一行（认不出给 N/A）；
+            # 优先直接读 data-csa-c-delivery-time 属性值；无属性时回退整段配送文本。
+            row = self._accordion_purchase_row(tree)
+            if row == "":
+                return "N/A", "N/A"
+            scope = "" if row is None else f'//*[@id="{row}"]'
             candidates: List[str] = []
-            for el in tree.xpath('//*[@data-csa-c-delivery-time]'):
+            for el in tree.xpath(f'{scope}//*[@data-csa-c-delivery-time]'):
                 raw = (el.get('data-csa-c-delivery-time') or "").strip()
                 if raw:
                     candidates.append(raw)
 
             if not candidates:
                 texts = self._get_all_text(tree,
-                    '//*[@data-csa-c-delivery-time]//text() | '
-                    '//div[contains(@class,"delivery-message")]//text() | '
-                    '//div[@id="deliveryBlockMessage"]//text()')
+                    f'{scope}//*[@data-csa-c-delivery-time]//text() | '
+                    f'{scope}//div[contains(@class,"delivery-message")]//text() | '
+                    f'{scope}//div[@id="deliveryBlockMessage"]//text()')
                 if texts:
                     candidates.append(" ".join(texts))
 

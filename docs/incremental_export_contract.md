@@ -56,7 +56,7 @@ null）。这是**纯追加**，按 `docs/erpapi_contract.md` §3.2「往成功�
 | 1 | **`slow_hash` 当不透明值用** | 算法是采集侧那一套（NFKC + 空白折叠 + 哨兵值全等归一 + 列表排序 + 图片 URL 归约到 image ID + 排序键 JSON + SHA-256，取前 16 位十六进制），**与契约文字描述的「字段排序后 sha256」不是同一个算法**。⚠ **不要按收到的 `slow` 对象自己重算再比对——两边必然不等。** 它保证的是「同页面跨进程跨引擎稳定、慢变字段真变了才变」 |
 | 2 | `fast.currency` 恒 `"USD"` | 采集侧**不采币种**，这是适配器补的常量。要真实币种需先在采集侧加抓取 |
 | 3 | `fast.stock_state` 值域 = `in_stock` / `out_of_stock` / `unknown` | 三值封闭集 |
-| 3b | `fast.stock_count` / `fast.delivery_days` / `fast.shipping` 的 `null` 与 `0` **不是一回事** | `null` = 这次没采到；`0` = 采到了且确实是 0（`stock_count=0` 即缺货；`shipping=0.0` 即**确认免运费**）。适配器绝不用 0 表示「没取到」，与 `price` 同一条原则。消费侧请分开处理，别用 `or 0` 兜底 |
+| 3b | `fast.stock_count` / `fast.delivery_days` / `fast.shipping` 的 `null` 与 `0` **不是一回事** | `null` = 这次没采到；`0` = 采到了且确实是 0（`stock_count=0` 即缺货；`shipping=0.0` 即**确认免运费**）。适配器绝不用 0 表示「没取到」，与 `price` 同一条原则。消费侧请分开处理，别用 `or 0` 兜底。**`stock_count` 的口径（2026-10 补记，行为未变）**：页面写着「Only N left in stock」时就是 N；否则是**单次可购买数量上限**（数量下拉框的最大值，多报价的 accordion 购买框上是所有报价行下拉框里的最大值；无推荐报价、走「查看全部报价」兜底时是该报价的 `maxQty`），**不是实物库存**；`999` = 页面没给数量（哨兵值，不是件数，别拿去求和或比大小）—— 多数伴随有货，但有没有货以 `fast.stock_state` 为准，读不到库存文案时 `stock_state=unknown`、`stock_count` 照样是 `999`；`0` = 缺货 / 不可售（库存文案是 out of stock / unavailable，或无推荐报价且兜底也没拿到报价）。`outcome != "ok"` 的记录（如 `not_found`）上的 `0` 是占位值，不表示缺货。**`delivery_days` 的口径（2026-10 补记，行为未变）**：即 `raw.delivery_time`，从采集当天（Worker 解析页面时的本机日期）到 `raw.delivery_date` 的天数；`delivery_date` 是页面（多报价的 accordion 购买框上是普通买家下单的那一行）显示的**最快**配送日期，可能是需要 Prime 会员或加急配送（`Or fastest delivery`，可能另收运费）的日期，不一定是标准免费配送的日期，与 `fast.shipping` 也不一定是同一档配送；`0` = 当天送达（Today）、`1` = 明天；`null` = 没采到。`Today` / `Tomorrow` 是页面按站点当地日期写的，月 + 日的日期按 Worker 本机日期相减，两边日期不同（时区）时会差一天；月 + 日的日期不晚于 Worker 本机当天时（如离线重解析旧页面）会被当成明年，得出 `363`–`365` 左右 —— 是异常值，不是送达天数。lxml 回退引擎在页面没有 `data-csa-c-delivery-time` 时可能取到推荐 / 广告卡片上的日期（见 `docs/sync_contract.md` §6.6）。无推荐报价、走「查看全部报价」兜底的记录上 `raw.delivery_date` 是兜底报价第一条配送消息的日期原文（可能是区间；认不出日期时是清理后的消息文本，最多 60 个字符），天数不随之重算（恒为 `null`） |
 | 3c | `slow.variant.theme` 是**维度名**不是取值 | 形如 `"color_name/size_name"`，顺序即 Amazon `dimensions` 数组的顺序（不排序）。采集侧拿不到维度名、只产出裸值（`"Red; L"`）时，`theme` 为 `null` —— 那种情况我们确实不知道维度叫什么，编一个出来会被下游当真维度去分组。⚠ **2026-08-14 之前 `theme` 对所有真实记录恒为 `null`**（适配器自带的解析按 `:` 切，而采集侧用的是 `=`）；修复后开始有值，消费侧若此前把 `theme` 当恒空处理需要复查 |
 | 4 | `slow.weight` / `slow.dimensions` = `{package, item}` 对象 | 采集侧两个值分别是包装与本体，不合并 |
 | 5 | 游标掉出保留窗口 → **409 `cursor_below_retention`** | 消费侧须实现「告警 + 全量对账 + 停」 |
@@ -184,7 +184,14 @@ X-Export-Token: <token>
     "currency": "USD",
     "stock_state": "in_stock",                   // in_stock|out_of_stock|unknown
     "stock_count": 37,                           // int 或 null；**0 是合法值**
+                                                 // 「Only N left」时是 N，否则是单次可购买
+                                                 // 数量上限（不是实物库存）；999 = 页面没给
+                                                 // 数量（有没有货看 stock_state）；0 = 缺货。
+                                                 // 见不变量 3b
     "delivery_days": 8,                          // int 或 null；预计送达天数
+                                                 // 采集当天到页面**最快**配送日期的天数
+                                                 // （可能是 Prime 会员 / 加急配送的日期）；
+                                                 // 0 = 当天送达。见不变量 3b
     "shipping": 5.99,                            // float 或 null；FREE -> 0.0
     "shipping_raw": "$5.99",                     // 原始串 "FREE"/"$5.99"，没采到 -> null
     "buybox_price": null,
