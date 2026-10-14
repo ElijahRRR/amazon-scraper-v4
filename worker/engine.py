@@ -1207,6 +1207,67 @@ class Worker:
             return False
         return True
 
+    #: 卖家两列「没取到」的取值。
+    _SELLER_NA = (None, "", "N/A")
+
+    #: AOD 报价里读不到数量上限时写的库存数。与两个解析引擎
+    #: `_slx_parse_stock_count` / `_parse_stock_count` 的兜底同一个值：
+    #: 那里的 999 表示「有货、页面没给数量」，这里是同一种状态，用同一种写法，
+    #: 下游只需认一种。
+    _OFFER_LISTING_UNKNOWN_QTY = "999"
+
+    @classmethod
+    def _merge_offer_listing(cls, r: Dict, offer: Dict) -> None:
+        """把 aodAjaxMain 第一个报价（parser.parse_offer_listing）并进无推荐报价页的结果。
+
+        只在 ``offer['price']`` 有值时调用。价格 / FBA / 运费 / 配送照旧覆盖。
+
+        库存数量（原来写死 ``"5"``）：
+          * 这个常量在仓库最早的快照里就有（根提交 c0a0f5d，2026-05 整库导入），
+            没有单独的提交说明；原注释说"AOD 获取到价格但无库存信息"，**不成立**
+            —— 每个 offer 的加购按钮都带 maxQty（2026-10 抽查的 12 份真实 AOD 响应、
+            32 个带价格的 offer 全有）。导出里走这条路的行于是全是 5。
+          * 但**替换 "0" 这个动作本身得留着**：商品页解析在无推荐报价时写的是
+            "0"，它旁边的 stock_status 却是 "In Stock (via offer-listing)"。
+            留着 "0"，增量导出的 ``fast.stock_count=0`` 按契约不变量 3b 就是
+            「确认缺货」，asin_changes 还会记一次 stock_qty down。
+          * 判定没被牵连：服务端 ``_is_parse_failure`` 要价格也是 N/A 才算失败
+            （这里价格必有值）；engine 的「核心字段全部缺失」判定在本分支之前、
+            且排除了 No Featured Offer；``_looks_degraded_delivery`` 不看库存数。
+          * 读得到 maxQty 就用它，读不到用 ``_OFFER_LISTING_UNKNOWN_QTY``。
+            ⚠ 这个 999 导出去是**非空**的 ``fast.stock_count=999``（``_int``
+            照收），严格按契约 3b「没采到就是 null」它该是 N/A。有意不在这里
+            单独改成 N/A：商品页正常路径「有货、没给数量」导出的也是 999，
+            只改这一条路，同一种状态就有了两种导出形状。要改得在解析器的
+            999 兜底处一起改。实际很少走到：真实 offer 全带 maxQty。
+
+        只在 selectolax 路径生效：lxml 引擎的商品页解析不产出
+        "No Featured Offer"（走不到调用这里的分支），``parse_offer_listing``
+        也只有 selectolax 实现。这是本修复之前就有的状况，不是本修复引入的。
+
+        卖家：商品页上本来就没有卖家（无推荐报价），两列都是 N/A 时才把
+        **同一个报价**的名字和 ID 成对填进去。只要商品页已经给了其中一个，
+        就整对不动 —— 一边来自商品页、一边来自 AOD 的组合可能是两个不同的卖家。
+        """
+        r["current_price"] = offer['price']
+        r["buybox_price"] = offer['price']
+        if offer.get('is_fba'):
+            r["is_fba"] = offer['is_fba']
+        if offer.get('shipping'):
+            r["buybox_shipping"] = offer['shipping']
+        if offer.get('delivery'):
+            r["delivery_date"] = offer['delivery']
+        r["stock_status"] = "In Stock (via offer-listing)"
+        if str(r.get("stock_count", "0")) in ("0", "", "N/A"):
+            qty = offer.get('max_qty')
+            r["stock_count"] = str(qty) if qty else cls._OFFER_LISTING_UNKNOWN_QTY
+        if (r.get("seller_id") in cls._SELLER_NA
+                and r.get("seller_name") in cls._SELLER_NA):
+            if offer.get('seller'):
+                r["seller_name"] = offer['seller']
+            if offer.get('seller_id'):
+                r["seller_id"] = offer['seller_id']
+
     async def _dump_degraded_html(self, asin: str, zip_code: str, html: str):
         """把疑似降级页的原始 HTML 存到独立目录（截图流程不碰它），供离线排查。
 
@@ -1620,19 +1681,8 @@ class Worker:
                         if olp_resp and hasattr(olp_resp, 'text') and olp_resp.text:
                             offer = self.parser.parse_offer_listing(olp_resp.text)
                             if offer and offer.get('price'):
-                                result_data["current_price"] = offer['price']
-                                result_data["buybox_price"] = offer['price']
-                                if offer.get('is_fba'):
-                                    result_data["is_fba"] = offer['is_fba']
-                                if offer.get('shipping'):
-                                    result_data["buybox_shipping"] = offer['shipping']
-                                if offer.get('delivery'):
-                                    result_data["delivery_date"] = offer['delivery']
-                                result_data["stock_status"] = "In Stock (via offer-listing)"
-                                # "See All Buying Options" 类页面：AOD 获取到价格但无库存信息，默认库存 5
-                                if str(result_data.get("stock_count", "0")) in ("0", "", "N/A"):
-                                    result_data["stock_count"] = "5"
-                                logger.info(f"NFO {asin} OLP: {offer['price']} ship={offer.get('shipping','?')} {offer.get('is_fba','?')} del={offer.get('delivery','?')}")
+                                self._merge_offer_listing(result_data, offer)
+                                logger.info(f"NFO {asin} OLP: {offer['price']} ship={offer.get('shipping','?')} {offer.get('is_fba','?')} del={offer.get('delivery','?')} seller={offer.get('seller_id','?')} qty={offer.get('max_qty','?')}")
                     except Exception as e:
                         logger.debug(f"NFO {asin} offer-listing 请求失败: {e}")
 
