@@ -745,17 +745,23 @@ completeness_ok  ⟺  (completeness & 8) != 0  AND  (completeness & 7) == 7
   会员价行时看全新报价行），认不出那一行时是 `"N/A"`，不回落整页。所以它**可能是需要
   Prime 会员的日期**（`Or Prime members get FREE delivery Tomorrow`）或加急配送的日期
   （`Or fastest delivery …`，可能另收运费），不一定是标准免费配送的日期；`buybox_shipping`
-  取的是第一条配送消息的运费，两者不一定是同一档配送。
+  一般取的是第一条配送消息的运费（另有 Prime 会员免运、满额免运的判定，见
+  `worker/parser.py` 的 `_slx_parse_buybox_shipping` / `_parse_buybox_shipping`），两者不一定是同一档配送。
+  ⚠ lxml 回退引擎（只在 selectolax 不可用时走）在页面没有 `data-csa-c-delivery-time` 时
+  退到整页 class 里含 `delivery-message` 的文本，会把推荐 / 广告商品卡片上的日期
+  （如 `FREE delivery Oct 15 - 19`）也算进去：这时 `delivery_date` 不是本商品的，形状也可能是
+  缩写月份（`"Oct 15"`）；selectolax 主路径这时是 `"N/A"`。
 
   | 字段 | 形状 |
   |---|---|
-  | `delivery_date` | `"Today"` / `"Tomorrow"`（页面写的就是这个词时）或 `"October 16"`（月 + 日，不带星期；页面用缩写时是 `"Oct 15"`）。页面给的是区间（`October 16 - 20`）时取第一天。读不到是 `"N/A"` |
-  | `delivery_time` | **字符串**形式的整数：从采集当天到 `delivery_date` 的天数，`Today` = `"0"`、`Tomorrow` = `"1"`，其余按日历日相减。「当天」是 Worker 解析页面时的本机日期，不是站点当地日期。`delivery_date` 为 `"N/A"` 时也是 `"N/A"` |
+  | `delivery_date` | `"Today"` / `"Tomorrow"`（页面写的就是这个词时）或 `"October 16"`（月 + 日，不带星期）。页面给的是区间（`October 16 - 20`）时取第一天。读不到是 `"N/A"` |
+  | `delivery_time` | **字符串**形式的整数：从采集当天到 `delivery_date` 的天数，`Today` = `"0"`、`Tomorrow` = `"1"`，其余按日历日相减。「当天」是 Worker 解析页面时的本机日期，不是站点当地日期：`Today` / `Tomorrow` 是页面按站点当地日期写的，月 + 日的日期才按 Worker 本机日期相减，两边日期不同（时区）时会差一天。⚠ 月 + 日的日期**不晚于** Worker 本机当天时（离线重解析旧页面，或 Worker 本机日期已过了页面上的日期）会被当成明年，天数变成 `"363"`–`"365"` 左右 —— 是异常值，不是送达天数。`delivery_date` 为 `"N/A"` 时也是 `"N/A"` |
 
   例外：无推荐报价、走「查看全部报价」兜底（`stock_status` 为 `In Stock (via offer-listing)`）
   时，`delivery_date` 换成该报价**第一条**配送消息里的日期原文（不比快慢，可能带星期、
-  可能是区间，如 `Monday, October 26` / `October 19 - 21`）；`delivery_time` 不随之重算，
-  仍是商品页上的值（这种页上一般是 `"N/A"`）。
+  可能是区间，如 `Monday, October 26` / `October 19 - 21`；那条消息里认不出日期时是去掉
+  `FREE delivery` / `Details` 等字样后的消息文本，最多 60 个字符）；`delivery_time` 不随之重算，
+  仍是商品页上的值（这种页上恒为 `"N/A"`）。
 - **`screenshot_path` 是易失引用（硬性规则）。** 该键**可能缺席**（不是所有采集
   都出截图）。
   截图文件会被常规清理，采集侧**不做**独立持久化，且明确接受随机器丢失。
