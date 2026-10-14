@@ -401,6 +401,44 @@ status.status == "completed"
 > 是**二手价**，与全新价不可混用。实例：`B0G449YVHD` 采到 `$20.70`，卖家是
 > Amazon Resale（亚马逊自营退货/开箱件）。
 
+> **`stock_count` 的口径**（2026-10 补记，行为未变）。字符串形式的整数：
+>
+> | 取值 | 含义 |
+> |---|---|
+> | `stock_status` 形如 `Only N left in stock…` 时的 `"N"` | 页面明说的剩余件数 |
+> | 其它正整数 | **单次可购买数量上限**（数量下拉框的最大值，多报价的 accordion 购买框上是所有报价行下拉框里的最大值；无推荐报价、走「查看全部报价」兜底时是该报价的 `maxQty`）。**不是实物库存** |
+> | `"999"` | 页面没给数量。**哨兵值，不是件数** —— 别拿去求和、比大小。多数伴随有货，但有没有货以 `stock_status` 为准：读不到库存文案时 `stock_status` 可能是 `"N/A"`（增量导出里 `stock_state=unknown`），`stock_count` 照样是 `"999"` |
+> | `"0"` | 缺货 / 不可售（`stock_status` 是 out of stock / unavailable，或 `No Featured Offer` 且兜底也没拿到报价）。⚠ `stock_status` 为 `"N/A"` 时的 `"0"` 是没采到商品页（如 404）写的占位值，**不表示缺货** |
+>
+> 增量导出里同一个值是 `fast.stock_count`（int 或 null，见 §4.8 与
+> `docs/incremental_export_contract.md` 不变量 3b）。
+
+> **`delivery_date` / `delivery_time` 的口径**（2026-10 补记，行为未变）。
+>
+> | 字段 | 含义 |
+> |---|---|
+> | `delivery_date` | 页面显示的**最快**配送日期：购买框里所有配送消息的日期取最早的一个（多报价的 accordion 购买框上只看普通买家下单的那一行：选中行；选中的是会员价行时看全新报价行）。所以它**可能是需要 Prime 会员的日期**（`Or Prime members get FREE delivery Tomorrow`）或加急配送（`Or fastest delivery …`，可能另收运费）的日期，不一定是标准免费配送的日期，与 `buybox_shipping`（一般是第一条配送消息的运费）也不一定是同一档。形状：`"Today"` / `"Tomorrow"` / `"October 16"`（月 + 日，不带星期；区间取第一天）；读不到是 `"N/A"` |
+> | `delivery_time` | 字符串形式的整数：从采集当天（Worker 解析页面时的本机日期）到 `delivery_date` 的天数，`Today` = `"0"`、`Tomorrow` = `"1"`。`delivery_date` 为 `"N/A"` 时也是 `"N/A"` |
+>
+> 注意两处偏差：
+>
+> - `Today` / `Tomorrow` 是页面按站点当地日期写的，月 + 日的日期才按 Worker 本机日期相减，
+>   两边日期不同（时区）时会差一天。月 + 日的日期**不晚于** Worker 本机当天时（离线重解析
+>   旧页面，或 Worker 本机日期已过了页面上的日期）会被当成明年的同一天，`delivery_time`
+>   约为 365 减去那个日期已过去的天数：当天是 `"365"`，过了 1–2 天是 `"364"`–`"363"`，
+>   离线重解析几周前的旧页面会得出三百多（如 `"330"`）。接近一年的值是异常值，不是送达
+>   天数；别拿「≥ 363」这类固定阈值去认。
+> - lxml 回退引擎（只在 selectolax 不可用时走）在页面没有 `data-csa-c-delivery-time` 时
+>   退到整页 class 里含 `delivery-message` 的文本，会把推荐 / 广告商品卡片上的日期（如
+>   `FREE delivery Oct 15 - 19`）也算进去：这时 `delivery_date` 不是本商品的，形状也可能是
+>   缩写月份（`"Oct 15"`）；selectolax 主路径这时是 `"N/A"`。
+>
+> 例外：无推荐报价、走「查看全部报价」兜底（`stock_status` 为 `In Stock (via offer-listing)`）时，
+> `delivery_date` 是该报价第一条配送消息里的日期原文（不比快慢，可能带星期或是区间，如
+> `October 19 - 21`；认不出日期时是清理后的消息文本，最多 60 个字符），`delivery_time`
+> 不随之重算（恒为 `"N/A"`）。增量导出里
+> `delivery_time` 是 `fast.delivery_days`（int 或 null，见 §4.8），`delivery_date` 只在 `raw` 里。
+
 | `has_more` | 还有下一页。**翻页的唯一终止条件** |
 | `next_cursor` | 下一页的游标（`direction=next` 用）= 本页最后一行的 `id` |
 | `prev_cursor` | 上一页的游标（`direction=prev` 用）= 本页第一行的 `id` |
@@ -706,6 +744,18 @@ while True:
 ⚠ `null` ≠ `0`（`docs/incremental_export_contract.md` 不变量 3b，与
 `stock_count` 同一条）。**别写 `shipping or 0`** —— 把没采到当 0 的话落地价
 照样算得出来、看着也正常，只是**偏小**，没有任何一侧会报错。
+
+`fast.stock_count` 的口径（2026-10 补记，行为未变）：「Only N left in stock」时是 N，
+否则是**单次可购买数量上限**（不是实物库存）；`999` = 页面没给数量（哨兵值，不是件数；
+有没有货看 `fast.stock_state`，它可能是 `unknown`）；
+`0` = 缺货 / 不可售。逐项说明见 §4.3 结果字段里的 `stock_count`。`outcome != "ok"`
+的记录（如 `not_found`）上的 `0` 是占位值，不表示缺货。
+
+`fast.delivery_days` 的口径（2026-10 补记，行为未变）：从采集当天到页面显示的**最快**
+配送日期（`raw.delivery_date`）的天数 —— 那个日期可能是需要 Prime 会员或加急配送的，
+不一定是标准免费配送的，与 `fast.shipping` 也不一定是同一档；`0` = 当天送达；`null` =
+没采到；接近一年的值（约 365 减去那个日期已过去的天数：过了 1–2 天是 `363`–`364`，
+离线重解析几周前的旧页面会是三百多）是把已过去的日期当成明年算出的异常值，不是送达天数。逐项说明见 §4.3 结果字段里的 `delivery_date` / `delivery_time`。
 
 > 顺带说明一处**已知的不一致**，以免被当成本端点的行为：UI 导出（Excel/CSV）
 > 的虚拟列「总价」把 `N/A` 也当 0 加进总价（`server/api/export.py:_prepare_row`），
