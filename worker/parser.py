@@ -180,6 +180,25 @@ _DELIVERY_DATE_RE = re.compile(
 )
 
 
+#: 详情表里「这一行说的是**包装 / 运输件**，不是商品本身」的标志词（压紧形，
+#: 见 AmazonParser._compact_key）。
+#:
+#: ``shipping`` 是后补的：Amazon 包装重量那一行有两种写法，``Package Weight``
+#: 与 ``Shipping Weight``。原判据只认 ``package``，后者两个条件都不满足，
+#: 整条 elif 链走空 —— 不是存错位置，是一个字都没存。
+_PACKAGE_WORDS = ("package", "shipping")
+
+#: BSR 值里的 "(See Top 100 in XXX)" —— 那是个导航链接的文字，不是排名。
+_BSR_NAV_RE = re.compile(r"\(\s*See Top 100[^)]*\)", re.I)
+
+
+def _strip_bsr_nav(v: str) -> str:
+    """去掉 BSR 值里的 "(See Top 100 in ...)" 并折叠空白。"""
+    if not v:
+        return v
+    return re.sub(r"\s+", " ", _BSR_NAV_RE.sub(" ", str(v))).strip()
+
+
 def _slx_iter_descendants(node):
     """前序遍历 ``node`` 的**全部后代元素**（不含 node 自身），严格限制在子树内。
 
@@ -288,6 +307,28 @@ class AmazonParser:
         "full refund", "eligible for return",
     ]
 
+    #: 空白折叠：首尾空白去掉，中间连续空白（空格 / 制表符 / 不换行空格 / 换行）
+    #: 合并成一个普通空格。Python 的 ``\s`` 对 str 是 Unicode 语义，含 ``\xa0``。
+    _WS_RUN_RE = re.compile(r"\s+")
+
+    @classmethod
+    def _squash_ws(cls, s: str) -> str:
+        """详情值 / 品牌的空白归一，口径经用户确认：首尾去掉、中间合并成一个空格。
+
+        为什么需要：详情表的值要用 ``text(separator=" ", strip=True)`` 取（否则 BSR
+        这种多元素的值会粘成 "#36 inChristmas Trees"），而 selectolax 的这个调用是
+        **逐文本节点** strip 再用分隔符拼接，td 里 span 两侧的缩进文本节点被 strip
+        成空串之后**仍然各贡献一个分隔符**：
+
+            <td class="a-span9">    <span class="po-break-word">SHareconn</span>   </td>
+            -> ' SHareconn '
+
+        按品牌 join / 去重时 ' SHareconn ' 与 'SHareconn' 是两个品牌。两个词分在两个
+        标签里时同理会拼出双空格；``&nbsp;`` 会原样留成 ``\\xa0``（lxml 的
+        normalize-space 也不认它）。
+        """
+        return cls._WS_RUN_RE.sub(" ", s).strip()
+
     def parse_product(self, html_text: str, asin: str, zip_code: str = "10001") -> Dict[str, Any]:
         """
         解析 Amazon 商品页面
@@ -317,7 +358,18 @@ class AmazonParser:
         # 为什么不在 slowhash.normalize_text 里洗：那里只作用于**哈希输入**，
         # 不改存下来的值 —— 洗了哈希稳了，下游拿到的仍然是脏数据，而下游按
         # 品牌 join 正是最需要它干净的地方。详见 common/core/textclean.py。
-        return _clean_deep(parsed)
+        cleaned = _clean_deep(parsed)
+
+        # 品牌的空白归一在出口再做一次（根因处的修复在两个 _*parse_all_details）。
+        # 为什么出口还要一道：品牌有四五个来源（JSON-LD / 详情表 / byline /
+        # logo alt / meta keywords），只修详情表那一路保证不了"最终值"的形状。
+        # 必须排在 _clean_deep **之后**：U+200E 删掉之后才露出来的空白
+        # （"‎ SHareconn" -> " SHareconn"）在之前做就漏了。
+        # 归一后成空串说明原值只有空白 —— 回到"没取到"的哨兵，与其它来源一致。
+        brand = cleaned.get("brand")
+        if isinstance(brand, str):
+            cleaned["brand"] = self._squash_ws(brand) or "N/A"
+        return cleaned
 
     # ==================== selectolax 解析路径 ====================
 
@@ -1032,7 +1084,23 @@ class AmazonParser:
                 if any(spam in b.lower() for spam in self.BULLET_BLACKLIST):
                     continue
                 clean.append(b)
-            return "\n".join(clean)
+
+            # **按顺序去重**。
+            #
+            # 实测（真实页面）六条卖点被采成了十二条 —— 正好两倍。根因是
+            # `#feature-bullets` 里同时存在两份 `ul`：可见的那份，加上 "See more"
+            # 展开区（`div.a-expander-content`）里的同一份副本。上面那条选择器是
+            # `... ul > li span.a-list-item`，两份都命中。
+            #
+            # ⚠ 为什么是去重而不是"只取第一个 ul"：哪一份在前不由我们决定，
+            #   而且有的页面真的把卖点拆在两个 ul 里（不是副本）。
+            #   按顺序去重对"真两份"无损，对"副本"正好修掉。
+            #
+            # ⚠ 这是一次行为改动：`bullet_points` 在 `_HASH_FIELDS` 与
+            #   `_TITLE_BULLETS_FIELDS` 里，所以任何一个"卖点本来就重复"的 ASIN，
+            #   下一次采集会产出一条**一次性的假变动**（title_bullets 变了）。
+            #   那是修复的代价，不是新缺陷 —— 重复的卖点从来就不是对的数据。
+            return "\n".join(dict.fromkeys(clean))
         except Exception:
             return ""
 
@@ -1165,16 +1233,26 @@ class AmazonParser:
                 try:
                     th = row.css_first('th')
                     tds = row.css('td')
+                    # ⚠ 值一律用 separator=" " 取。
+                    #   无分隔符拼接会把相邻元素的文字粘在一起，美国页实测（30 张里
+                    #   带 BSR 的全部）产出 "#24,048 in Home & Kitchen (See Top 100 in
+                    #   Home & Kitchen)#36 inChristmas Trees" —— 两条排名之间、in 和
+                    #   类目名之间都没有空格；只是 BSR 这种多元素的值才看得出来。
+                    #   "(See Top 100 ...)" 导航链接由 _map_detail 统一去掉。
+                    # ⚠ 而带分隔符取又有反作用：td 里 span 两侧的缩进文本节点 strip 成
+                    #   空串后仍各贡献一个分隔符 -> ' SHareconn '。所以取完一律过
+                    #   _squash_ws（首尾去掉、中间连续空白并成一个空格），三个分支都要：
+                    #   这里的值喂给 _map_detail，型号 / 制造商 / 重量 / 尺寸 / 品牌全从这走。
                     if th and tds:
                         k = th.text(strip=True)
-                        v = tds[0].text(strip=True)
+                        v = self._squash_ws(tds[0].text(separator=" ", strip=True))
                         if k and v:
                             self._map_detail(d, k, v)
                     elif len(tds) >= 2:
                         # 两列 td 布局：第一列通常是加粗的 key（a-text-bold）
                         key_span = tds[0].css_first('span.a-text-bold') or tds[0]
                         k = key_span.text(strip=True)
-                        v = tds[1].text(strip=True)
+                        v = self._squash_ws(tds[1].text(separator=" ", strip=True))
                         if k and v and len(k) <= 50:
                             self._map_detail(d, k, v)
                 except Exception:
@@ -1190,7 +1268,21 @@ class AmazonParser:
                         spans = parent.css('span')
                         for i, sp in enumerate(spans):
                             if sp.text(strip=True) == k and i + 1 < len(spans):
-                                v = spans[i + 1].text(strip=True)
+                                v = self._squash_ws(spans[i + 1].text(separator=" ", strip=True))
+                                # **大类排名**（detailBullets 版详情表）。
+                                #
+                                # 这种布局里 BSR 那一行是嵌套的，一个商品有多个排名：
+                                #   Best Sellers Rank: #105 in Clothing... (See Top 100...)
+                                #                      #3 in Men's T-Shirts
+                                # 取 spans[i+1] 只拿到**最里层**那个 span，
+                                # 也就是最后一个子类目排名 —— 大类那条（#105）
+                                # 整个丢了；无分隔符拼接还会产出 "#3 inMen's T-Shirts"。
+                                # （th/td 版详情表那条路径的同类问题见上面的 separator 说明。）
+                                #
+                                # 所以 BSR 特殊处理：取整个 li 的文本、去掉键名、
+                                # 去掉 "(See Top 100 in ...)" 这类导航链接。
+                                if 'bestsellersrank' in self._compact_key(k):
+                                    v = self._clean_bsr(parent, k) or v
                                 if k and v:
                                     self._map_detail(d, k.replace(':', ''), v)
                                 break
@@ -1613,6 +1705,11 @@ class AmazonParser:
 
         # 2) 备选：任意带 seller= 的链接（href 路径变化时兜底）
         for css, xp in (
+            # 2026 版 buybox 的卖家挂件（2026-10 抽查的 30 张美国真实页 22 张有它，
+            # 其中 15 张没有老的 #merchant-info）。它排在页面级兜底 `a[href*="seller="]`
+            # **之前**是有意的：那条兜底是全页扫描，会把"其它卖家"区块里的链接也捞进来。
+            ('#merchantInfoFeature_feature_div a[href*="seller="]',
+             '//*[@id="merchantInfoFeature_feature_div"]//a[contains(@href, "seller=")]'),
             ('#merchant-info a[href*="seller="]',
              '//*[@id="merchant-info"]//a[contains(@href, "seller=")]'),
             ('#tabular-buybox a[href*="seller="]',
@@ -1634,13 +1731,32 @@ class AmazonParser:
         #    selectolax 默认的 `text(strip=True)`（无分隔符拼接），真实页面上的
         #    `Sold by <a>Amazon.com</a>` 会被拼成 `Sold byAmazon.com`，这个子串
         #    判断因此**从来没命中过**，自营页恒返回 ("N/A","N/A")。
-        for css, xp in (
-            ('#merchant-info', '//*[@id="merchant-info"]'),
-            ('#tabular-buybox', '//*[@id="tabular-buybox"]'),
-            ('#offerDisplay_feature_div', '//*[@id="offerDisplay_feature_div"]'),
+        #
+        # ⚠ 两类容器用**两套判据**，不是疏忽：
+        #
+        #   merchant_only=True  —— 2026 版 buybox 把卖家和发货方拆成了两个
+        #       feature div，#merchantInfoFeature_feature_div **只装卖家**。
+        #       老的三个容器在这种页面上一个都不存在，只认它们的话自营页恒落 N/A；
+        #       而这个容器里的文案不一定是 "Sold by" / "Ships from"（真实页面上
+        #       见过 "Shipper / Seller Amazon..."），枚举文案是枚举不完的 ——
+        #       它只装卖家，域名出现就等于"卖家是 Amazon 自营"。
+        #
+        #   merchant_only=False —— 老容器把卖家和发货方混在一起，那里不能改成
+        #       光看域名（blob 里常有 "Amazon.com" 的页脚 / 退货链接文字），照旧用
+        #       原来那两条带主语的短语判，判据一个字没动。
+        for css, xp, merchant_only in (
+            ('#merchantInfoFeature_feature_div',
+             '//*[@id="merchantInfoFeature_feature_div"]', True),
+            ('#merchant-info', '//*[@id="merchant-info"]', False),
+            ('#tabular-buybox', '//*[@id="tabular-buybox"]', False),
+            ('#offerDisplay_feature_div', '//*[@id="offerDisplay_feature_div"]', False),
         ):
             blob = (self._uni_first_text(tree, css, xp) or "").lower()
             if not blob:
+                continue
+            if merchant_only:
+                if "amazon.com" in blob:
+                    return "AMAZON", "Amazon.com"
                 continue
             if "sold by amazon.com" in blob or "ships from amazon.com" in blob:
                 return "AMAZON", "Amazon.com"
@@ -2392,38 +2508,110 @@ class AmazonParser:
         """详情表键名归一化：小写 → 非 [a-z0-9&/ ] 字符换空格 → 折叠空白。"""
         return re.sub(r"\s+", " ", cls._KEY_JUNK_RE.sub(" ", (k or "").lower())).strip()
 
+    @staticmethod
+    def _compact_key(k: str) -> str:
+        """键名压成**只剩小写字母数字** —— 空格、冒号、双向控制符全部去掉。
+
+        Amazon 同一个字段的标签**空格数不固定**。真实页面上见过：
+
+            <tr><td>ManufacturerPartNumber</td><td>DN01UDBBY2</td></tr>
+
+        —— 一个空格都没有。而映射的判据是 ``'part number' in k_lower``，
+        于是 ``part_number`` 恒空。同一张页面上 ``Model Number`` 是带空格的，
+        所以 model_number 取到了 —— 一半对一半错，最难发现的那种。
+
+        压紧之后 ``manufacturerpartnumber`` 与 ``manufacturer part number``
+        归到同一个串，两种写法都认。
+        """
+        return re.sub(r"[^a-z0-9]", "", (k or "").lower())
+
+    @staticmethod
+    def _clean_bsr(node, key: str) -> str:
+        """从 BSR 那一行里取出**完整**排名串（含大类 + 各子类）。
+
+        取整个容器的文本（带空格分隔），砍掉键名前缀，再去掉
+        ``(See Top 100 in ...)`` 这种导航链接文字 —— 那是个链接，不是排名。
+
+        产出形如：``#105 in Clothing, Shoes & Accessories #3 in Men's T-Shirts``
+        """
+        try:
+            txt = node.text(separator=" ", strip=True)
+        except Exception:
+            return ""
+        if not txt:
+            return ""
+        # 砍键名前缀（键名自带的冒号可能在也可能不在）
+        idx = txt.find(key)
+        if idx >= 0:
+            txt = txt[idx + len(key):]
+        txt = txt.lstrip(": ‎‏")
+        # 导航链接的清理交给 _map_detail 统一做（两条来源共用一处）。
+        return re.sub(r"\s+", " ", txt).strip()
+
     def _map_detail(self, d: Dict, k: str, v: str):
         """字段名映射"""
         k_lower = k.lower()
-        if 'model number' in k_lower:
+        # 压紧形：对"标签里有没有空格"免疫，见 _compact_key 的说明。
+        k_flat = self._compact_key(k)
+        if 'modelnumber' in k_flat:
             d['model_number'] = v
-        elif 'part number' in k_lower:
-            # 'part number' 排在 'manufacturer' 之前，所以 "Manufacturer Part Number"
+        elif 'partnumber' in k_flat:
+            # 'partnumber' 排在 'manufacturer' 之前，所以 "Manufacturer Part Number"
             # 一直落位正确 —— 当年活着的只有年龄段那一条。
             d['part_number'] = v
-        elif 'country of origin' in k_lower:
+        elif 'countryoforigin' in k_flat:
             d['country_of_origin'] = v
-        elif 'best sellers rank' in k_lower:
-            d['best_sellers_rank'] = v
+        elif 'bestsellersrank' in k_flat:
+            # "( See Top 100 in XXX )" 是个**导航链接**，不是排名 —— 去掉。
+            # 放在这里（而不是各提取路径里）是因为 BSR 有两条来源：
+            # detailBullets 的 li 和 tech-spec 的 tr，两边都会撞上它。
+            d['best_sellers_rank'] = _strip_bsr_nav(v)
         elif self._norm_detail_key(k) in self._MANUFACTURER_KEYS:
             d['manufacturer'] = v
         elif k_lower.strip() == 'brand':
             d['brand'] = v
-        elif 'date first available' in k_lower:
+        elif 'datefirstavailable' in k_flat:
             d['date_first_available'] = v
         elif 'upc' in k_lower:
             d['upc'] = v
-        elif 'weight' in k_lower and 'item' in k_lower:
+        elif 'weight' in k_flat and 'item' in k_flat:
             d['item_weight'] = v
-        elif 'weight' in k_lower and 'package' in k_lower:
-            _, w = self._split_dim_weight(v)
-            d['package_weight'] = w if w != "N/A" else "N/A"
-        elif 'dimensions' in k_lower:
-            dim, _ = self._split_dim_weight(v)
-            if 'package' in k_lower:
+        elif 'weight' in k_flat and any(w in k_flat for w in _PACKAGE_WORDS):
+            # 认 ``Package Weight`` 与 ``Shipping Weight`` 两种写法，见 _PACKAGE_WORDS。
+            #
+            # ⚠ 这里**不能**直接用 _split_dim_weight 的第二半。
+            #   那个函数按分号拆 "尺寸; 重量"，而**重量行本身没有分号**：
+            #       Package Weight: 200 g        -> parts = ["200 g"]
+            #   于是 parts[1] 不存在、返回 "N/A"，真值 "200 g" 被扔在 parts[0]。
+            #   原实现写的是 ``_, w = split(v)`` 然后
+            #   ``w if w != "N/A" else "N/A"``（后半句恒等于 w，是句废话），
+            #   结果是**凡是不带分号的重量行一律存成 N/A**。
+            # ⚠ package_weight 在 _HASH_FIELDS 里，受影响的 ASIN 下次采集会产出
+            #   一条一次性的假变动 —— 是补一个一直空着的字段，不是改坏一个已有值。
+            dim_part, w = self._split_dim_weight(v)
+            d['package_weight'] = w if w != "N/A" else dim_part
+        elif 'dimensions' in k_flat:
+            # **重量那一半不再丢掉**。
+            #
+            # Amazon 常把尺寸和重量塞进同一行，用分号分隔：
+            #     Product Dimensions: 25 x 20 x 5 cm; 200 g
+            # 原实现是 ``dim, _ = self._split_dim_weight(v)`` —— 下划线那半
+            # （``200 g``）被直接扔了。于是页面上明明写着重量，
+            # item_weight / package_weight 却是 N/A。
+            #
+            # 只在对应的重量字段**还空着**时才回填：页面上如果另有一行
+            # 专门的 "Item Weight"，那一行是更权威的来源，不能被这里覆盖。
+            # （字典迭代顺序 = 页面上的行序，所以"先到先得"不可靠，
+            #   必须显式判空。）
+            dim, w = self._split_dim_weight(v)
+            if any(w_ in k_flat for w_ in _PACKAGE_WORDS):
                 d['package_dimensions'] = dim
+                if w != "N/A" and not d.get('package_weight'):
+                    d['package_weight'] = w
             else:
                 d['item_dimensions'] = dim
+                if w != "N/A" and not d.get('item_weight'):
+                    d['item_weight'] = w
 
     def _split_dim_weight(self, s: str) -> Tuple[str, str]:
         """拆分尺寸和重量（用分号分隔）"""
@@ -2682,9 +2870,17 @@ class AmazonParser:
 
     def _parse_bullet_points(self, tree) -> str:
         try:
-            bullets = self._get_all_text(tree, '//div[@id="feature-bullets"]//ul/li//span[@class="a-list-item"]//text()')
+            # ⚠ ``contains(@class, ...)`` 而不是 ``@class="..."``。
+            #
+            # ``@class="a-list-item"`` 要求 class 属性**完全等于**这一个词，
+            # 而真实页面上是 ``class="a-list-item a-size-base a-color-base"``
+            # —— 于是这条 xpath 在**任何现代 Amazon 页面上都匹配 0 个节点**，
+            # lxml 引擎的 bullet_points 恒为空。selectolax 的 ``span.a-list-item``
+            # 是"包含"语义，两条引擎因此给出完全不同的答案；构造的测试 HTML 里
+            # class 恰好只有一个词，所以一直没被发现。
+            bullets = self._get_all_text(tree, '//div[@id="feature-bullets"]//ul/li//span[contains(@class,"a-list-item")]//text()')
             if not bullets:
-                bullets = self._get_all_text(tree, '//div[contains(@class,"a-expander-content")]//ul/li//span[@class="a-list-item"]//text()')
+                bullets = self._get_all_text(tree, '//div[contains(@class,"a-expander-content")]//ul/li//span[contains(@class,"a-list-item")]//text()')
 
             clean = []
             for b in bullets:
@@ -2694,7 +2890,9 @@ class AmazonParser:
                 if any(spam in txt.lower() for spam in self.BULLET_BLACKLIST):
                     continue
                 clean.append(txt)
-            return "\n".join(clean)
+            # 按顺序去重，语义与 selectolax 孪生实现 _slx_parse_bullet_points
+            # 完全一致（论证写在那边）。
+            return "\n".join(dict.fromkeys(clean))
         except Exception:
             return ""
 
@@ -2789,21 +2987,24 @@ class AmazonParser:
         """全页扫描：提取 Product Information 表格内容"""
         d = {}
         try:
+            # XPath 1.0 的 normalize-space 只认空格 / 制表 / 回车 / 换行，``&nbsp;``
+            # 解码出来的 \xa0 原样留下 —— 所以值再过一次 _squash_ws，与 selectolax
+            # 路径同一个口径（理由见 _squash_ws）。
             for row in tree.xpath('//th/../..//tr'):
                 try:
                     k_nodes = row.xpath('normalize-space(./th)')
-                    v_nodes = row.xpath('normalize-space(./td)')
+                    v_nodes = self._squash_ws(str(row.xpath('normalize-space(./td)')))
                     if k_nodes and v_nodes:
-                        self._map_detail(d, str(k_nodes), str(v_nodes))
+                        self._map_detail(d, str(k_nodes), v_nodes)
                 except Exception:
                     continue
 
             for s in tree.xpath('//li/span/span[contains(@class, "a-text-bold")]'):
                 try:
                     k = s.xpath('normalize-space(./text())')
-                    v = s.xpath('normalize-space(./following-sibling::span)')
+                    v = self._squash_ws(str(s.xpath('normalize-space(./following-sibling::span)')))
                     if k and v:
-                        self._map_detail(d, str(k).replace(':', ''), str(v))
+                        self._map_detail(d, str(k).replace(':', ''), v)
                 except Exception:
                     continue
 
