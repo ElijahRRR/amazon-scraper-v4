@@ -9,6 +9,9 @@
 |---|---|---|
 | `us_B0CG19X7RN` | `tests/test_parser_detail_fixes.py` | `#feature-bullets`（卖点去重 / lxml 多 class 选择器的变体底稿）、`#merchantInfoFeature_feature_div`（2026 版卖家挂件，第三方卖家 callalily；自营变体的底稿）、th/td 详情表的 6 行（Item Dimensions D x W x H、Item Weight、Item Dimensions、Manufacturer、Manufacturer Part Number、Best Sellers Rank —— BSR 的两条排名粘连、重量 / 尺寸 / 料号标签变体的底稿） |
 | `us_B0F3JB4D4Z` | `tests/test_parser_detail_fixes.py` | 只截了 byline 和 Product Overview，**有意不带**后面的 th/td 详情表：整页上详情表那一行会覆盖 po- 行，只留 po- 行才测得到制造商 / 品牌在双 td 分支里的取值（带分隔符取值后 span 两侧的缩进会变成首尾空格） |
+| `us_B0D4QGVN6F`、`us_B0D45YH9FL` | `tests/test_parser_text_fields.py` | `#feature-bullets`：卖家以自己的小标题开头、正文提到 "customer service" 的那条卖点（Smiley Customer Service: … / Instruction and High Quality Wood: … customer service team …），基线按黑名单子串整条删掉 |
+| `us_B0D86XBV23` | `tests/test_parser_text_fields.py` | `#a-popover-cReturnsPolicyPopover`：黑名单当初要挡的退货弹层模板句（"Go to your orders and start the return" 等三句） |
+| `us_B0FFGFT343` | `tests/test_parser_text_fields.py` | `colorImages` 所在的整段 `<script>` 原样保留（解析器先按"含 colorImages 的第一个 script"选段，这一步也要测到）：第 9 张 PT08 `"hiRes":null`，基线整张丢掉 |
 
 ## 截取规则
 
@@ -24,8 +27,11 @@
 3. 外面套一层 `<!DOCTYPE html><html><head><meta charset="utf-8"></head><body>`，
    第二行注释写明出处。
 
-`us_B0CG19X7RN` 上被测的字段（BSR、料号、商品重量 / 尺寸、制造商、卖家、卖点）
-两条解析引擎与整页逐字段相同（已核对）。
+3a. `colorImages` 所在的整段 `<script>` 原样保留（不是只留数组）。
+
+被测字段在片段上与整页逐字段相同（两条解析引擎都核对过）：`us_B0CG19X7RN` 的
+BSR / 料号 / 商品重量与尺寸 / 制造商 / 卖家 / 卖点，`us_B0D4QGVN6F` / `us_B0D45YH9FL`
+的卖点，`us_B0FFGFT343` 的图片列表。
 
 ## 构造变体
 

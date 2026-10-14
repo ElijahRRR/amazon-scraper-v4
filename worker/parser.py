@@ -301,11 +301,56 @@ class AmazonParser:
     """Amazon 商品页面解析器"""
 
     # 垃圾文字黑名单（五点描述过滤用）
+    #
+    # 它要挡的是 Amazon 自己的**退货弹层模板句**。真实页面上（2026-10 抽查的
+    # 30 张美国页里 19 张有）buybox 的 "FREE Returns" 弹层里是这么一段：
+    #
+    #   <div id="creturnsHowToReturnExpanderContent" class="a-expander-content ...">
+    #     <ol> <li><span class="a-list-item">Go to your orders and start the return</span></li>
+    #          <li><span class="a-list-item">Select your preferred free shipping option</span></li>
+    #          <li><span class="a-list-item">Drop off and leave!</span></li> </ol>
+    #
+    # —— 与五点同一个 ``a-expander-content`` / ``a-list-item`` 结构，五点的兜底
+    # 选择器一旦落到它上面就会把这三句当成卖点。表里前五个词正好是这三句的切片。
+    # 判据见 `_is_bullet_boilerplate`：**不再**是"含这个词就整条删"。
     BULLET_BLACKLIST = [
         "go to your orders", "start the return", "free shipping option", "drop off",
         "leave!", "return this item", "money back", "customer service",
         "full refund", "eligible for return",
     ]
+
+    #: 卖家自己的小标题：``Smiley Customer Service: ...`` / ``Customer Support - ...`` /
+    #: ``【Customer Service】...``。开头允许最多 3 个装饰符（✅ ★ 之类）。
+    #: 小标题本身不含句末标点 —— 这样 "Drop off and leave!" 里的 ``!`` 不会被当成分隔。
+    #: 长度上限 80：抽查页面里最长的小标题 68 字符
+    #: （"Built-in LED Lights, Perfect Integration of Bookshelf and Floor Lamp："）。
+    _SELLER_HEADING_RE = re.compile(
+        r"^\W{0,3}(?:[【\[][^】\]]{1,80}[】\]]"
+        r"|[^:：.!?]{1,80}?(?:\s*[:：]|\s+[-–—|]\s))"
+    )
+
+    @classmethod
+    def _is_bullet_boilerplate(cls, text: str) -> bool:
+        """这一条是不是 Amazon 混进来的模板句（而不是卖家写的卖点）。
+
+        原判据是"小写后含黑名单任一子串就整条删"，于是卖家的真实卖点被误删
+        （2026-10 抽查的 30 张美国页上两例，各被删掉一条）：
+
+            Smiley Customer Service: Welcome to Contact Us; ...                          B0D4QGVN6F
+            Instruction and High Quality Wood: ... our customer service team is always ...  B0D45YH9FL
+
+        区别在形状上：模板句是**一句完整的说明**，没有小标题；卖家卖点几乎都以
+        自己的「小标题：」/「小标题 - 」/【小标题】开头。
+        所以收窄成：**含黑名单词，且不以卖家小标题开头**，才算模板句。
+
+        ⚠ 只收窄、不放宽：黑名单词一个没删。不带小标题、又恰好提到
+          "customer service" 的卖家卖点仍会被删 —— 那是原判据就有的误伤，
+          这里没有证据去动它（真实页面上没见到这种卖点）。
+        """
+        low = text.lower()
+        if not any(term in low for term in cls.BULLET_BLACKLIST):
+            return False
+        return cls._SELLER_HEADING_RE.match(text) is None
 
     #: 空白折叠：首尾空白去掉，中间连续空白（空格 / 制表符 / 不换行空格 / 换行）
     #: 合并成一个普通空格。Python 的 ``\s`` 对 str 是 Unicode 语义，含 ``\xa0``。
@@ -1081,7 +1126,8 @@ class AmazonParser:
             for b in bullets:
                 if len(b) < 2:
                     continue
-                if any(spam in b.lower() for spam in self.BULLET_BLACKLIST):
+                # 模板句判据见 _is_bullet_boilerplate（不再是"含词即删"）
+                if self._is_bullet_boilerplate(b):
                     continue
                 clean.append(b)
 
@@ -1162,6 +1208,80 @@ class AmazonParser:
         except Exception:
             return ""
 
+    # ---- 图片：colorImages.initial 逐张取 ----
+    #
+    # 原实现是对整段 script 跑两条正则：
+    #     re.findall('"hiRes":"(https://...)"') or re.findall('"large":"(https://...)"')
+    # 第一条**跳过** ``"hiRes":null`` 的条目，而第二条只在"一张 hiRes 都没有"时
+    # 才整体启用 —— 不是逐张兜底。于是只要某一张原图不够大（Amazon 不给 hiRes），
+    # 它就从列表里**整张消失**。2026-10 抽查实测（美国页）：
+    #   B0FFGFT343  第 9 张 PT08 51E41zXXguL 只有 714x401，hiRes=null，整张丢了。
+    # 若 hiRes=null 的恰好是 MAIN 图，丢的就是**主图**，"首图即主图"的约定也破了。
+    #
+    # 页面上 initial 的写法（30 张美国抽查页全部是这一种）：
+    #     'colorImages': { 'initial': A.$.parseJSON('[{"hiRes":null,"large":"...","main":{...},...}, ...]')
+    # 条目键：hiRes / large / main{url: [w, h]} / thumb / variant / altText ...
+    _COLOR_IMAGES_INITIAL_RE = re.compile(
+        r"""['"]colorImages['"]\s*:\s*\{\s*['"]initial['"]\s*:\s*(A\.\$\.parseJSON\(\s*')?(?=\[)""")
+
+    @classmethod
+    def _color_images_initial(cls, script: str) -> Optional[List[str]]:
+        """colorImages.initial 逐张取 ``hiRes or large or main 里面积最大的那张``，保序。
+
+        结构认不出来（没有 initial、JSON 解析失败、一张都取不到）返回 ``None``，
+        由调用方退回原来的整段正则 —— 认不出来的页面行为与改动前一致。
+        """
+        m = cls._COLOR_IMAGES_INITIAL_RE.search(script)
+        if not m:
+            return None
+        start = m.end()
+        try:
+            if m.group(1):
+                # parseJSON('...')：数组在一个**单引号 JS 字符串**里。字符串到第一个
+                # 未转义的 ' 结束（altText 里的撇号会写成 \'，所以不能按括号配平：
+                # JSON 串里的 \" 在 JS 源码里是 \\"，配平扫描会把它当成串结束）。
+                i, n = start, len(script)
+                while i < n and script[i] != "'":
+                    i += 2 if script[i] == "\\" else 1
+                # 只还原 JS 层的两种转义：\' -> '、\\ -> \。其余（\" \n \/ \uXXXX）
+                # 本来就是合法的 JSON 转义，原样交给 json.loads。
+                payload = re.sub(r"\\(['\\])", r"\1", script[start:i])
+                entries = json.loads(payload)
+            else:
+                # 直接是数组字面量：JSONDecoder.raw_decode 只吃一个值，后面的 JS 不管。
+                entries, _ = json.JSONDecoder().raw_decode(script, start)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(entries, list):
+            return None
+
+        def _area(wh) -> int:
+            try:
+                return int(wh[0]) * int(wh[1])
+            except (TypeError, ValueError, IndexError, KeyError):
+                return 0
+
+        urls = []
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            url = None
+            for key in ("hiRes", "large"):
+                v = e.get(key)
+                if isinstance(v, str) and v.startswith("https://"):
+                    url = v
+                    break
+            if url is None and isinstance(e.get("main"), dict):
+                cands = [(u, _area(wh)) for u, wh in e["main"].items()
+                         if isinstance(u, str) and u.startswith("https://")]
+                if cands:
+                    # max 取第一个最大值：同面积时保留页面上的先后
+                    url = max(cands, key=lambda c: c[1])[0]
+            if url:
+                urls.append(url)
+        # 保序去重：首图（页面第 1 张，即 MAIN）始终排在第 1 位
+        return list(dict.fromkeys(urls)) or None
+
     def _slx_parse_images(self, tree, html_text: str) -> str:
         try:
             img_urls = []
@@ -1169,6 +1289,10 @@ class AmazonParser:
             for script in scripts:
                 text = script.text(strip=True)
                 if text and "colorImages" in text:
+                    per_image = self._color_images_initial(text)
+                    if per_image is not None:
+                        img_urls = per_image
+                        break
                     urls = re.findall(r'"hiRes":"(https://[^"]+)"', text) or \
                            re.findall(r'"large":"(https://[^"]+)"', text)
                     # 保序去重：dict.fromkeys 在 Python 3.7+ 保留插入顺序，
@@ -2887,7 +3011,8 @@ class AmazonParser:
                 txt = b.strip()
                 if not txt or len(txt) < 2:
                     continue
-                if any(spam in txt.lower() for spam in self.BULLET_BLACKLIST):
+                # 与 selectolax 孪生实现同一个判据（_is_bullet_boilerplate）
+                if self._is_bullet_boilerplate(txt):
                     continue
                 clean.append(txt)
             # 按顺序去重，语义与 selectolax 孪生实现 _slx_parse_bullet_points
@@ -2949,10 +3074,13 @@ class AmazonParser:
             scripts = self._get_all_text(tree, '//script[contains(text(), "colorImages")]/text()')
             if scripts:
                 script = scripts[0]
-                urls = re.findall(r'"hiRes":"(https://[^"]+)"', script) or \
-                       re.findall(r'"large":"(https://[^"]+)"', script)
-                # 保序去重：保持亚马逊页面图片原始顺序，主图排在第 1 位
-                img_urls = list(dict.fromkeys(urls))
+                # 逐张取，理由见 _color_images_initial；认不出结构才退回整段正则
+                img_urls = self._color_images_initial(script)
+                if img_urls is None:
+                    urls = re.findall(r'"hiRes":"(https://[^"]+)"', script) or \
+                           re.findall(r'"large":"(https://[^"]+)"', script)
+                    # 保序去重：保持亚马逊页面图片原始顺序，主图排在第 1 位
+                    img_urls = list(dict.fromkeys(urls))
             else:
                 img_urls = tree.xpath('//div[@id="imgTagWrapperId"]/img/@src')
             return "\n".join(img_urls)
