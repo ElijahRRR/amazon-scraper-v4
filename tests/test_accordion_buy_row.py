@@ -14,8 +14,10 @@
 夹具是 tests/fixtures/offer/ 下的美国站真实页面片段（来源见那里的 README）。凡是在片段上
 改过东西的用例，docstring 里写明改了什么、为什么。
 
-日期断言只用与运行日期无关的形状：行里只剩一个日期时选中的就是它，"Tomorrow" 恒为
-1 天。天数不写死，用同一行的候选日期经 ``_pick_delivery`` 现算。
+时钟钉在夹具的抓取时刻（``_CAPTURED_AT``，见 ``_Base.setUp``）。配送天数是「解析当天
+到页面日期」的差，不钉的话同一个用例换个日子跑就换答案：B0D12731YT 的全新行有
+Friday, October 16 和 Prime「Tomorrow」，到了 10 月 15 日两者都是 1 天，``_pick_delivery``
+取先出现的那个，就成了 October 16（每年 10 月 15 日都会红）。钉住之后天数可以直接写死。
 
 两条引擎都要跑：生产上 lxml 分支只在 selectolax 缺失时才走，靠模块级开关永远测不到它。
 """
@@ -26,6 +28,8 @@ import os
 import re
 import sys
 import unittest
+from datetime import datetime, timezone
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -37,8 +41,37 @@ from selectolax.parser import HTMLParser  # noqa: E402
 import worker.parser as parser_mod  # noqa: E402
 from worker.parser import AmazonParser  # noqa: E402
 
+try:
+    import dateparser  # noqa: E402
+except ImportError:  # 没装时解析器换算不了「月 + 日」，断言这类日期的用例照样会红，不在这里掩盖
+    dateparser = None
+
 _FIX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "offer")
 _ZIP = "10001"
+
+#: 夹具页面的抓取时刻（2026-10-11 05:49 UTC，见 tests/fixtures/offer/README.md）。
+#: 解析器里「今天」有两个来源，都要钉：``worker.parser`` 模块里的 ``datetime.now()``
+#: （``_pick_delivery`` 拿它当减数），以及 dateparser 自己的「现在」（``PREFER_DATES_FROM
+#: future`` 靠它判断一个月 + 日是今年还是明年，经 ``RELATIVE_BASE`` 设定）。
+_CAPTURED_AT = datetime(2026, 10, 11, 5, 49)
+
+
+class _CapturedDatetime(datetime):
+    """``worker.parser.datetime`` 的替身：``now()`` 恒为 ``_CAPTURED_AT``（按 UTC 解释）。"""
+
+    @classmethod
+    def now(cls, tz=None):
+        if tz is None:
+            return _CAPTURED_AT
+        return _CAPTURED_AT.replace(tzinfo=timezone.utc).astimezone(tz)
+
+
+def _dateparser_at_capture(real_parse):
+    def parse(date_string, *args, settings=None, **kwargs):
+        settings = dict(settings or {})
+        settings.setdefault("RELATIVE_BASE", _CAPTURED_AT)
+        return real_parse(date_string, *args, settings=settings, **kwargs)
+    return parse
 
 
 def _load(name: str) -> str:
@@ -127,6 +160,15 @@ class _Base(unittest.TestCase):
 
     def setUp(self):
         self.p = AmazonParser()
+        # 时钟钉在抓取时刻（为什么见模块说明）。整个文件都钉：价格类用例不看日期，
+        # 钉了也无妨，省得哪天有人往这里加配送断言时忘了。
+        patches = [mock.patch.object(parser_mod, "datetime", _CapturedDatetime)]
+        if dateparser is not None:
+            patches.append(mock.patch.object(
+                dateparser, "parse", _dateparser_at_capture(dateparser.parse)))
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
 
     def _delivery(self, html: str, asin: str) -> tuple:
         """(delivery_date, delivery_time)：两条引擎的函数本身 + parse_product 出口必须一致。"""
@@ -175,8 +217,7 @@ class AccordionDeliveryTests(_Base):
         self.assertIn("a-accordion-active", HTMLParser(html).css_first(
             "#newAccordionRow_0").attributes.get("class", ""))
         date, days = self._delivery(html, "B0CQWZR6L8")
-        self.assertEqual(date, "October 16")
-        self.assertEqual(days, self.p._pick_delivery(["Friday, October 16"])[1])
+        self.assertEqual((date, days), ("October 16", "5"))  # 10-11 -> 10-16
 
     def test_member_price_row_selected_reads_the_new_row(self):
         """B0D12731YT（未改动）：选中的是会员价行，它**没有任何**配送信息；
@@ -184,6 +225,9 @@ class AccordionDeliveryTests(_Base):
 
         这一条在基线上也是 Tomorrow（全页最快恰好也是它），守的是「会员价行 -> 全新行」
         这一步：只读会员价行本身会恒为 N/A。
+
+        依赖时钟钉在抓取时刻：不钉的话每年 10 月 15 日 October 16 也是 1 天，并列时取先
+        出现的那个，就成了 ('October 16', '1')。
         """
         html = _load("dp_us_B0D12731YT_accordion_prime.html.gz")
         self.assertEqual(_row_times(html, "primeSavingsUpsellAccordionRow"), [],
@@ -208,8 +252,7 @@ class AccordionDeliveryTests(_Base):
         self.assertEqual(set(_row_times(html, "newAccordionRow_1")), {"Friday, October 16"})
         self.assertIn("Tomorrow, October 12", _row_times(html, "usedAccordionRow"))
         date, days = self._delivery(html, "B0D12731YT")
-        self.assertEqual(date, "October 16")
-        self.assertEqual(days, self.p._pick_delivery(["Friday, October 16"])[1])
+        self.assertEqual((date, days), ("October 16", "5"))  # 10-11 -> 10-16
 
     def test_selected_used_row_reads_the_used_row(self):
         """读的是「选中行」，不是「全新行」。B0CQWZR6L8 的变体：**改动**是把
@@ -222,8 +265,7 @@ class AccordionDeliveryTests(_Base):
         二手行被选中的；要扩成「现价也跟下单那一行走」得用户另行同意。"""
         html = _select_used_row(_load("dp_us_B0CQWZR6L8_accordion.html.gz"))
         date, days = self._delivery(html, "B0CQWZR6L8")
-        self.assertEqual(date, "October 17")
-        self.assertEqual(days, self.p._pick_delivery(["Saturday, October 17"])[1])
+        self.assertEqual((date, days), ("October 17", "6"))  # 10-11 -> 10-17
 
     def test_text_fallback_is_scoped_to_the_purchase_row_too(self):
         """页面不带 data-csa-c-delivery-time 属性时，配送走「整段配送文本 + 正则」的
@@ -241,8 +283,7 @@ class AccordionDeliveryTests(_Base):
                       HTMLParser(html).css_first("#usedAccordionRow").text(),
                       "夹具前提：二手行正文里有更快的日期")
         date, days = self._delivery(html, "B0CQWZR6L8")
-        self.assertEqual(date, "October 16")
-        self.assertEqual(days, self.p._pick_delivery(["Friday, October 16"])[1])
+        self.assertEqual((date, days), ("October 16", "5"))  # 10-11 -> 10-16
 
     def test_unrecognisable_accordion_never_falls_back_to_the_whole_page(self):
         """accordion 在、但认不出任何行 -> N/A。回落全页就是这个 bug 本身。
@@ -265,8 +306,9 @@ class AccordionDeliveryTests(_Base):
             self.assertIsNone(self.p._member_price_scopes(tree))
         times = [n.attributes.get("data-csa-c-delivery-time")
                  for n in HTMLParser(html).css("[data-csa-c-delivery-time]")]
-        self.assertEqual(len(times), 2)
+        self.assertEqual(times, ["Friday, October 16", "Tomorrow, October 12"])
         self.assertEqual(self._delivery(html, "B0CRH6FDD7"), self.p._pick_delivery(times))
+        self.assertEqual(self._delivery(html, "B0CRH6FDD7"), ("Tomorrow", "1"))
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -310,6 +352,28 @@ class AccordionShippingTests(_Base):
         self.assertEqual(self._shipping(html, "$42.61"), "$6.99")
         for eng, r in _parse_both(html, "B0CQWZR6L8").items():
             self.assertEqual(r["buybox_shipping"], "$6.99", eng)
+
+    def test_free_over_threshold_with_the_amount_in_its_own_tag(self):
+        """满额免邮的金额包在子标签里时，两条引擎得出同一个结论。
+
+        selectolax 一侧把 #deliveryBlockMessage 下每个节点的 ``text(strip=True)`` 用空格
+        拼起来，而父节点的 ``text(strip=True)`` 是无分隔符拼接：``"…on orders over$35.00
+        shipped…"``。基线正则写死 ``over \\$``（中间一个空格），selectolax 认不出门槛，
+        落到 data-csa-c-delivery-price（"FREE"）；lxml 逐个文本节点、空格相连，认得出。
+        于是 $20 的商品 selectolax 报 FREE、lxml 报 N/A（不够门槛、运费未知）。
+
+        B0CQWZR6L8 的变体（全新行选中，未挪动），**改动**一处：在全新行的
+        #deliveryBlockMessage 开头插一句 "FREE delivery on orders over <span
+        class="a-text-bold">$35.00</span> shipped by Amazon"。和上一条一样是合成的句式；
+        金额加粗用的是页面上配送日期那种 ``a-text-bold`` 标签。
+        """
+        html = _load("dp_us_B0CQWZR6L8_accordion.html.gz")
+        block = '<div id="deliveryBlockMessage" class="a-section a-spacing-none">'
+        html = _edit_row(html, "newAccordionRow_0", block,
+                         block + '<span>FREE delivery on orders over '
+                                 '<span class="a-text-bold">$35.00</span> shipped by Amazon</span>', 1)
+        self.assertEqual(self._shipping(html, "$20.00"), "N/A")
+        self.assertEqual(self._shipping(html, "$42.61"), "FREE")
 
     def test_member_price_row_selected_reads_the_new_rows_block(self):
         """会员价行的 #deliveryBlockMessage 是空的，必须读全新行。

@@ -37,7 +37,8 @@ BSR / 料号 / 商品重量与尺寸 / 制造商 / 卖家 / 卖点，`us_B0D4QGV
 
 30 张美国对照页上没有现成例子的边界（Shipping Weight 标签、尺寸行里带重量、
 无空格的 ManufacturerPartNumber、"See more" 展开区里的卖点副本、多 class 的
-卖点 span、Amazon 自营的卖家挂件、`&nbsp;`），测试在上面的真实片段上做**一处**
+卖点 span、Amazon 自营的卖家挂件、卖家档案链接没有 `sellerProfileTriggerId` 且挂件前面
+先出现配送消息里带 `seller=` 的「Details」链接、`&nbsp;`），测试在上面的真实片段上做**一处**
 标明的改动；每条用例的 docstring 写了改的是哪一处、为什么。
 
 ## 已知不覆盖

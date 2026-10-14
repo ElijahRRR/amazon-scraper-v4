@@ -960,8 +960,7 @@ class AmazonParser:
 
         配送日期 / 天数 / 运费用它：会员价行**不带配送信息**，只读它会恒为 N/A；
         而回落全页又会读到别的行（用户实测美国 B0CQWZR6L8：未选中的二手行有 Prime
-        「Tomorrow」，选中的全新行是更晚的日期，入库成了 Tomorrow；美国 B0FFGFT343：
-        选中会员价行，全页最快的 October 15 不是全新行的，全新行是 October 16）。
+        「Tomorrow」，选中的全新行是更晚的日期，入库成了 Tomorrow）。
         原价也用它（经 ``_accordion_offer_scopes``）：会员价行的 List / Typical 是
         相对会员价标的，配上全新行的现价会出现 原价 ≤ 现价。
         返回值语义同 ``_accordion_selected_row``；会员价行被选中却找不到全新行时
@@ -1086,7 +1085,11 @@ class AmazonParser:
                 return "FREE"
 
             # 满额免邮
-            free_over = re.search(r'free delivery.*?on orders over \$(\d+(?:\.\d+)?)', delivery_block, re.IGNORECASE)
+            # 金额两侧的空白可有可无：金额包在子标签里（<b>$35.00</b>）时，上面拼的那段
+            # 里父节点的 text(strip=True) 是无分隔符拼接，"over" 与 "$35.00" 之间没有空格；
+            # 写死一个空格就只在 lxml 一侧（逐个文本节点、空格相连）认得出，两条引擎分叉。
+            free_over = re.search(r'free delivery.*?on orders over\s*\$\s*(\d+(?:\.\d+)?)',
+                                  delivery_block, re.IGNORECASE)
             if free_over:
                 threshold = float(free_over.group(1))
                 if current_price and current_price not in ['N/A', 'See price in cart', '不可售']:
@@ -1265,8 +1268,10 @@ class AmazonParser:
             # 语义不变：报**能看到的最快**配送（含 Prime 会员专享，见 _pick_delivery），
             # 只是在 accordion 页上把「能看到」收窄到普通买家下单的那一行
             # （_accordion_purchase_row）。原来全页取最快，未选中的行更快时就报了别的行的
-            # 日期（用户实测美国 B0CQWZR6L8：二手行 Prime「Tomorrow」入库；美国
-            # B0FFGFT343：选中会员价行，全新行 October 16，导出 October 15）。
+            # 日期（用户实测美国 B0CQWZR6L8：二手行 Prime「Tomorrow」入库）。
+            # 拿保存的页面做前后对比时要把时钟钉在抓取时刻：天数按解析当天算，已过去的
+            # 月 + 日会被当成明年（三百多天）、不再是最快，换个日子重解析，「全页最快」
+            # 本身就会变，前后差异里会混进与本改动无关的配送变化。
             # 认不出行给 N/A；非 accordion：前缀为空，选择器与原来逐字节相同。
             row = self._accordion_purchase_row(tree)
             if row == "":
@@ -2375,6 +2380,9 @@ class AmazonParser:
                 # 1..5 / 5 / 1..4。12 份真实 AOD 响应里 32 个带价格的 offer 全都有
                 # maxQty，下拉也全都是 maxQty - 1）。
                 # 取下拉会让同一个 offer 走兜底路径比走正常路径少报 1 件。
+                # ⚠ 这些对照与那 12 份响应都来自**加拿大站**（amazon.ca，同一套
+                # aodAjaxMain 模板）；美国站 amazon.com 的 aodAjaxMain 还没拿真实响应
+                # 核对过（沙箱里抓回 503），见 tests/fixtures/offer/README.md。
                 max_qty = self._aod_offer_max_qty(container)
                 if max_qty:
                     best_offer['max_qty'] = max_qty
@@ -3219,7 +3227,9 @@ class AmazonParser:
             if "prime members get free delivery" in delivery_block.lower():
                 return "FREE"
 
-            free_over = re.search(r'free delivery.*?on orders over \$(\d+(?:\.\d+)?)', delivery_block, re.IGNORECASE)
+            # 金额两侧空白可有可无，判据与 selectolax 一侧相同（为什么见那边）。
+            free_over = re.search(r'free delivery.*?on orders over\s*\$\s*(\d+(?:\.\d+)?)',
+                                  delivery_block, re.IGNORECASE)
             if free_over:
                 threshold = float(free_over.group(1))
                 if current_price and current_price not in ['N/A', 'See price in cart', '不可售']:

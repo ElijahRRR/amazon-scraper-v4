@@ -279,6 +279,10 @@ def _aod_offer(price_whole: str, price_frac: str, seller: str, seller_id: str,
     （span.a-price 的 whole / fraction、data-csa-c-delivery-*、#aod-offer-shipsFrom
     .a-color-base、#aod-offer-soldBy a.a-link-normal 的 href、加购按钮外层
     data-aod-atc-action 的 JSON），其余装饰层略去；店名 / ID 是虚构的。
+
+    ⚠ 照抄的那批真实 AOD 响应是**加拿大站**（amazon.ca）的：同一套 aodAjaxMain 模板，
+    但美国站 amazon.com 的响应还没拿真实样本核对过 —— 这里守的是「解析器读这套结构」，
+    不是「美国站的响应长这样」。
     """
     price = ('<span id="aod-price-1"><span class="a-price aok-align-center '
              'centralizedApexPricePriceToPayMargin apex-pricetopay-value" data-a-size="medium_plus">'

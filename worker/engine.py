@@ -1227,6 +1227,10 @@ class Worker:
             没有单独的提交说明；原注释说"AOD 获取到价格但无库存信息"，**不成立**
             —— 每个 offer 的加购按钮都带 maxQty（2026-10 抽查的 12 份真实 AOD 响应、
             32 个带价格的 offer 全有）。导出里走这条路的行于是全是 5。
+            ⚠ 证据的出处：那 12 份是**加拿大站**（amazon.ca）的 aodAjaxMain 响应，
+            与这里请求的是同一套模板；美国站 amazon.com 的 aodAjaxMain 还没拿真实
+            响应核对过（沙箱里抓回 503），测试里的美国 AOD 是照那套结构构造的，
+            见 tests/fixtures/offer/README.md「没有真实片段的部分」。
           * 但**替换 "0" 这个动作本身得留着**：商品页解析在无推荐报价时写的是
             "0"，它旁边的 stock_status 却是 "In Stock (via offer-listing)"。
             留着 "0"，增量导出的 ``fast.stock_count=0`` 按契约不变量 3b 就是
@@ -1239,7 +1243,8 @@ class Worker:
             照收），严格按契约 3b「没采到就是 null」它该是 N/A。有意不在这里
             单独改成 N/A：商品页正常路径「有货、没给数量」导出的也是 999，
             只改这一条路，同一种状态就有了两种导出形状。要改得在解析器的
-            999 兜底处一起改。实际很少走到：真实 offer 全带 maxQty。
+            999 兜底处一起改。实际很少走到：真实 offer 全带 maxQty（上面那批
+            加拿大站样本如此）。
 
         只在 selectolax 路径生效：lxml 引擎的商品页解析不产出
         "No Featured Offer"（走不到调用这里的分支），``parse_offer_listing``

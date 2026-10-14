@@ -43,6 +43,9 @@ Tomorrow、挪动选中行、改配送价、改会员价行的划线价等）都
   抽查页里也没有任何 AOD 标记，所以 `parse_offer_listing` 与无推荐报价端到端用例里的 AOD
   响应是在测试里**构造**的（`tests/test_offer_price_seller_aod.py::_aod_offer`）：被测选择器
   读到的那几层照真实 AOD 响应原样保留，店名 / ID 虚构。拿到真实美国站 AOD 响应后应换成夹具。
+  ⚠ 照着抄结构的那批真实 AOD 响应（2026-10 抽查的 12 份，`worker/engine.py` /
+  `worker/parser.py` 里关于 maxQty 的注释说的也是它们）都是**加拿大站**（amazon.ca）的：
+  同一套 aodAjaxMain 模板，但 amazon.com 的 aodAjaxMain 至今没拿真实响应核对过。
 * **Warehouse / Amazon Resale 被选中的二手 buybox**：30 张页里没有，用例在
   `dp_us_B0CQWZR6L8_accordion` 上做标明的变体（把同页那个真实的 Amazon Resale 链接放进
   二手行的加购表单）。

@@ -7,7 +7,8 @@
                class **完全等于**一个词，多 class 的 span 一个都匹配不上
     重量 / 尺寸  ``Shipping Weight`` 整行走空；不带分号的重量值存成 N/A；
                ``尺寸; 重量`` 那一行的重量被扔掉；``ManufacturerPartNumber`` 无空格标签
-    卖家        2026 版 buybox 的卖家挂件 #merchantInfoFeature_feature_div 上自营认不出
+    卖家        2026 版 buybox 的卖家挂件 #merchantInfoFeature_feature_div 上自营认不出；
+               没有 sellerProfileTriggerId 时落到全页第一个 seller= 链接（配送消息里的 "Details"）
 
 夹具是美国站真实页面的原文片段（tests/fixtures/parser_text/us_*.html，来历见 README）。
 页面上没有现成例子的边界，在真实片段上做**一处**标明的改动（构造变体），每条的 docstring
@@ -336,6 +337,35 @@ class MerchantInfoFeatureSeller(unittest.TestCase):
             with self.subTest(engine=engine):
                 r = _parse(self._first_party(), engine)
                 self.assertEqual((r["seller_id"], r["seller_name"]), ("AMAZON", "Amazon.com"))
+
+    def test_widget_link_beats_an_earlier_page_wide_seller_link(self):
+        """第二步（任意带 seller= 的链接）里，新挂件排在页面级兜底 ``a[href*="seller="]``
+        之前。基线没有挂件这一项，落到页面级兜底，拿到的是 DOM 里第一个带 seller= 的
+        链接 —— 购买框配送消息里的「Details」链接排在卖家挂件前面。
+
+        构造变体，两处改动：
+        1. 去掉片段里两处卖家档案链接的 ``id='sellerProfileTriggerId'``（链接与 href 原样），
+           让第一步落空、走到第二步 —— 30 张美国页上这个 id 都在，第二步是它改名时的兜底；
+        2. 在挂件前面插一段配送消息：``<a>`` 是美国页上真实的「Details」链接原文（B0D45YH9FL /
+           B098QJXZLS 购买框的 #deliveryBlockMessage 里，DOM 位置在卖家挂件之前），seller=
+           换成本片段的卖家 ID；外面那层配送消息是简化过的。真实页上这个链接的 seller=
+           就是卖家本人，所以基线 ID 碰巧对，名字却是 "Details"。
+        """
+        html = _html("us_B0CG19X7RN")
+        assert html.count(" id='sellerProfileTriggerId'") == 2
+        html = html.replace(" id='sellerProfileTriggerId'", "")
+        details = ('<div id="deliveryBlockMessage" class="a-section"> FREE delivery '
+                   '<span class="a-text-bold">Tuesday, October 20</span>. '
+                   '<a aria-label="Details about delivery costs and shipping methods" '
+                   'target="_blank" href="/gp/aag/details/?seller=A5WPZBUT3Z26Y&amp;'
+                   'sshmPath=shipping-rates" data-a-atomic-interop="" '
+                   'data-a-component="text-link">Details</a></div>\n')
+        html = _one_change(html, '<div id="merchantInfoFeature_feature_div"',
+                           details + '<div id="merchantInfoFeature_feature_div"')
+        for engine in ENGINES:
+            with self.subTest(engine=engine):
+                r = _parse(html, engine)
+                self.assertEqual((r["seller_id"], r["seller_name"]), ("A5WPZBUT3Z26Y", "callalily"))
 
     def test_third_party_name_without_link_is_not_claimed_as_amazon(self):
         """守卫：新挂件的域名判据只认域名本身。构造变体：把真实片段里的两处卖家档案链接换成
