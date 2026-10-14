@@ -92,7 +92,8 @@ def _parse_both(html: str, asin: str, site) -> dict:
 # ══════════════════════════════════════════════════════════════════════
 class AccordionOriginalPriceTests(unittest.TestCase):
     """多 offer accordion 里每一行都有自己的 #corePriceDisplay_desktop_feature_div
-    （id 重复）。原价只能从选中那一行（a-accordion-active）读。"""
+    （id 重复）。原价只能从选中那一行（a-accordion-active）读；选中的是会员价行时
+    读全新行（与现价同一行）。"""
 
     def _orig(self, html: str, asin: str, site) -> str:
         p = AmazonParser()
@@ -125,11 +126,16 @@ class AccordionOriginalPriceTests(unittest.TestCase):
         html = _load("dp_ca_B0B9R8R8NC_accordion_was.html.gz")
         self.assertEqual(self._orig(html, "B0B9R8R8NC", _CA), "$169.99")
 
-    def test_selected_prime_row_keeps_its_list_price(self):
+    def test_selected_prime_row_reads_the_new_rows_strike_price(self):
         """US B0D12731YT：选中的是会员价行，"List Price: $34.99" 在它自己的价格块里
-        （#apex_desktop_primeSavingsUpsellAccordionRow）。行名去掉 `_N` 才对得上中栏 id。"""
+        （#apex_desktop_primeSavingsUpsellAccordionRow），是相对会员价 $26.99 标的。
+        用户口径（2026-10-14）：原价跟现价同一行 —— 全新行（现价 $35.99 就读它），
+        而全新行自己没有划线价 -> N/A。原来报 $34.99，原价 < 现价。
+        全新行自己标了划线价的页（B0F3CQT8G5）见 tests/test_accordion_buy_row.py。"""
         html = _load("dp_us_B0D12731YT_accordion_prime.html.gz")
-        self.assertEqual(self._orig(html, "B0D12731YT", _US), "$34.99")
+        self.assertIn("$34.99", HTMLParser(html).css_first(
+            "#apex_desktop_primeSavingsUpsellAccordionRow").text(), "夹具前提：会员价行有 List 价")
+        self.assertEqual(self._orig(html, "B0D12731YT", _US), "N/A")
 
     def test_single_offer_layout_is_untouched(self):
         """非 accordion（B0CRH6FDD7，"Was: $64.99"）：选择器与原来逐字节相同。"""

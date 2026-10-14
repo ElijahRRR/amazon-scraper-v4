@@ -7,8 +7,10 @@
       选中行；选中的是会员价行（它不带配送信息）时读全新行 newAccordionRow_N。
       **语义不变**：仍是那一行里能看到的最快日期（含 Prime 会员专享）。
   H2  选中会员价行（"Prime Member Price"）时 current_price / buybox_price 取全新行的
-      普通价。用户口径：现价 = 普通买家能买到的价格，会员价不保留。原价仍按 G2
-      （读选中行）不变。
+      普通价。用户口径：现价 = 普通买家能买到的价格，会员价不保留。
+  P1  同一情形下原价也跟全新行取（用户口径 2026-10-14：与现价同一行，那一行没有
+      划线价就是 N/A）。原来读会员价行的 List / Typical —— 那是相对会员价标的，
+      配上普通价就成了 原价 ≤ 现价（US B0D12731YT $34.99 / $35.99）。
 
 夹具是 tests/fixtures/offer/ 下的真实页面片段（来源见那里的 README）。凡是在片段上
 改过东西的用例，docstring 里写明改了什么、为什么。
@@ -97,6 +99,16 @@ def _select_used_row(html: str) -> str:
                      'data-a-accordion-row-name="usedAccordionRow"', 1)
 
 
+def _edit_between(html: str, start: str, end: str, old: str, new: str, expect: int) -> str:
+    """只在 ``start`` 与其后第一个 ``end`` 之间把 ``old`` 换成 ``new``，并核对次数。
+    用来改中栏的某一个分行价格块（它们在 #apex_desktop 里按 DOM 顺序相邻）。"""
+    i = html.index(start)
+    j = html.index(end, i + len(start))
+    seg = html[i:j]
+    assert seg.count(old) == expect, (start, old, seg.count(old))
+    return html[:i] + seg.replace(old, new) + html[j:]
+
+
 def _row_times(html: str, row_id: str) -> list:
     """某一行里全部 data-csa-c-delivery-time 的值（夹具前提断言用）。"""
     return [n.attributes.get("data-csa-c-delivery-time")
@@ -136,6 +148,10 @@ class _Base(unittest.TestCase):
                          res["slx"]["current_price"])
         self.assertEqual(self.p._parse_current_price(lxml_html.fromstring(html), spec),
                          res["lxml"]["current_price"])
+        self.assertEqual(self.p._slx_parse_original_price(HTMLParser(html)),
+                         res["slx"]["original_price"])
+        self.assertEqual(self.p._parse_original_price(lxml_html.fromstring(html)),
+                         res["lxml"]["original_price"])
         return res["slx"]
 
 
@@ -341,12 +357,13 @@ class MemberPriceTests(_Base):
         got = self._prices(html, "B0D12731YT", _US)
         self.assertEqual(got["current_price"], "$35.99")
         self.assertEqual(got["buybox_price"], "$35.99")
-        # 原价仍按 G2 读选中行（会员价行自己的 "List Price: $34.99"），不因 H2 改变。
-        self.assertEqual(got["original_price"], "$34.99")
+        # P1：原价跟现价同一行（全新行），全新行没有划线价 -> N/A。会员价行自己的
+        # "List Price: $34.99" 是相对会员价标的，原来报的就是它（原价 < 现价）。
+        self.assertEqual(got["original_price"], "N/A")
 
     def test_member_price_row_without_a_new_row_gives_na(self):
-        """选中会员价行、却找不到全新行 -> 现价 / buybox 价 N/A，配送 / 运费也 N/A。
-        拿会员价顶上正是用户否掉的那个值。
+        """选中会员价行、却找不到全新行 -> 现价 / buybox 价 / 原价 N/A，配送 / 运费也 N/A。
+        拿会员价（及相对它标的 List 价）顶上正是用户否掉的那个值。
 
         B0D12731YT 的变体：**改动**是把全新行的 id 改名（<div id="newAccordionRow_1"
         -> someOtherRow_1）。
@@ -357,8 +374,66 @@ class MemberPriceTests(_Base):
         got = self._prices(html, "B0D12731YT", _US)
         self.assertEqual(got["current_price"], "N/A")
         self.assertEqual(got["buybox_price"], "N/A")
+        self.assertEqual(got["original_price"], "N/A")
         self.assertEqual(self._delivery(html, "B0D12731YT", _US), ("N/A", "N/A"))
         self.assertEqual(self._shipping(html, "N/A", _US), "N/A")
+
+    # ---- P1  原价跟全新行取 ----
+    def test_new_rows_own_list_price_is_kept(self):
+        """US B0F3CQT8G5（未改动的真实页面）：选中会员价行（$79.99），全新行普通价 $84.99，
+        全新行**自己**的中栏价格块（apex_desktop_newAccordionRow，页面上是隐藏的那份）
+        标了 "List Price: $99.99"。原价跟全新行取就是它，结果不变。
+
+        会员价行碰巧也标 $99.99，所以这一条在基线上也绿；下一条把两者拆开。
+        """
+        html = _load("dp_us_B0F3CQT8G5_accordion_prime_list.html.gz")
+        tree = HTMLParser(html)
+        self.assertIn("a-accordion-active",
+                      tree.css_first("#primeSavingsUpsellAccordionRow").attributes.get("class", ""))
+        self.assertEqual(
+            [n.text(strip=True) for n in tree.css(
+                '#apex_desktop_newAccordionRow span[data-a-strike="true"] span.a-offscreen')],
+            ["$99.99"], "夹具前提：全新行自己有划线价")
+        got = self._prices(html, "B0F3CQT8G5", _US)
+        self.assertEqual((got["current_price"], got["buybox_price"]), ("$84.99", "$84.99"))
+        self.assertEqual(got["original_price"], "$99.99")
+
+    def test_original_price_comes_from_the_new_row_not_the_member_row(self):
+        """B0F3CQT8G5 的变体：**改动**是把会员价行中栏块
+        （apex_desktop_primeSavingsUpsellAccordionRow）里的 "$99.99" 换成 "$89.99"
+        （3 处："List Price:" 文案、a-offscreen、aria-hidden），全新行原样。
+        两行的划线价不同，必须报全新行的 $99.99 —— 读会员价行的话是 $89.99（基线即如此）。
+        """
+        html = _edit_between(_load("dp_us_B0F3CQT8G5_accordion_prime_list.html.gz"),
+                             '<div id="apex_desktop_primeSavingsUpsellAccordionRow"',
+                             '<div id="apex_desktop_newAccordionRow"', "$99.99", "$89.99", 3)
+        got = self._prices(html, "B0F3CQT8G5", _US)
+        self.assertEqual(got["current_price"], "$84.99")
+        self.assertEqual(got["original_price"], "$99.99")
+
+    def test_single_centre_block_is_not_read_when_member_row_selected(self):
+        """较早的 accordion 形状（buybox 分行、中栏只有一份价格块）上，原价会多读整个
+        ``#apex_desktop``（G2 的兜底，那一份是主推 offer 的）。选中会员价行时主推的就是
+        会员价，那一份就是会员价的，不读。
+
+        B0D12731YT 的变体，**改动**同 test_offer_price_seller_aod 里那条单中栏用例的做法：
+        删掉中栏的全新行块与二手行块，去掉会员价行块的 id —— ``#apex_desktop`` 里只剩
+        会员价那份 "List Price: $34.99"。buybox 的全新行自己没有划线价 -> N/A
+        （基线经 ``#apex_desktop`` 兜底报 $34.99）。
+        """
+        tree = HTMLParser(_load("dp_us_B0D12731YT_accordion_prime.html.gz"))
+        tree.css_first("#apex_desktop_newAccordionRow").decompose()
+        tree.css_first("#apex_desktop_usedAccordionRow").decompose()
+        del tree.css_first("#apex_desktop_primeSavingsUpsellAccordionRow").attrs["id"]
+        html = tree.html
+        self.assertNotRegex(html, r'id="apex_desktop_[^"]*AccordionRow')
+        self.assertIn("$34.99", HTMLParser(html).css_first("#apex_desktop").text(),
+                      "夹具前提：单中栏里是会员价那份 List 价")
+        self.assertIsNone(HTMLParser(html).css_first(
+            '#newAccordionRow_1 span[data-a-strike="true"]'), "夹具前提：buybox 全新行没有划线价")
+        got = self._prices(html, "B0D12731YT", _US)
+        self.assertEqual(got["current_price"], "$35.99")
+        self.assertEqual(got["original_price"], "N/A")
 
     def test_new_rows_own_price_block_unreadable_gives_na_not_the_center_column(self):
         """全新行**行内**的价格块读不到 -> 现价 / buybox 价 N/A，不去中栏

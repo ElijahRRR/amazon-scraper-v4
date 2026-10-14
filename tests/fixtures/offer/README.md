@@ -5,8 +5,8 @@ Warehouse Deals 的卖家 ID、无推荐报价页走「查看全部报价」(aod
 卖家与库存数。
 
 `tests/test_accordion_buy_row.py` 也用这里的 accordion 片段：配送日期 / 天数 / 运费只读
-下单那一行、会员价行被选中时现价取全新行的普通价。它在片段上做的改动（把二手行日期改成
-Tomorrow、挪动选中行、改配送价等）都在**测试里现做**并写明，夹具文件本身是原样裁剪。
+下单那一行、会员价行被选中时现价与原价都取全新行。它在片段上做的改动（把二手行日期改成
+Tomorrow、挪动选中行、改配送价、改会员价行的划线价等）都在**测试里现做**并写明，夹具文件本身是原样裁剪。
 
 ## 来源
 
@@ -16,6 +16,7 @@ Tomorrow、挪动选中行、改配送价等）都在**测试里现做**并写�
 | `dp_us_B0CQWZR6L8_accordion.html.gz` | www.amazon.com 商品页 | 2026-10-11 05:49 | 同一个 bug 的美国站形状（标签大写 "New Condition Price"） |
 | `dp_ca_B0B9R8R8NC_accordion_was.html.gz` | www.amazon.ca 商品页 | 2026-10-10 13:53 | accordion，全新行**自己**有 "Was: $169.99" —— 修完不能丢 |
 | `dp_us_B0D12731YT_accordion_prime.html.gz` | www.amazon.com 商品页 | 2026-10-11 05:49 | accordion，选中的是会员价行（primeSavingsUpsellAccordionRow），"List Price: $34.99" |
+| `dp_us_B0F3CQT8G5_accordion_prime_list.html.gz` | www.amazon.com 商品页 | 2026-10-11 05:49 | accordion，选中的是会员价行（$79.99）；全新行普通价 $84.99，**全新行自己**的中栏块（apex_desktop_newAccordionRow）标了 "List Price: $99.99" —— 原价跟全新行取时不能丢 |
 | `dp_ca_B0CRH6FDD7_single_was.html.gz` | www.amazon.ca 商品页 | 2026-10-10 13:52 | 传统单 offer buybox，"Was: $64.99" —— 非 accordion 路径的对照 |
 | `dp_ca_B0CG19X7RN_accordion_delivery.html.gz` | www.amazon.ca 商品页 | 2026-10-10 13:52 | accordion：选中的全新行只有 Friday, October 16；未选中的二手行有 October 14 / Monday, October 12。配送日期曾被导出成 October 12 |
 | `dp_ca_B0GKNHN7Q5_warehouse.html.gz` | www.amazon.ca 商品页 | 2026-10-10 13:53 | 二手 buybox，卖家 Warehouse Deals，链接是 `/b?node=8929975011`（无 `seller=`），ID 在同一表单的 `input#merchantID` |
@@ -50,6 +51,9 @@ Tomorrow、挪动选中行、改配送价等）都在**测试里现做**并写�
 `dp_ca_B0CG19X7RN_accordion_delivery.html.gz` 按同一裁剪法（`#apex_desktop` + `#buyBoxAccordion`）
 后加；它与 `dp_us_B0D12731YT_accordion_prime` / `dp_us_B0CQWZR6L8_accordion` 两份一起核过：
 现价 / buybox 价 / 原价 / 运费 / 配送日期 / 配送天数 / 品相在两条引擎上与完整页面逐字段相同。
+
+`dp_us_B0F3CQT8G5_accordion_prime_list.html.gz` 同法后加（会员价页的原价改跟全新行取，2026-10-14），
+同样 7 个字段两条引擎与完整页面逐字段相同（改动前后的解析代码上都核过）。
 
 ## 会过期
 
