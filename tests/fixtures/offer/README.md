@@ -8,6 +8,10 @@ Warehouse Deals 的卖家 ID、无推荐报价页走「查看全部报价」(aod
 下单那一行、会员价行被选中时现价与原价都取全新行。它在片段上做的改动（把二手行日期改成
 Tomorrow、挪动选中行、改配送价、改会员价行的划线价等）都在**测试里现做**并写明，夹具文件本身是原样裁剪。
 
+`tests/test_offer_price_seller_aod_us.py` / `tests/test_accordion_buy_row_us.py` 是 main 上同名测试
+（不带 `_us`）的原样副本，只用美国站片段，在这个分支上守住美国站的同一批行为；下表里标「main」的
+三份片段只给它们用。
+
 ## 来源
 
 | 夹具 | 来源 | 抓取时间 (UTC) | 为什么选它 |
@@ -21,6 +25,9 @@ Tomorrow、挪动选中行、改配送价、改会员价行的划线价等）都
 | `dp_ca_B0CG19X7RN_accordion_delivery.html.gz` | www.amazon.ca 商品页 | 2026-10-10 13:52 | accordion：选中的全新行只有 Friday, October 16；未选中的二手行有 October 14 / Monday, October 12。配送日期曾被导出成 October 12 |
 | `dp_ca_B0GKNHN7Q5_warehouse.html.gz` | www.amazon.ca 商品页 | 2026-10-10 13:53 | 二手 buybox，卖家 Warehouse Deals，链接是 `/b?node=8929975011`（无 `seller=`），ID 在同一表单的 `input#merchantID` |
 | `dp_ca_B0D45YH9FL_nfo.html.gz` | www.amazon.ca 商品页 | 2026-10-10 13:53 | 无推荐报价（"No featured offers available"），`input#merchantID` 的 value 为空 |
+| `dp_us_B0CRGYZ4HV_accordion_list.html.gz`（main） | www.amazon.com 商品页 | 2026-10-11 05:49 | accordion，全新行**自己**的中栏块（`apex_desktop_newAccordionRow`）标了 "List Price: $44.99" —— 修完不能丢 |
+| `dp_us_B0CRH6FDD7_single_list.html.gz`（main） | www.amazon.com 商品页 | 2026-10-11 05:49 | 传统单 offer buybox（没有 `#buyBoxAccordion`），"List Price: $49.99" —— 非 accordion 路径的对照 |
+| `dp_us_B07JN24QCB_nfo.html.gz`（main） | www.amazon.com 商品页 | 2026-10-11 05:49 | 无推荐报价（"No featured offers available"），`input#merchantID` 的 value 为空 |
 | `aod_ca_B0D45YH9FL.html.gz` | 同一 ASIN 的 aodAjaxMain 响应 | 2026-10-10 14:14 | 第一个报价 Botley Store / A15CBTP5BTSNTZ / $246.62 / maxQty 3，与用户导出那一行的价格、运费、配送逐字段对上 |
 | `aod_ca_B098QJXZLS.html.gz` | www.amazon.ca aodAjaxMain 响应 | 2026-10-11 06:18 | 无推荐报价；第一个报价 GiantRun LLC / ADHQ1EIRR50GJ / $503.56 / maxQty 20，价格与导出那一行（库存数 5）相同 |
 | `aod_ca_B0D4QGVN6F.html.gz` | www.amazon.ca aodAjaxMain 响应 | 2026-10-11 06:19 | 无推荐报价；第一个报价卖家名 "Amazon US" / ADQ8PPI9HA4SX / $238.23 / maxQty 5，价格与导出那一行相同 |
@@ -54,6 +61,14 @@ Tomorrow、挪动选中行、改配送价、改会员价行的划线价等）都
 
 `dp_us_B0F3CQT8G5_accordion_prime_list.html.gz` 同法后加（会员价页的原价改跟全新行取，2026-10-14），
 同样 7 个字段两条引擎与完整页面逐字段相同（改动前后的解析代码上都核过）。
+
+标「main」的三份美国片段（随 main 的 #26 进来）按同一裁剪法做，核对时有两处例外：
+`dp_us_B07JN24QCB_nfo` 在 lxml 引擎上的配送日期 / 天数（lxml 从片段外的推荐卡片读到了
+`Oct 15`；无推荐报价页的配送由 AOD 兜底覆盖，用例不断言它）、`dp_us_B0F3CQT8G5_accordion_prime_list`
+的 `is_fba`（片段里没有整页上那段发货方文案，别拿它断言 is_fba）。
+
+美国站的 aodAjaxMain 没有真实响应（沙箱里回 503）：`*_us.py` 里的 AOD 响应是照上面那批
+**加拿大站**真实 AOD 的结构在测试里构造的（`_aod_offer`），店名 / ID 虚构。
 
 ## 会过期
 
