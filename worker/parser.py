@@ -455,11 +455,78 @@ class AmazonParser:
     """Amazon 商品页面解析器"""
 
     # 垃圾文字黑名单（五点描述过滤用）
+    #
+    # 它要挡的是 Amazon 自己的**退货弹层模板句**。真实页面上（2026-10 抽查的
+    # 66 张美 / 加页面每张都有）buybox 的 "FREE Returns" 弹层里是这么一段：
+    #
+    #   <div id="creturnsHowToReturnExpanderContent" class="a-expander-content ...">
+    #     <ol> <li><span class="a-list-item">Go to your orders and start the return</span></li>
+    #          <li><span class="a-list-item">Select your preferred free shipping option</span></li>
+    #          <li><span class="a-list-item">Drop off and leave!</span></li> </ol>
+    #
+    # —— 与五点同一个 ``a-expander-content`` / ``a-list-item`` 结构，五点的兜底
+    # 选择器一旦落到它上面就会把这三句当成卖点。表里前五个词正好是这三句的切片。
+    # 判据见 `_is_bullet_boilerplate`：**不再**是"含这个词就整条删"。
     BULLET_BLACKLIST = [
         "go to your orders", "start the return", "free shipping option", "drop off",
         "leave!", "return this item", "money back", "customer service",
         "full refund", "eligible for return",
     ]
+
+    #: 卖家自己的小标题：``Smiley Customer Service: ...`` / ``Customer Support - ...`` /
+    #: ``【Customer Service】...``。开头允许最多 3 个装饰符（✅ ★ 之类）。
+    #: 小标题本身不含句末标点 —— 这样 "Drop off and leave!" 里的 ``!`` 不会被当成分隔。
+    #: 长度上限 80：抽查页面里最长的小标题 68 字符
+    #: （"Built-in LED Lights, Perfect Integration of Bookshelf and Floor Lamp："）。
+    _SELLER_HEADING_RE = re.compile(
+        r"^\W{0,3}(?:[【\[][^】\]]{1,80}[】\]]"
+        r"|[^:：.!?]{1,80}?(?:\s*[:：]|\s+[-–—|]\s))"
+    )
+
+    @classmethod
+    def _is_bullet_boilerplate(cls, text: str) -> bool:
+        """这一条是不是 Amazon 混进来的模板句（而不是卖家写的卖点）。
+
+        原判据是"小写后含黑名单任一子串就整条删"，于是卖家的真实卖点被误删
+        （2026-10 抽查 33 个加拿大商品里 3 个，美国页同样复现）：
+
+            Smiley Customer Service: Welcome to Contact Us; ...          B0D4QGVN6F
+            Customer Support - Comes with 1 luggage rack ... 24/7 customer service ...   B09Y3DKJKQ
+            Instruction and Customer Service: You could see the installation steps ...   B0D45YH9FL
+
+        区别在形状上：模板句是**一句完整的说明**，没有小标题；卖家卖点几乎都以
+        自己的「小标题：」/「小标题 - 」/【小标题】开头（抽查 347 条卖点里 344 条）。
+        所以收窄成：**含黑名单词，且不以卖家小标题开头**，才算模板句。
+
+        ⚠ 只收窄、不放宽：黑名单词一个没删。不带小标题、又恰好提到
+          "customer service" 的卖家卖点仍会被删 —— 那是原判据就有的误伤，
+          这里没有证据去动它（真实页面上没见到这种卖点）。
+        """
+        low = text.lower()
+        if not any(term in low for term in cls.BULLET_BLACKLIST):
+            return False
+        return cls._SELLER_HEADING_RE.match(text) is None
+
+    #: 空白折叠：首尾空白去掉，中间连续空白（空格 / 制表符 / 不换行空格 / 换行）
+    #: 合并成一个普通空格。Python 的 ``\s`` 对 str 是 Unicode 语义，含 ``\xa0``。
+    _WS_RUN_RE = re.compile(r"\s+")
+
+    @classmethod
+    def _squash_ws(cls, s: str) -> str:
+        """详情值 / 品牌的空白归一，口径经用户确认：首尾去掉、中间合并成一个空格。
+
+        为什么需要：selectolax 的 ``text(separator=" ", strip=True)`` 是**逐文本
+        节点** strip 再用分隔符拼接，td 里 span 两侧的缩进文本节点被 strip 成空串
+        之后**仍然各贡献一个分隔符**：
+
+            <td class="a-span9">    <span class="po-break-word">MoKitDora</span>   </td>
+            -> ' MoKitDora '
+
+        真实导出 535 行里 44 行品牌带首尾空格（' SMIBUY ' / ' MoKitDora ' ...），
+        按品牌 join / 去重时与 'SMIBUY' 是两个品牌。两个词分在两个标签里时同理会
+        拼出双空格；``&nbsp;`` 会原样留成 ``\\xa0``（lxml 的 normalize-space 也不认它）。
+        """
+        return cls._WS_RUN_RE.sub(" ", s).strip()
 
     def parse_product(self, html_text: str, asin: str, zip_code: str = "10001",
                       marketplace: str = None) -> Dict[str, Any]:
@@ -504,7 +571,18 @@ class AmazonParser:
         # 为什么不在 slowhash.normalize_text 里洗：那里只作用于**哈希输入**，
         # 不改存下来的值 —— 洗了哈希稳了，下游拿到的仍然是脏数据，而下游按
         # 品牌 join 正是最需要它干净的地方。详见 common/core/textclean.py。
-        return _clean_deep(parsed)
+        cleaned = _clean_deep(parsed)
+
+        # 品牌的空白归一在出口再做一次（根因处的修复在两个 _*parse_all_details）。
+        # 为什么出口还要一道：品牌有四五个来源（JSON-LD / 详情表 / byline /
+        # logo alt / meta keywords），只修详情表那一路保证不了"最终值"的形状。
+        # 必须排在 _clean_deep **之后**：U+200E 删掉之后才露出来的空白
+        # （"\u200e MoKitDora" -> " MoKitDora"）在之前做就漏了。
+        # 归一后成空串说明原值只有空白 —— 回到"没取到"的哨兵，与其它来源一致。
+        brand = cleaned.get("brand")
+        if isinstance(brand, str):
+            cleaned["brand"] = self._squash_ws(brand) or "N/A"
+        return cleaned
 
     # ==================== selectolax 解析路径 ====================
 
@@ -890,6 +968,13 @@ class AmazonParser:
 
     def _slx_parse_current_price(self, tree, spec=None) -> str:
         try:
+            # 会员价行被选中时改读全新行（见 _member_price_scopes）。其余情形前缀为空，
+            # 选择器与原来逐字节相同。选择器在外层、作用域在内层：优先级照旧，
+            # 只是当会员价行不存在。
+            scopes = self._member_price_scopes(tree)
+            if scopes == []:
+                return "N/A"
+            prefixes = [""] if scopes is None else [css + " " for css, _ in scopes]
             # 方法1: 价格容器内的 a-offscreen（限定到价格区域，避免全页匹配）
             price_selectors = [
                 '#corePrice_feature_div span.a-offscreen',
@@ -901,7 +986,7 @@ class AmazonParser:
                 '#priceToPay span.a-offscreen',
                 '#apex_offerDisplay_desktop span.a-offscreen',
             ]
-            for sel in price_selectors:
+            for sel in [pre + s for s in price_selectors for pre in prefixes]:
                 node = tree.css_first(sel)
                 if node:
                     p = node.text(strip=True)
@@ -920,8 +1005,9 @@ class AmazonParser:
                     if p and _FOREIGN_PRICE_RE.search(p):
                         return f"[非{_cur(spec)}]{p}"
             # 方法2: 拆分整数+小数（限定到价格容器）
-            for container in ['#corePrice_feature_div', '#corePriceDisplay_desktop_feature_div',
-                              '#corePrice_desktop', '#price', '#apex_offerDisplay_desktop']:
+            containers = ['#corePrice_feature_div', '#corePriceDisplay_desktop_feature_div',
+                          '#corePrice_desktop', '#price', '#apex_offerDisplay_desktop']
+            for container in [pre + c for c in containers for pre in prefixes]:
                 prefix = f'{container} ' if container else ''
                 whole_node = tree.css_first(f'{prefix}span.a-price-whole')
                 frac_node = tree.css_first(f'{prefix}span.a-price-fraction')
@@ -935,6 +1021,13 @@ class AmazonParser:
         return "N/A"
 
     def _slx_parse_buybox_price(self, tree) -> Optional[str]:
+        # 作用域口径同 _slx_parse_current_price：会员价行被选中时只读全新行。
+        # 那时前两条（#tabular-buybox / #buybox）是行的祖先，加了前缀就不再命中，
+        # 落到后面行内的价格容器上 —— 正是要的。其余情形选择器逐字节不变。
+        scopes = self._member_price_scopes(tree)
+        if scopes == []:
+            return None
+        prefixes = [""] if scopes is None else [css + " " for css, _ in scopes]
         selectors = [
             '#tabular-buybox span.a-offscreen',
             '#buybox span.a-offscreen',
@@ -945,7 +1038,7 @@ class AmazonParser:
             '#corePriceDisplay_desktop_feature_div span.a-offscreen',
             '#apex_offerDisplay_desktop span.a-offscreen',
         ]
-        for sel in selectors:
+        for sel in [pre + s for s in selectors for pre in prefixes]:
             try:
                 nodes = tree.css(sel)
                 for node in nodes:
@@ -956,12 +1049,197 @@ class AmazonParser:
                 continue
         return None
 
+    # ---- 原价：accordion buybox 只读选中那一行 ----
+    #
+    # 2026-09 起的多 offer accordion 布局里，**每一行 offer 都有自己的一整套价格块**，
+    # 而且 id 是重复的：
+    #
+    #   #centerCol #apex_desktop
+    #       #apex_desktop_newAccordionRow   > #corePriceDisplay_desktop_feature_div
+    #       #apex_desktop_usedAccordionRow  > #corePriceDisplay_desktop_feature_div
+    #           …"New condition price: $112.99"（basisPrice，带 data-a-strike）
+    #   #buybox #buyBoxAccordion
+    #       #newAccordionRow_0.a-accordion-active > … #corePrice_feature_div
+    #       #usedAccordionRow                     > … #corePrice_feature_div
+    #
+    # 原来全页取第一个划线价，全新行自己没有划线价时就落到二手行的
+    # "New condition price"（= 全新件的现价），导出成 原价 = 现价。
+    # 实例：CA B09Y3DKJKQ / B0CG19X7RN，US B0CQWZR6L8 / B0GGGQBJSB / B0GKNHN7Q5。
+    # 做法与 #24 修 offer_condition 一致：只读 a-accordion-active 那一行；
+    # 行 id 去掉 `_N` 后缀就是中栏价格块的 `apex_desktop_<行名>`（36+30 张真实页
+    # 上 12 张 accordion 页全部对得上）。选中的是会员价行时改读全新行（与现价同一行，
+    # 见 _accordion_offer_scopes）。
+    #
+    # 同一个「整个购买框里取第一个 / 取最快」的毛病还在配送与运费上（每行各有一份
+    # 配送块），以及会员价行被选中时的现价上。它们共用下面同一份行判定
+    # （_accordion_selected_row；offer_condition 还留着 #24 的一份等价旧写法）；
+    # 原价 / 配送 / 运费用 _accordion_purchase_row，会员价时的现价用 _member_price_scopes。
+    #
+    # 同类字段逐个核过（12 张 accordion 真实页）、**没改**的：库存状态取第一个
+    # #availability、卖家取第一个卖家链接、FBA 判定取第一个 "Ships from"，
+    # 选中行（或会员价行后面的全新行，两者卖家 / 发货方相同）都排在 DOM 最前，
+    # 12 张页上取到的都是对的那一行。库存数的数量下拉是**所有行**取最大值，
+    # 12 张页上都等于下单那一行的值（二手行的上限更小）。没有真实页面证据，不动。
+
+    #: 行 id 要拼进 CSS / XPath，只收字母开头的字母数字下划线；别的一律当认不出。
+    _ACCORDION_ROW_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+    #: 会员价行（buybox 上标 "Prime Member Price"）。它不是一个独立的 offer，而是
+    #: **同一个全新 offer 给 Prime 会员的价格**：行里只有会员价、卖家与发货方，
+    #: 没有配送承诺、没有数量下拉、没有库存文案。普通买家实际下单的是紧随其后的
+    #: 全新行 newAccordionRow_N。美国站 4 张真实页全是这个形状：
+    #: B0D12731YT $26.99（普通 $35.99）/ B0DGLHZBJR $44.99（$47.99）/
+    #: B0F3CQT8G5 $79.99（$84.99）/ B0FFGFT343 $44.64（$49.99）。
+    _MEMBER_PRICE_ROW = "primeSavingsUpsellAccordionRow"
+
+    def _accordion_new_row(self, tree) -> Optional[str]:
+        """buybox 上全新报价行（newAccordionRow_N）的 id；没有或 id 不安全 -> None。"""
+        rid = self._uni_first_attr(
+            tree, '#buyBoxAccordion div[id^="newAccordionRow"]',
+            '//*[@id="buyBoxAccordion"]//div[starts-with(@id, "newAccordionRow")]/@id',
+            'id')
+        return rid if rid and self._ACCORDION_ROW_ID_RE.match(rid) else None
+
+    def _accordion_selected_row(self, tree) -> Optional[str]:
+        """accordion buybox 上**选中那一行** offer 的 id —— 这几个字段共用的行判定。
+
+        * 不是 accordion 布局 -> ``None``：调用方照旧全页取（与原来逐字节一致）。
+        * 是 accordion 但认不出行 -> ``""``：调用方必须给 N/A，**不许回落全页**
+          —— 回落就是读到别的行，正是这一串 bug 本身。
+        * 没有展开行时退到全新行（newAccordionRow_N）：页面主推的就是它。
+
+        原价 / 配送 / 运费 / 会员价时的现价都从这里出发：各字段各认各的行，
+        同一条记录里就会拼进两个 offer 的数据。
+
+        offer_condition（``_parse_offer_condition``）里还有一份等价的旧写法
+        （#24，同一条 a-accordion-active 选择器，读的是行文本、没有「退到全新行」
+        也没有 id 校验），没并过来：并的话要先在 66 张真实页上对 offer_condition
+        做一遍前后对比，不在这次改动的范围里。
+        """
+        if not self._has_any_block(tree, ("buyBoxAccordion",)):
+            return None
+        rid = self._uni_first_attr(
+            tree,
+            '#buyBoxAccordion div.a-accordion-active[id*="AccordionRow"]',
+            '//*[@id="buyBoxAccordion"]//div[contains(@id, "AccordionRow")'
+            ' and contains(concat(" ", normalize-space(@class), " "),'
+            ' " a-accordion-active ")]/@id', 'id')
+        if not rid:
+            rid = self._accordion_new_row(tree)
+        if not rid or not self._ACCORDION_ROW_ID_RE.match(rid):
+            return ""
+        return rid
+
+    def _is_member_price_row(self, rid: Optional[str]) -> bool:
+        return bool(rid) and re.sub(r"_\d+$", "", rid) == self._MEMBER_PRICE_ROW
+
+    def _accordion_purchase_row(self, tree) -> Optional[str]:
+        """普通买家实际下单的那一行：选中行；选中的是会员价行时换成全新行。
+
+        配送日期 / 天数 / 运费用它：会员价行**不带配送信息**，只读它会恒为 N/A；
+        而回落全页又会读到二手行（实测 CA B0CG19X7RN：选中的全新行只有
+        October 16，未选中的二手行有 October 14 / Monday October 12，导出成了
+        October 12）。原价也用它（经 ``_accordion_offer_scopes``）：会员价行的
+        List / Typical 是相对会员价标的，配上全新行的现价会出现 原价 ≤ 现价。
+        返回值语义同 ``_accordion_selected_row``；会员价行被选中却找不到全新行时
+        给 ``""``（N/A），不猜。
+        """
+        rid = self._accordion_selected_row(tree)
+        if self._is_member_price_row(rid):
+            return self._accordion_new_row(tree) or ""
+        return rid
+
+    def _member_price_scopes(self, tree) -> Optional[List[Tuple[str, str]]]:
+        """会员价行被选中时，现价 / buybox 价改读的作用域 ``[(css, xpath), ...]``。
+
+        用户口径（2026-10-11）：**现价 = 普通买家能买到的价格，会员价不保留。**
+        所以选中会员价行时只读 buybox 里的全新行本身（行内有自己的
+        ``#corePrice_feature_div``，4 张真实页上首个 a-offscreen 就是普通价）。
+
+        * 没选中会员价行（含非 accordion、认不出行）-> ``None``：调用方照旧取，
+          选择器逐字节不变。只有会员价这一种情形改行，别的 accordion 页上现价
+          本来就取到选中行（选中行在 DOM 里排第一，12 张真实页都是）。
+        * 选中会员价行、却没有全新行 -> ``[]``：调用方给 N/A。拿会员价顶上
+          就是用户否掉的那个值。
+
+        **不加**中栏同名价格块 ``apex_desktop_newAccordionRow`` 作第二作用域：
+        那一块的「要付的价」（``.apex-pricetopay-value``）的 a-offscreen 在 4 张
+        真实页上全是**空的**，块里第一个有字的 a-offscreen 是 List Price 或单价
+        （B0F3CQT8G5 ``$99.99``、B0D12731YT ``$1.80`` / count）。选择器在外层、
+        作用域在内层，行内价格块一旦读不到，就会先落到中栏的
+        ``#corePriceDisplay_desktop_feature_div`` 上拿到这种值，两条引擎还各错各的。
+        行内读不到就给 N/A，不猜。同理也不带 ``#apex_desktop`` 整块兜底（原价那边
+        只在没选中会员价行时带）：较早的单中栏形状里那一份价格块是主推 offer 的
+        —— 会员价被选中时它就是会员价。
+        """
+        rid = self._accordion_selected_row(tree)
+        if not self._is_member_price_row(rid):
+            return None
+        new = self._accordion_new_row(tree)
+        if not new:
+            return []
+        return [(f"#{new}", f'//*[@id="{new}"]')]
+
+    def _accordion_offer_scopes(self, tree) -> Optional[List[Tuple[str, str]]]:
+        """accordion buybox 上**下单那一行 offer** 的原价作用域 ``[(css, xpath), ...]``。
+
+        行用 ``_accordion_purchase_row``：选中行；选中的是会员价行时换成全新行
+        newAccordionRow_N —— 与现价 / buybox 价同一行（``_member_price_scopes``）。
+
+        * 不是 accordion 布局 -> ``None``：调用方照旧全页取（行为与原来逐字节一致）。
+        * 是 accordion 但认不出行 -> ``[]``：调用方必须给 N/A，**不许回落全页**
+          —— 回落就是这个 bug 本身。会员价行被选中却没有全新行也是 ``[]``。
+        * 没有展开行时退到全新行（newAccordionRow_N）：页面主推的就是它。
+        * 中栏**没有任何**分行价格块（``apex_desktop_*AccordionRow``）时，再加上
+          整个 ``#apex_desktop``：那是较早的 accordion 形状 —— buybox 分行、中栏
+          只有一份价格块，而那一份就是主推 offer 的。语料里 12 张 accordion 页
+          全是分行形状，走不到这里；不加的话这种页上中栏真实的 List / Was 价
+          会被丢成 N/A（基线是取得到的）。分行块存在时不加：整块里还套着
+          二手行，加了就又是这个 bug。选中会员价行时也不加：那时主推的是会员价，
+          中栏那一份就是会员价的（同 ``_member_price_scopes`` 不带它的理由）。
+
+        会员价行被选中时**原价读全新行**（用户口径 2026-10-14：原价跟现价同一行，
+        那一行没有划线价就是 N/A）。原来读会员价行，可那一行的 List / Typical 是
+        相对会员价标的，配上全新行的普通价就成了 原价 ≤ 现价：美国站 B0D12731YT
+        List $34.99 / 现价 $35.99、B0DGLHZBJR $47.99 = $47.99、B0FFGFT343 Typical
+        $46.99 / $49.99 —— 这三张页的全新行自己没有划线价，现在是 N/A。
+        B0F3CQT8G5 的全新行自己标了 List $99.99（中栏 apex_desktop_newAccordionRow），
+        结果不变。
+
+        已知未覆盖：现价只在「选中会员价行」时改行，卖家仍取页面上第一个。假如某页
+        选中的是**二手行**（语料 66 张里没有一张是），原价会是二手行的
+        "New condition price"、现价却是全新行的价格，又成了 原价 = 现价 ——
+        根子在现价不分行，归那几个字段的修复去管，不在这里压掉划线价。
+        """
+        rid = self._accordion_purchase_row(tree)
+        if rid is None:
+            return None
+        if not rid:
+            return []
+        base = re.sub(r"_\d+$", "", rid)
+        # 先中栏价格块（划线价实际都在这里），再 buybox 行本身（行内也有一份
+        # #corePrice_feature_div）。两处都属于同一个 offer。
+        scopes = [(f"#apex_desktop_{base}", f'//*[@id="apex_desktop_{base}"]'),
+                  (f"#{rid}", f'//*[@id="{rid}"]')]
+        if (not self._uni_first_attr(
+                tree, '[id^="apex_desktop_"][id*="AccordionRow"]',
+                '//*[starts-with(@id, "apex_desktop_") and contains(@id, "AccordionRow")]/@id',
+                'id')
+                and not self._is_member_price_row(self._accordion_selected_row(tree))):
+            scopes.append(("#apex_desktop", '//*[@id="apex_desktop"]'))
+        return scopes
+
     def _slx_parse_original_price(self, tree) -> str:
         try:
-            for container in ['#corePrice_feature_div', '#corePriceDisplay_desktop_feature_div', '#price']:
-                node = tree.css_first(f'{container} span[data-a-strike="true"] span.a-offscreen')
-                if node:
-                    return node.text(strip=True)
+            # accordion 只读下单那一行（会员价行被选中时是全新行，与现价同一行；
+            # 见 _accordion_offer_scopes）。非 accordion：前缀为空，选择器与原来逐字节相同。
+            scopes = self._accordion_offer_scopes(tree)
+            prefixes = [""] if scopes is None else [css + " " for css, _ in scopes]
+            for prefix in prefixes:
+                for container in ['#corePrice_feature_div', '#corePriceDisplay_desktop_feature_div', '#price']:
+                    node = tree.css_first(f'{prefix}{container} span[data-a-strike="true"] span.a-offscreen')
+                    if node:
+                        return node.text(strip=True)
         except Exception:
             pass
         return "N/A"
@@ -969,7 +1247,16 @@ class AmazonParser:
     def _slx_parse_buybox_shipping(self, tree, current_price: Optional[str],
                                    spec=None) -> str:
         try:
-            delivery_nodes = tree.css('div#deliveryBlockMessage *')
+            # accordion：每一行 offer 各有一份 #deliveryBlockMessage（id 重复）。
+            # 原来把**所有行**的文案拼成一段再判，并取**全页第一个**
+            # data-csa-c-delivery-price —— 选中行不排第一（二手行被选中）时读到的是
+            # 别的行的运费。只读普通买家下单的那一行（_accordion_purchase_row）；
+            # 认不出行给 N/A。非 accordion：前缀为空，选择器与原来逐字节相同。
+            row = self._accordion_purchase_row(tree)
+            if row == "":
+                return "N/A"
+            scope = "" if row is None else f"#{row} "
+            delivery_nodes = tree.css(f'{scope}div#deliveryBlockMessage *')
             delivery_block = " ".join(n.text(strip=True) for n in delivery_nodes if n.text(strip=True))
 
             # Prime 免费配送
@@ -994,13 +1281,13 @@ class AmazonParser:
                 return "N/A"
 
             # data-csa-c-delivery-price 属性
-            dp_node = tree.css_first('span[data-csa-c-delivery-price]')
+            dp_node = tree.css_first(f'{scope}span[data-csa-c-delivery-price]')
             if dp_node:
                 dp = dp_node.attributes.get('data-csa-c-delivery-price', '')
                 if dp:
                     return dp.strip()
 
-            # 兜底
+            # 兜底（2026-10 的 66 张真实页上都没有这个节点，不属于 accordion 的行结构，照旧全页取）
             shipping = self._slx_text(tree, [
                 'div#mir-layout-loaded-comparison-row-2 span',
             ])
@@ -1165,11 +1452,21 @@ class AmazonParser:
 
     def _slx_parse_delivery(self, tree) -> Tuple[str, str]:
         try:
+            # 语义不变：报**能看到的最快**配送（含 Prime 会员专享，见 _pick_delivery），
+            # 只是在 accordion 页上把「能看到」收窄到普通买家下单的那一行
+            # （_accordion_purchase_row）。原来全页取最快，未选中的二手行更快时
+            # 就报了二手行的日期（CA B0CG19X7RN：选中行 October 16，导出 October 12；
+            # 用户实测 US B0CQWZR6L8：二手行 Prime「Tomorrow」入库）。
+            # 认不出行给 N/A；非 accordion：前缀为空，选择器与原来逐字节相同。
+            row = self._accordion_purchase_row(tree)
+            if row == "":
+                return "N/A", "N/A"
+            scope = "" if row is None else f"#{row} "
             # 优先直接读 data-csa-c-delivery-time 属性（权威、格式稳定 "Weekday, Month Day"），
             # 比抓子元素文本鲁棒：有的模板日期是属性所在 span 的直接文本节点，
             # 旧的 '[attr] *' 选择器抓不到任何子元素 → 返回 N/A。
             candidates: List[str] = []
-            for n in tree.css('[data-csa-c-delivery-time]'):
+            for n in tree.css(f'{scope}[data-csa-c-delivery-time]'):
                 raw = (n.attributes.get('data-csa-c-delivery-time') or "").strip()
                 if raw:
                     candidates.append(raw)
@@ -1177,8 +1474,8 @@ class AmazonParser:
             # 回退：页面不带该属性时，用整段配送文本 + 正则（覆盖老/异形模板）。
             if not candidates:
                 texts = []
-                for n in tree.css('[data-csa-c-delivery-time] *, div.delivery-message *, '
-                                  'div#deliveryBlockMessage *'):
+                for n in tree.css(f'{scope}[data-csa-c-delivery-time] *, {scope}div.delivery-message *, '
+                                  f'{scope}div#deliveryBlockMessage *'):
                     t = n.text(strip=True)
                     if t:
                         texts.append(t)
@@ -1239,7 +1536,8 @@ class AmazonParser:
             for b in bullets:
                 if len(b) < 2:
                     continue
-                if any(spam in b.lower() for spam in self.BULLET_BLACKLIST):
+                # 模板句判据见 _is_bullet_boilerplate（不再是"含词即删"）
+                if self._is_bullet_boilerplate(b):
                     continue
                 clean.append(b)
 
@@ -1329,6 +1627,81 @@ class AmazonParser:
         except Exception:
             return ""
 
+    # ---- 图片：colorImages.initial 逐张取 ----
+    #
+    # 原实现是对整段 script 跑两条正则：
+    #     re.findall('"hiRes":"(https://...)"') or re.findall('"large":"(https://...)"')
+    # 第一条**跳过** ``"hiRes":null`` 的条目，而第二条只在"一张 hiRes 都没有"时
+    # 才整体启用 —— 不是逐张兜底。于是只要某一张原图不够大（Amazon 不给 hiRes），
+    # 它就从列表里**整张消失**。2026-10 抽查实测两例：
+    #   B09Y3DKJKQ  MAIN 图 4104axN68uL 只有 500x500，hiRes=null —— **主图**丢了，
+    #               列表第 1 张变成了 PT01，"首图即主图"的约定也破了；
+    #   B0FFGFT343  第 9 张 PT08 51E41zXXguL 只有 714x401，hiRes=null。
+    #
+    # 页面上 initial 的写法（66 张美 / 加页面全部是这一种）：
+    #     'colorImages': { 'initial': A.$.parseJSON('[{"hiRes":null,"large":"...","main":{...},...}, ...]')
+    # 条目键：hiRes / large / main{url: [w, h]} / thumb / variant / altText ...
+    _COLOR_IMAGES_INITIAL_RE = re.compile(
+        r"""['"]colorImages['"]\s*:\s*\{\s*['"]initial['"]\s*:\s*(A\.\$\.parseJSON\(\s*')?(?=\[)""")
+
+    @classmethod
+    def _color_images_initial(cls, script: str) -> Optional[List[str]]:
+        """colorImages.initial 逐张取 ``hiRes or large or main 里面积最大的那张``，保序。
+
+        结构认不出来（没有 initial、JSON 解析失败、一张都取不到）返回 ``None``，
+        由调用方退回原来的整段正则 —— 认不出来的页面行为与改动前一致。
+        """
+        m = cls._COLOR_IMAGES_INITIAL_RE.search(script)
+        if not m:
+            return None
+        start = m.end()
+        try:
+            if m.group(1):
+                # parseJSON('...')：数组在一个**单引号 JS 字符串**里。字符串到第一个
+                # 未转义的 ' 结束（altText 里的撇号会写成 \'，所以不能按括号配平：
+                # JSON 串里的 \" 在 JS 源码里是 \\"，配平扫描会把它当成串结束）。
+                i, n = start, len(script)
+                while i < n and script[i] != "'":
+                    i += 2 if script[i] == "\\" else 1
+                # 只还原 JS 层的两种转义：\' -> '、\\ -> \。其余（\" \n \/ \uXXXX）
+                # 本来就是合法的 JSON 转义，原样交给 json.loads。
+                payload = re.sub(r"\\(['\\])", r"\1", script[start:i])
+                entries = json.loads(payload)
+            else:
+                # 直接是数组字面量：JSONDecoder.raw_decode 只吃一个值，后面的 JS 不管。
+                entries, _ = json.JSONDecoder().raw_decode(script, start)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(entries, list):
+            return None
+
+        def _area(wh) -> int:
+            try:
+                return int(wh[0]) * int(wh[1])
+            except (TypeError, ValueError, IndexError, KeyError):
+                return 0
+
+        urls = []
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            url = None
+            for key in ("hiRes", "large"):
+                v = e.get(key)
+                if isinstance(v, str) and v.startswith("https://"):
+                    url = v
+                    break
+            if url is None and isinstance(e.get("main"), dict):
+                cands = [(u, _area(wh)) for u, wh in e["main"].items()
+                         if isinstance(u, str) and u.startswith("https://")]
+                if cands:
+                    # max 取第一个最大值：同面积时保留页面上的先后
+                    url = max(cands, key=lambda c: c[1])[0]
+            if url:
+                urls.append(url)
+        # 保序去重：首图（页面第 1 张，即 MAIN）始终排在第 1 位
+        return list(dict.fromkeys(urls)) or None
+
     def _slx_parse_images(self, tree, html_text: str) -> str:
         try:
             img_urls = []
@@ -1336,6 +1709,10 @@ class AmazonParser:
             for script in scripts:
                 text = script.text(strip=True)
                 if text and "colorImages" in text:
+                    per_image = self._color_images_initial(text)
+                    if per_image is not None:
+                        img_urls = per_image
+                        break
                     urls = re.findall(r'"hiRes":"(https://[^"]+)"', text) or \
                            re.findall(r'"large":"(https://[^"]+)"', text)
                     # 保序去重：dict.fromkeys 在 Python 3.7+ 保留插入顺序，
@@ -1404,16 +1781,20 @@ class AmazonParser:
                     #   无分隔符拼接会把相邻元素的文字粘在一起，实测产出
                     #   "#48 inDesks & Workstations"（in 和类目名之间没有空格）。
                     #   这条**两个站点都有**，只是 BSR 这种多元素的值才看得出来。
+                    # ⚠ 而带分隔符取又有反作用：td 里 span 两侧的缩进文本节点 strip 成
+                    #   空串后仍各贡献一个分隔符 -> ' MoKitDora '。所以取完一律过
+                    #   _squash_ws（首尾去掉、中间连续空白并成一个空格），三个分支都要：
+                    #   这里的值喂给 _map_detail，型号 / 制造商 / 重量 / 尺寸 / 品牌全从这走。
                     if th and tds:
                         k = th.text(strip=True)
-                        v = tds[0].text(separator=" ", strip=True)
+                        v = self._squash_ws(tds[0].text(separator=" ", strip=True))
                         if k and v:
                             self._map_detail(d, k, v)
                     elif len(tds) >= 2:
                         # 两列 td 布局：第一列通常是加粗的 key（a-text-bold）
                         key_span = tds[0].css_first('span.a-text-bold') or tds[0]
                         k = key_span.text(strip=True)
-                        v = tds[1].text(separator=" ", strip=True)
+                        v = self._squash_ws(tds[1].text(separator=" ", strip=True))
                         if k and v and len(k) <= 50:
                             self._map_detail(d, k, v)
                 except Exception:
@@ -1429,7 +1810,7 @@ class AmazonParser:
                         spans = parent.css('span')
                         for i, sp in enumerate(spans):
                             if sp.text(strip=True) == k and i + 1 < len(spans):
-                                v = spans[i + 1].text(separator=" ", strip=True)
+                                v = self._squash_ws(spans[i + 1].text(separator=" ", strip=True))
                                 # F-012 实测修复：**大类排名**。
                                 #
                                 # BSR 那一行的结构是嵌套的，一个商品有多个排名：
@@ -1876,8 +2257,12 @@ class AmazonParser:
             seller_id = m.group(1) if m else ""
             if seller_id and name:
                 return seller_id, name
-            if name:  # 拿到名字但没拿到 ID（极罕见）
-                return "N/A", name
+            if name:
+                # 拿到名字但链接里没有 seller=。不罕见：Warehouse Deals / Amazon
+                # Resale 的二手 buybox，卖家链接指向的是类目节点（实测 CA
+                # B0GKNHN7Q5：`href="/b?node=8929975011"`），所有走 Warehouse 的
+                # 二手行都会是这个形状。ID 其实就在同一张加购表单的 hidden input 里。
+                return (self._seller_link_form_merchant_id(tree) or "N/A"), name
 
         # 2) 备选：任意带 seller= 的链接（href 路径变化时兜底）
         for css, xp in (
@@ -1957,6 +2342,46 @@ class AmazonParser:
 
         return "N/A", "N/A"
 
+    #: 加购表单里装卖家 ID 的 hidden input，按优先级。`usedMerchantID` 是二手
+    #: offer 表单里的那一份（实测与 merchantID 同值，留着兜底）。
+    _FORM_MERCHANT_INPUTS = ("merchantID", "usedMerchantID")
+
+    def _seller_link_form_merchant_id(self, tree) -> Optional[str]:
+        """卖家档案链接**所在那张表单**里的 merchantID；取不到返回 None。
+
+        ⚠ 必须是"链接所在的那张"，不能是全页第一个 ``form#addToCart``：
+          accordion buybox 每一行 offer 各有一张 ``form#addToCart``（id 重复），
+          全新行和二手行的 merchantID 不同（实测 CA B09Y3DKJKQ：全新行
+          ADUC3URPUSR5N、二手行 AUJBRIGYRJ3Q8）。取错表单就是把 A 的 ID 配上
+          B 的名字 —— 比 N/A 更糟。链接不在任何表单里时宁可不填。
+
+        空值（无推荐报价页上是 ``value=""``）与非 ID 形状的值一律不收，
+        判据与 ``seller=`` 那条正则同一个字符集。
+        """
+        try:
+            if self._is_slx(tree):
+                node = tree.css_first('a#sellerProfileTriggerId')
+                form = node.parent if node is not None else None
+                while form is not None and form.tag != "form":
+                    form = form.parent
+                if form is None:
+                    return None
+                for inp in self._FORM_MERCHANT_INPUTS:
+                    for el in form.css(f'input#{inp}'):
+                        val = (el.attributes.get("value") or "").strip()
+                        if re.fullmatch(r"[A-Z0-9]+", val):
+                            return val
+                return None
+            for inp in self._FORM_MERCHANT_INPUTS:
+                for v in tree.xpath('(//a[@id="sellerProfileTriggerId"])[1]'
+                                    f'/ancestor::form[1]//input[@id="{inp}"]/@value'):
+                    val = str(v).strip()
+                    if re.fullmatch(r"[A-Z0-9]+", val):
+                        return val
+        except Exception:
+            pass
+        return None
+
     def _slx_parse_price_enhanced(self, tree, jsonld: dict, sp_data: dict,
                                   spec=None) -> str:
         """增强价格解析：CSS → JSON-LD → JS脚本数据"""
@@ -2026,10 +2451,36 @@ class AmazonParser:
 
         return ""
 
+    @staticmethod
+    def _aod_offer_max_qty(container) -> Optional[int]:
+        """AOD 单个 offer 的 maxQty（正整数）；取不到返回 None，**不猜**。
+
+        值在加购按钮的 ``data-aod-atc-action`` 属性里，是一段 JSON：
+        ``{"maxQty":3,"offerIndex":1,"minQty":1,...}``。JSON 解不开时退一步用
+        正则抠同一个键，仍拿不到就算了 —— 读不到时填什么由调用方决定。
+        """
+        try:
+            node = container.css_first('[data-aod-atc-action]')
+            raw = (node.attributes.get('data-aod-atc-action') or '') if node is not None else ''
+            if not raw:
+                return None
+            try:
+                val = json.loads(raw).get('maxQty')
+            except (ValueError, AttributeError):
+                m = re.search(r'"maxQty"\s*:\s*(\d+)', raw)
+                val = m.group(1) if m else None
+            if isinstance(val, bool):
+                return None
+            n = int(val)
+            return n if n > 0 else None
+        except (TypeError, ValueError, AttributeError):
+            return None
+
     def parse_offer_listing(self, html_text: str, spec=None) -> Optional[Dict[str, Any]]:
         """v3: 解析 /gp/offer-listing/{ASIN} 页面，提取第一个 offer 完整信息
         限定在 #aod-offer / #aod-offer-list 区域内，避免提取到推荐产品的价格
-        返回: {'price','shipping','delivery','seller','ships_from','is_fba'} 或 None
+        返回: {'price','shipping','delivery','seller','seller_id','ships_from',
+               'is_fba','max_qty'} 或 None；取不到的键不出现（seller_id / max_qty 同理）。
         """
         if not html_text or "validateCaptcha" in html_text:
             return None
@@ -2039,16 +2490,31 @@ class AmazonParser:
             if not tree:
                 return None
 
-            # 在 #aod-offer / #aod-offer-list / #aod-pinned-offer 区域内搜索
+            # 在 #aod-pinned-offer / #aod-offer / #aod-offer-list 区域内搜索
             # 这些是 Amazon AOD (All Offers Display) 的标准容器
-            offer_containers = ['#aod-pinned-offer', '#aod-offer', '#aod-offer-list']
+            #
+            # 候选是**单个报价节点**：pinned 一个，再按顺序逐个 #aod-offer（id 重复，
+            # 每个报价一个）。下面所有字段都只在同一个节点里读 —— 原来第一个
+            # #aod-offer 没价格时退到整个 #aod-offer-list，价格取到的是第二个报价的，
+            # 卖家 / 运费 / maxQty 的 css_first 却仍落在第一个报价上，一行里拼进
+            # 两个卖家。整个列表只在页面上一个 #aod-offer 都没有时才当候选
+            # （认不出单个报价的版式，保留原来的兜底）。
+            # 真实响应里第一个 #aod-offer 都有价格，结果与原来逐字段相同。
+            candidates = []
+            pinned = tree.css_first('#aod-pinned-offer')
+            if pinned is not None:
+                candidates.append(pinned)
+            offers = tree.css('#aod-offer')
+            candidates.extend(offers)
+            if not offers:
+                offer_list = tree.css_first('#aod-offer-list')
+                if offer_list is not None:
+                    candidates.append(offer_list)
 
             best_offer = {}
 
-            for container_sel in offer_containers:
-                container = tree.css_first(container_sel)
-                if not container:
-                    continue
+            for container in candidates:
+                best_offer = {}
 
                 # 价格：先试 a-offscreen，再试 whole+fraction
                 price_found = False
@@ -2122,6 +2588,26 @@ class AmazonParser:
                     seller_node = container.css_first('#aod-offer-soldBy a')
                 if seller_node:
                     best_offer['seller'] = seller_node.text(strip=True)
+                    # 卖家 ID 就在同一个链接的 href 里
+                    # （/gp/aag/main?...&seller=A15CBTP5BTSNTZ&...），判据同 _parse_seller。
+                    sid = re.search(r"seller=([A-Z0-9]+)",
+                                    seller_node.attributes.get('href') or '')
+                    if sid:
+                        best_offer['seller_id'] = sid.group(1)
+
+                # 可购数量上限：本 offer 加购按钮上的 data-aod-atc-action JSON 里的 maxQty。
+                #
+                # 为什么是 maxQty 而不是数量下拉：两份能对照的真实样本里，同一个卖家
+                # 在商品页 select#quantity 的最大项（正常路径的 stock_count 就取它）
+                # 与 AOD 的 maxQty **相等**，而 AOD 静态 HTML 的下拉恒比它少 1：
+                #   CA B0CQWZR6L8  商品页下拉 1..24  AOD maxQty 24  AOD 下拉 1..23
+                #   CA B0DJ231D92  商品页下拉 1..5   AOD maxQty 5   AOD 下拉 1..4
+                # （12 份真实 AOD 响应里 32 个带价格的 offer 全都有 maxQty，
+                #   下拉也全都是 maxQty - 1。）
+                # 取下拉会让同一个 offer 走兜底路径比走正常路径少报 1 件。
+                max_qty = self._aod_offer_max_qty(container)
+                if max_qty:
+                    best_offer['max_qty'] = max_qty
 
                 # Ships from → FBA/FBM 判断
                 ships_node = container.css_first('#aod-offer-shipsFrom .a-color-base')
@@ -2930,6 +3416,11 @@ class AmazonParser:
 
     def _parse_current_price(self, tree, spec=None) -> str:
         try:
+            # 作用域口径同 _slx_parse_current_price（会员价行被选中时只读全新行）。
+            scopes = self._member_price_scopes(tree)
+            if scopes == []:
+                return "N/A"
+            prefixes = [""] if scopes is None else [xp for _, xp in scopes]
             # 限定到价格容器内（避免全页匹配 a-offscreen）
             price_xpaths = [
                 '//*[@id="corePrice_feature_div"]//span[@class="a-offscreen"]/text()',
@@ -2940,7 +3431,7 @@ class AmazonParser:
                 '//*[@id="priceToPay"]//span[@class="a-offscreen"]/text()',
                 '//*[@id="apex_offerDisplay_desktop"]//span[@class="a-offscreen"]/text()',
             ]
-            for xp in price_xpaths:
+            for xp in [pre + x for x in price_xpaths for pre in prefixes]:
                 vals = tree.xpath(xp)
                 for v in vals:
                     # F-012：口径与 selectolax 孪生实现 _slx_parse_current_price
@@ -2950,19 +3441,25 @@ class AmazonParser:
             # fallback: 拆分整数+小数（限定到价格容器）
             for container_id in ['corePrice_feature_div', 'corePriceDisplay_desktop_feature_div',
                                  'price', 'apex_offerDisplay_desktop']:
-                whole = tree.xpath(f'//*[@id="{container_id}"]//span[@class="a-price-whole"]/text()')
-                frac = tree.xpath(f'//*[@id="{container_id}"]//span[@class="a-price-fraction"]/text()')
-                if whole and frac:
-                    w = whole[0].strip().replace('.', '')
-                    f = frac[0].strip()
-                    if w and f:
-                        return f"{_sym(spec)}{w}.{f}"
+                for pre in prefixes:
+                    whole = tree.xpath(f'{pre}//*[@id="{container_id}"]//span[@class="a-price-whole"]/text()')
+                    frac = tree.xpath(f'{pre}//*[@id="{container_id}"]//span[@class="a-price-fraction"]/text()')
+                    if whole and frac:
+                        w = whole[0].strip().replace('.', '')
+                        f = frac[0].strip()
+                        if w and f:
+                            return f"{_sym(spec)}{w}.{f}"
             # 全局 fallback 已移除，避免匹配推荐区域价格
         except Exception:
             pass
         return "N/A"
 
     def _parse_buybox_price(self, tree) -> Optional[str]:
+        # 作用域口径同 _slx_parse_buybox_price。
+        scopes = self._member_price_scopes(tree)
+        if scopes == []:
+            return None
+        prefixes = [""] if scopes is None else [xp for _, xp in scopes]
         xpaths = [
             '//*[@id="tabular-buybox"]//span[@class="a-offscreen"]/text()',
             '//*[@id="buybox"]//span[@class="a-offscreen"]/text()',
@@ -2973,7 +3470,7 @@ class AmazonParser:
             '//*[@id="corePriceDisplay_desktop_feature_div"]//span[@class="a-offscreen"]/text()',
             '//*[@id="apex_offerDisplay_desktop"]//span[@class="a-offscreen"]/text()',
         ]
-        for xp in xpaths:
+        for xp in [pre + x for x in xpaths for pre in prefixes]:
             try:
                 vals = tree.xpath(xp)
                 for v in vals:
@@ -2985,10 +3482,15 @@ class AmazonParser:
 
     def _parse_original_price(self, tree) -> str:
         try:
-            for container_id in ['corePrice_feature_div', 'corePriceDisplay_desktop_feature_div', 'price']:
-                orig = tree.xpath(f'//*[@id="{container_id}"]//span[@data-a-strike="true"]//span[@class="a-offscreen"]/text()')
-                if orig:
-                    return orig[0].strip()
+            # 作用域口径同 _slx_parse_original_price（accordion 只读下单那一行，
+            # 见 _accordion_offer_scopes）。
+            scopes = self._accordion_offer_scopes(tree)
+            prefixes = [""] if scopes is None else [xp for _, xp in scopes]
+            for prefix in prefixes:
+                for container_id in ['corePrice_feature_div', 'corePriceDisplay_desktop_feature_div', 'price']:
+                    orig = tree.xpath(f'{prefix}//*[@id="{container_id}"]//span[@data-a-strike="true"]//span[@class="a-offscreen"]/text()')
+                    if orig:
+                        return orig[0].strip()
         except Exception:
             pass
         return "N/A"
@@ -2996,7 +3498,12 @@ class AmazonParser:
     def _parse_buybox_shipping(self, tree, current_price: Optional[str],
                                spec=None) -> str:
         try:
-            delivery_texts = self._get_all_text(tree, '//div[@id="deliveryBlockMessage"]//text()')
+            # 作用域口径同 _slx_parse_buybox_shipping（accordion 只读下单那一行）。
+            row = self._accordion_purchase_row(tree)
+            if row == "":
+                return "N/A"
+            scope = "" if row is None else f'//*[@id="{row}"]'
+            delivery_texts = self._get_all_text(tree, f'{scope}//div[@id="deliveryBlockMessage"]//text()')
             delivery_block = " ".join(delivery_texts)
 
             if "prime members get free delivery" in delivery_block.lower():
@@ -3018,7 +3525,7 @@ class AmazonParser:
                             return "FREE"
                 return "N/A"
 
-            dp = tree.xpath('//span[@data-csa-c-delivery-price]/@data-csa-c-delivery-price')
+            dp = tree.xpath(f'{scope}//span[@data-csa-c-delivery-price]/@data-csa-c-delivery-price')
             if dp:
                 return dp[0].strip()
 
@@ -3099,19 +3606,23 @@ class AmazonParser:
 
     def _parse_delivery(self, tree) -> Tuple[str, str]:
         try:
-            # 与 selectolax 路径一致：优先直接读 data-csa-c-delivery-time 属性值；
-            # 无属性时回退整段配送文本。
+            # 与 selectolax 路径一致：accordion 只读下单那一行（认不出给 N/A）；
+            # 优先直接读 data-csa-c-delivery-time 属性值；无属性时回退整段配送文本。
+            row = self._accordion_purchase_row(tree)
+            if row == "":
+                return "N/A", "N/A"
+            scope = "" if row is None else f'//*[@id="{row}"]'
             candidates: List[str] = []
-            for el in tree.xpath('//*[@data-csa-c-delivery-time]'):
+            for el in tree.xpath(f'{scope}//*[@data-csa-c-delivery-time]'):
                 raw = (el.get('data-csa-c-delivery-time') or "").strip()
                 if raw:
                     candidates.append(raw)
 
             if not candidates:
                 texts = self._get_all_text(tree,
-                    '//*[@data-csa-c-delivery-time]//text() | '
-                    '//div[contains(@class,"delivery-message")]//text() | '
-                    '//div[@id="deliveryBlockMessage"]//text()')
+                    f'{scope}//*[@data-csa-c-delivery-time]//text() | '
+                    f'{scope}//div[contains(@class,"delivery-message")]//text() | '
+                    f'{scope}//div[@id="deliveryBlockMessage"]//text()')
                 if texts:
                     candidates.append(" ".join(texts))
 
@@ -3155,7 +3666,8 @@ class AmazonParser:
                 txt = b.strip()
                 if not txt or len(txt) < 2:
                     continue
-                if any(spam in txt.lower() for spam in self.BULLET_BLACKLIST):
+                # 与 selectolax 孪生实现同一个判据（_is_bullet_boilerplate）
+                if self._is_bullet_boilerplate(txt):
                     continue
                 clean.append(txt)
 
@@ -3226,10 +3738,13 @@ class AmazonParser:
             scripts = self._get_all_text(tree, '//script[contains(text(), "colorImages")]/text()')
             if scripts:
                 script = scripts[0]
-                urls = re.findall(r'"hiRes":"(https://[^"]+)"', script) or \
-                       re.findall(r'"large":"(https://[^"]+)"', script)
-                # 保序去重：保持亚马逊页面图片原始顺序，主图排在第 1 位
-                img_urls = list(dict.fromkeys(urls))
+                # 逐张取，理由见 _color_images_initial；认不出结构才退回整段正则
+                img_urls = self._color_images_initial(script)
+                if img_urls is None:
+                    urls = re.findall(r'"hiRes":"(https://[^"]+)"', script) or \
+                           re.findall(r'"large":"(https://[^"]+)"', script)
+                    # 保序去重：保持亚马逊页面图片原始顺序，主图排在第 1 位
+                    img_urls = list(dict.fromkeys(urls))
             else:
                 img_urls = tree.xpath('//div[@id="imgTagWrapperId"]/img/@src')
             return "\n".join(img_urls)
@@ -3264,21 +3779,24 @@ class AmazonParser:
         """全页扫描：提取 Product Information 表格内容"""
         d = {}
         try:
+            # XPath 1.0 的 normalize-space 只认空格 / 制表 / 回车 / 换行，``&nbsp;``
+            # 解码出来的 \xa0 原样留下 —— 所以值再过一次 _squash_ws，与 selectolax
+            # 路径同一个口径（理由见 _squash_ws）。
             for row in tree.xpath('//th/../..//tr'):
                 try:
                     k_nodes = row.xpath('normalize-space(./th)')
-                    v_nodes = row.xpath('normalize-space(./td)')
+                    v_nodes = self._squash_ws(str(row.xpath('normalize-space(./td)')))
                     if k_nodes and v_nodes:
-                        self._map_detail(d, str(k_nodes), str(v_nodes))
+                        self._map_detail(d, str(k_nodes), v_nodes)
                 except Exception:
                     continue
 
             for s in tree.xpath('//li/span/span[contains(@class, "a-text-bold")]'):
                 try:
                     k = s.xpath('normalize-space(./text())')
-                    v = s.xpath('normalize-space(./following-sibling::span)')
+                    v = self._squash_ws(str(s.xpath('normalize-space(./following-sibling::span)')))
                     if k and v:
-                        self._map_detail(d, str(k).replace(':', ''), str(v))
+                        self._map_detail(d, str(k).replace(':', ''), v)
                 except Exception:
                     continue
 
