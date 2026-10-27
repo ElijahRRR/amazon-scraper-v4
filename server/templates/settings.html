@@ -293,10 +293,24 @@
                             <input type="number" class="form-control" id="newSchedInterval" value="1" min="1" placeholder="1">
                             <small class="text-secondary">1=每天，2=每两天，以此类推</small>
                         </div>
+                        <div class="col-6">
+                            <label class="form-label">站点</label>
+                            {# 选项来自服务端站点注册表（pages.py），这里不写第二份站点表 #}
+                            <select id="newSchedMarketplace" class="form-select" autocomplete="off">
+                                {% for id, label, postal in marketplaces %}
+                                <option value="{{ id }}" data-postal="{{ postal }}"{{ ' selected' if id == default_marketplace }}>{{ label }}（{{ id }}）</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label">配送邮编（可选）</label>
+                            <input type="text" class="form-control" id="newSchedZip" autocomplete="off">
+                            <small class="text-secondary">留空则每次执行时用该站点的默认邮编</small>
+                        </div>
                         <div class="col-12">
                             <label class="form-label">ASIN 文件 <small class="text-secondary">(.xlsx / .csv / .txt)</small></label>
                             <input type="file" class="form-control" id="newSchedFile" accept=".xlsx,.csv,.txt">
-                            <small class="text-secondary">留空则使用主库全部 ASIN</small>
+                            <small class="text-secondary">留空则使用所选站点主库的全部 ASIN</small>
                         </div>
                         <div class="col-12">
                             <div class="form-check">
@@ -411,6 +425,17 @@ async function resetDefaults() {
 // 定时采集管理
 let _schedules = [];
 
+// F-012 blocker 3：站点名 / 默认邮编只读上面那个由服务端注册表渲染的下拉，不另写一份。
+const DEFAULT_MKT = {{ default_marketplace|tojson }};
+const SCHED_SITES = Object.fromEntries([...document.getElementById('newSchedMarketplace').options]
+    .map(o => [o.value, {label: o.textContent, postal: o.dataset.postal}]));
+function syncSchedZipPlaceholder() {
+    const site = SCHED_SITES[document.getElementById('newSchedMarketplace').value];
+    document.getElementById('newSchedZip').placeholder = site ? site.postal : '';
+}
+document.getElementById('newSchedMarketplace').addEventListener('change', syncSchedZipPlaceholder);
+syncSchedZipPlaceholder();
+
 async function loadSchedules() {
     try {
         const resp = await fetch('/api/schedules');
@@ -436,6 +461,10 @@ function renderSchedules() {
         const id = esc(s.id);
         const intervalText = s.interval_days === 1 ? '每天' : `每 ${s.interval_days} 天`;
         const asinText = s.source_file ? `${s.asin_count || '?'} ASINs` : '全库';
+        // 只有非美国站才显示站点：老定时任务没有 marketplace 键，就是美国站
+        const mkt = s.marketplace || DEFAULT_MKT;
+        const siteText = (mkt !== DEFAULT_MKT ? ` | ${esc((SCHED_SITES[mkt] || {}).label || mkt)}` : '')
+            + (s.zip_code ? ` | 邮编 ${esc(s.zip_code)}` : '');
         const statusText = s.last_run_date ? `上次: ${s.last_run_date}` : '未运行';
         const enabledClass = s.enabled ? 'text-success' : 'text-secondary';
         const enabledIcon = s.enabled ? 'bi-check-circle-fill' : 'bi-pause-circle';
@@ -446,7 +475,7 @@ function renderSchedules() {
             </button>
             <div style="flex:1; min-width:0;">
                 <div class="text-truncate"><strong>${esc(s.name)}</strong></div>
-                <small class="text-secondary">${s.time} | ${intervalText} | ${asinText} | ${statusText}</small>
+                <small class="text-secondary">${s.time} | ${intervalText} | ${asinText}${siteText} | ${statusText}</small>
             </div>
             <button class="btn btn-sm btn-outline-accent" onclick="runScheduleNow('${id}')" title="立即执行">
                 <i class="bi bi-play-fill"></i>
@@ -528,6 +557,12 @@ async function submitNewSchedule() {
     fd.append('time', timeStr);
     fd.append('interval_days', interval);
     fd.append('needs_screenshot', screenshot ? 'true' : 'false');
+    // 美国站不发：服务端只在收到时才往定时任务里存 marketplace 键，不发则存下来的
+    // dict（及 GET /api/schedules、runtime_settings.json）与改造前逐字节一致
+    const schedMkt = document.getElementById('newSchedMarketplace').value;
+    if (schedMkt !== DEFAULT_MKT) fd.append('marketplace', schedMkt);
+    const schedZip = document.getElementById('newSchedZip').value.trim();
+    if (schedZip) fd.append('zip_code', schedZip);   // 不填 = 每次执行时取该站点默认
     if (hasFile) fd.append('file', fileInput.files[0]);
 
     try {
@@ -592,7 +627,11 @@ async function runScheduleNow(schedId) {
 function showScheduleMsg(type, msg) {
     const div = document.getElementById('scheduleResult');
     div.style.display = 'block';
-    div.innerHTML = `<div class="alert alert-${type} py-1">${msg}</div>`;
+    // textContent 而不是拼 innerHTML：服务端的 400 原文会回显用户填的邮编 / 站点
+    const alertDiv = document.createElement('div');
+    alertDiv.className = `alert alert-${type} py-1`;
+    alertDiv.textContent = msg;
+    div.replaceChildren(alertDiv);
     setTimeout(() => { div.style.display = 'none'; }, 3000);
 }
 

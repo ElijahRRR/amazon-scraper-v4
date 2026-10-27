@@ -89,6 +89,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from common import config
 from common.core.searchurl import normalize_keyword
+from common.core import marketplace as _marketplace
+from common.core.dbtables import (
+    SCREENSHOT_TASK_SITE_REJECTED_SQL,
+    task_marketplace_sql,
+)
 from common.pgdb._shared import _normalize_screenshot_path
 
 logger = logging.getLogger(__name__)
@@ -119,17 +124,30 @@ class MediaMixin:
                 return 0
             ss = bool(brow["needs_screenshot"])
             # 继承本批已有任务的 zip（同族应同邮编）
+            #
+            # F-012：站点与邮编取自**同一条**任务行，两者因此必然是合法的一对。
+            # 选行逻辑一个字没改（同一个 WHERE、同一个 LIMIT 1，只多取一列），
+            # 美国批次继承到的邮编不可能因此变。
+            # 改之前：加拿大批次展开出来的兄弟任务是 (amazon.com, 'M5V 3L9') ——
+            # worker 会拿加拿大邮编去 amazon.com 切地址，pull_tasks 那条「同邮编
+            # 必同站点」的前提（tasks.py）也被它破掉。
             async with rc.execute(
-                "SELECT zip_code FROM tasks WHERE batch_id=? LIMIT 1", (bid,)
+                "SELECT zip_code, marketplace FROM tasks WHERE batch_id=? LIMIT 1", (bid,)
             ) as c:
                 zrow = await c.fetchone()
             zip_code = (zrow["zip_code"] if zrow else None) or config.DEFAULT_ZIP_CODE
+            mkt = _marketplace.get(zrow["marketplace"] if zrow else None).id
             # 本批已采 ASIN 的同族列表（twister 洗干净的真家族）
+            #
+            # F-012：只读**同站点**的 asin_data。同一个 ASIN 两站各一行、家族也
+            # 各是各的：只按 asin 连的话，加拿大批次会把美国家族（只在美国卖的
+            # 兄弟款）整批入队到加拿大批次，美国批次也会吃进加拿大家族。
             async with rc.execute(
                 "SELECT d.variation_asins FROM asin_data d "
                 "JOIN batch_asins ba ON ba.asin = d.asin "
-                "WHERE ba.batch_id=? AND d.variation_asins IS NOT NULL AND d.variation_asins != ''",
-                (bid,)
+                "WHERE ba.batch_id=? AND d.marketplace=? "
+                "AND d.variation_asins IS NOT NULL AND d.variation_asins != ''",
+                (bid, self.text_affinity(mkt))
             ) as c:
                 fam_rows = await c.fetchall()
             # 本批已有 ASIN（去重基准）
@@ -158,14 +176,18 @@ class MediaMixin:
         if not candidates:
             return 0
         # 复用 create_tasks：ON CONFLICT DO NOTHING tasks + 维护 batch_asins + 截图任务，返回实际新增数
-        return await self.create_tasks(batch_id, sorted(candidates), zip_code, ss)
+        # F-012：站点显式传下去（is_new 也随之按这个站点判）。美国批次传的是
+        # 'amazon.com'，与原来不传（None -> amazon.com）落库值相同。
+        return await self.create_tasks(batch_id, sorted(candidates), zip_code, ss,
+                                       marketplace=mkt)
 
     # ==================== 卖家店铺采集（F-009）====================
 
     async def create_seller_batch(self, name: str, seller_ids: List[str],
                                   discover_mode: str = "with_detail",
                                   zip_code: str = "10001",
-                                  needs_screenshot: bool = False) -> Tuple[int, int]:
+                                  needs_screenshot: bool = False,
+                                  marketplace: str = None) -> Tuple[int, int]:
         """创建一个 seller_discovery 类型的批次，并为每个 seller_id 插入一个 discover_seller 任务。
 
         - 衍生的 ASIN 详情任务在 discover 任务完成时由 accept_seller_discovery_result 动态插入。
@@ -190,6 +212,8 @@ class MediaMixin:
         name_p = self.text_affinity(name)
         mode_p = self.text_affinity(discover_mode)
         zip_p = self.text_affinity(zip_code)
+        # F-012：不合法就抛，不静默回退（口径见 create_tasks）。
+        mkt_p = self.text_affinity(_marketplace.get(marketplace).id)
         async with self._write_lock:
             await self._db.execute("BEGIN")
             try:
@@ -212,11 +236,11 @@ class MediaMixin:
                 # unnest 的源行数 = 尝试插入次数，烧号与逐行 INSERT OR IGNORE 一致。
                 cursor = await self._db.execute(
                     "INSERT INTO tasks "
-                    "(batch_id, asin, zip_code, needs_screenshot, task_type) "
-                    "SELECT ?::bigint, u.asin, ?::text, 0, 'discover_seller' "
+                    "(batch_id, asin, zip_code, needs_screenshot, task_type, marketplace) "
+                    "SELECT ?::bigint, u.asin, ?::text, 0, 'discover_seller', ?::text "
                     "  FROM unnest(?::text[]) AS u(asin) "
                     "ON CONFLICT DO NOTHING",
-                    (batch_id, zip_p, clean_ids)
+                    (batch_id, zip_p, mkt_p, clean_ids)
                 )
                 inserted = cursor.rowcount
                 await self._db.execute("COMMIT")
@@ -305,11 +329,15 @@ class MediaMixin:
                 detail_inserted = 0
                 if discover_mode == "with_detail" and seen_asins:
                     # 取该 task 的 zip_code 复用
+                    # F-012：站点与邮编一样，从 discover 任务**继承**下来。
+                    # 漏了它，加拿大站发现出来的 ASIN 会被派成美国站详情任务。
                     async with self._db.execute(
-                        "SELECT zip_code FROM tasks WHERE id=?", (tid,)
+                        "SELECT zip_code, marketplace FROM tasks WHERE id=?", (tid,)
                     ) as c:
                         zrow = await c.fetchone()
                     zip_code = zrow["zip_code"] if zrow else "10001"
+                    mkt = zrow["marketplace"] if zrow else _marketplace.DEFAULT_MARKETPLACE
+                    mkt_p = self.text_affinity(mkt)
 
                     # total_changes 差值 → set-based INSERT + 命令标签。
                     # seen_asins 是 set，原版 executemany 也按 set 迭代序插入，
@@ -317,18 +345,21 @@ class MediaMixin:
                     detail_asins = list(seen_asins)
                     cursor = await self._db.execute(
                         "INSERT INTO tasks "
-                        "(batch_id, asin, zip_code, needs_screenshot, task_type) "
-                        "SELECT ?::bigint, u.asin, ?::text, ?::int, 'asin' "
+                        "(batch_id, asin, zip_code, needs_screenshot, task_type, "
+                        " marketplace) "
+                        "SELECT ?::bigint, u.asin, ?::text, ?::int, 'asin', ?::text "
                         "  FROM unnest(?::text[]) AS u(asin) "
                         "ON CONFLICT DO NOTHING",
-                        (bid, self.text_affinity(zip_code), ss_val, detail_asins)
+                        (bid, self.text_affinity(zip_code), ss_val, mkt_p, detail_asins)
                     )
                     detail_inserted = cursor.rowcount
 
                     # 维护 batch_asins 关联（is_new 判定参考 create_tasks）
                     for a in seen_asins:
+                        # F-012：按 (asin, marketplace) 判新旧，口径同 create_tasks。
                         async with self._db.execute(
-                            "SELECT 1 FROM asin_data WHERE asin=?", (a,)
+                            "SELECT 1 FROM asin_data WHERE asin=? AND marketplace=?",
+                            (a, mkt_p)
                         ) as c:
                             exists = await c.fetchone()
                         await self._db.execute(
@@ -415,10 +446,11 @@ class MediaMixin:
                                   search_params: Optional[Dict] = None,
                                   discover_mode: str = "with_detail",
                                   zip_code: str = "10001",
-                                  needs_screenshot: bool = False) -> Tuple[int, int]:
+                                  needs_screenshot: bool = False,
+                                  marketplace: str = None) -> Tuple[int, int]:
         """创建一个 keyword_discovery 批次，每个关键词一个 discover_search 任务。
 
-        语义与 SQLite 侧同名方法逐字一致，见那边的 docstring。
+        语义与 SQLite 侧同名方法逐字一致，见那边的 docstring（含 ``marketplace``）。
 
         Returns: (batch_id, inserted_search_task_count)
         """
@@ -441,6 +473,21 @@ class MediaMixin:
         mode_p = self.text_affinity(discover_mode)
         zip_p = self.text_affinity(zip_code)
         meta_p = self.text_affinity(meta_json)
+        # F-012：站点**从搜索参数的 domain 推导**，这是本次改造要补的那条断点。
+        #
+        # 改造前：`domain=www.amazon.ca` 只影响 worker 翻搜索结果页的 URL，
+        # 派生出来的详情任务没有任何站点字段，于是详情全部去 amazon.com 抓 ——
+        # 批次名/进度/发现数全部正常，只有数据是另一个国家的。
+        # 现在 domain 决定整条链路的站点，发现与详情不可能再走岔。
+        #
+        # 调用方显式给了 ``marketplace`` 就用它，**不再从 domain 重新推导**：
+        # HTTP 边界（server/api/searches.py）已经解析过站点，而且对注册表之外的
+        # 16 个搜索站点有意放行 discover_only（站点落到美国）。这里再按 domain
+        # 推导一遍会对那 16 个站点抛 ValueError -> 500，边界放行的请求在库层炸掉。
+        # 不传（老调用方 / 直接调库的测试）-> 照旧按 domain 推导。
+        mkt_p = self.text_affinity(
+            _marketplace.get(marketplace).id if marketplace is not None
+            else _marketplace.get((search_params or {}).get("domain")).id)
         async with self._write_lock:
             await self._db.execute("BEGIN")
             try:
@@ -461,11 +508,12 @@ class MediaMixin:
 
                 cursor = await self._db.execute(
                     "INSERT INTO tasks "
-                    "(batch_id, asin, zip_code, needs_screenshot, task_type, task_meta) "
-                    "SELECT ?::bigint, u.kw, ?::text, 0, 'discover_search', ?::text "
+                    "(batch_id, asin, zip_code, needs_screenshot, task_type, task_meta, "
+                    " marketplace) "
+                    "SELECT ?::bigint, u.kw, ?::text, 0, 'discover_search', ?::text, ?::text "
                     "  FROM unnest(?::text[]) AS u(kw) "
                     "ON CONFLICT DO NOTHING",
-                    (batch_id, zip_p, meta_p, clean_kws)
+                    (batch_id, zip_p, meta_p, mkt_p, clean_kws)
                 )
                 inserted = cursor.rowcount
                 await self._db.execute("COMMIT")
@@ -565,26 +613,33 @@ class MediaMixin:
                 # Step 4: 若 with_detail，为每个 ASIN 插入详情任务（同 batch_id）
                 detail_inserted = 0
                 if discover_mode == "with_detail" and seen_asins:
+                    # F-012：站点与邮编一样，从 discover 任务**继承**下来。
+                    # 漏了它，加拿大站发现出来的 ASIN 会被派成美国站详情任务。
                     async with self._db.execute(
-                        "SELECT zip_code FROM tasks WHERE id=?", (tid,)
+                        "SELECT zip_code, marketplace FROM tasks WHERE id=?", (tid,)
                     ) as c:
                         zrow = await c.fetchone()
                     zip_code = zrow["zip_code"] if zrow else "10001"
+                    mkt = zrow["marketplace"] if zrow else _marketplace.DEFAULT_MARKETPLACE
+                    mkt_p = self.text_affinity(mkt)
 
                     detail_asins = list(seen_asins)
                     cursor = await self._db.execute(
                         "INSERT INTO tasks "
-                        "(batch_id, asin, zip_code, needs_screenshot, task_type) "
-                        "SELECT ?::bigint, u.asin, ?::text, ?::int, 'asin' "
+                        "(batch_id, asin, zip_code, needs_screenshot, task_type, "
+                        " marketplace) "
+                        "SELECT ?::bigint, u.asin, ?::text, ?::int, 'asin', ?::text "
                         "  FROM unnest(?::text[]) AS u(asin) "
                         "ON CONFLICT DO NOTHING",
-                        (bid, self.text_affinity(zip_code), ss_val, detail_asins)
+                        (bid, self.text_affinity(zip_code), ss_val, mkt_p, detail_asins)
                     )
                     detail_inserted = cursor.rowcount
 
                     for a in seen_asins:
+                        # F-012：按 (asin, marketplace) 判新旧，口径同 create_tasks。
                         async with self._db.execute(
-                            "SELECT 1 FROM asin_data WHERE asin=?", (a,)
+                            "SELECT 1 FROM asin_data WHERE asin=? AND marketplace=?",
+                            (a, mkt_p)
                         ) as c:
                             exists = await c.fetchone()
                         await self._db.execute(
@@ -659,25 +714,36 @@ class MediaMixin:
     # ==================== 截图路径回填 ====================
 
     async def _get_done_screenshot_path(self, asin: str,
-                                        batch_id: int = None) -> Optional[str]:
+                                        batch_id: int = None,
+                                        marketplace: str = None) -> Optional[str]:
         """走 self._db（写连接）。
 
         唯一调用点是 _save_result_inner_unlocked，那时已经持有写锁且身处写事务，
         必须走同一条连接才看得见事务内的未提交写入 —— 不要"顺手"改成 read()。
+
+        F-012 ``marketplace``：给了就只认**同站点**的截图。一张截图属于哪个站点，
+        由它那一行 (batch_id, asin) 的任务决定（片段见 common/core/dbtables.py）。
+        不加这一条，第二条「不限批次」的兜底查询会让加拿大行继承美国批次的截图
+        （反之亦然）。``None`` -> 与改动前相同的两条查询。
         """
+        mkt_pred = ""
+        mkt_params: tuple = ()
+        if marketplace is not None:
+            mkt_pred = f" AND {task_marketplace_sql('s.batch_id', 's.asin')} = ?"
+            mkt_params = (self.text_affinity(marketplace),)
         queries = []
         if batch_id is not None:
             queries.append((
-                """SELECT file_path FROM screenshots
-                   WHERE asin = ? AND batch_id = ? AND status = 'done'
-                   ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT 1""",
-                (self.text_affinity(asin), self.as_int(batch_id)),
+                f"""SELECT s.file_path FROM screenshots s
+                   WHERE s.asin = ? AND s.batch_id = ? AND s.status = 'done'{mkt_pred}
+                   ORDER BY s.updated_at DESC NULLS LAST, s.id DESC LIMIT 1""",
+                (self.text_affinity(asin), self.as_int(batch_id)) + mkt_params,
             ))
         queries.append((
-            """SELECT file_path FROM screenshots
-               WHERE asin = ? AND status = 'done'
-               ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT 1""",
-            (self.text_affinity(asin),),
+            f"""SELECT s.file_path FROM screenshots s
+               WHERE s.asin = ? AND s.status = 'done'{mkt_pred}
+               ORDER BY s.updated_at DESC NULLS LAST, s.id DESC LIMIT 1""",
+            (self.text_affinity(asin),) + mkt_params,
         ))
 
         for sql, params in queries:
@@ -690,8 +756,13 @@ class MediaMixin:
         return None
 
     async def _get_done_screenshot_paths(self, asins: List[str],
-                                         batch_id: int = None) -> Dict[str, str]:
-        """走 self.read()。"""
+                                         batch_id: int = None,
+                                         marketplace: str = None) -> Dict[str, str]:
+        """走 self.read()。
+
+        ``marketplace``：同 ``_get_done_screenshot_path`` —— 给了就只认同站点的
+        截图（两次 load 都限定），``None`` -> 与改动前相同。
+        """
         if not asins:
             return {}
 
@@ -707,16 +778,20 @@ class MediaMixin:
             # 换成 = ANY(?::text[])：一个参数，空数组也合法，顺带绕开 asyncpg
             # 的 32767 个参数上限。行为完全一致（IN 与 = ANY 同义）。
             sql = (
-                "SELECT asin, file_path FROM screenshots "
-                "WHERE status = 'done' AND asin = ANY(?::text[])"
+                "SELECT s.asin, s.file_path FROM screenshots s "
+                "WHERE s.status = 'done' AND s.asin = ANY(?::text[])"
             )
             params: List[Any] = [[self.text_affinity(a) for a in remaining]]
             if batch_filter is not None:
-                sql += " AND batch_id = ?"
+                sql += " AND s.batch_id = ?"
                 params.append(self.as_int(batch_filter))
+            if marketplace is not None:
+                # 参数顺序 = SQL 文本顺序：asins -> batch -> 站点
+                sql += f" AND {task_marketplace_sql('s.batch_id', 's.asin')} = ?"
+                params.append(self.text_affinity(marketplace))
             # PG 的 DESC 默认 NULLS FIRST，SQLite 是 NULLS LAST —— 必须显式写，
             # 否则一行 updated_at 为 NULL 就会抢到"哪张截图胜出"的第一名。
-            sql += " ORDER BY updated_at DESC NULLS LAST, id DESC"
+            sql += " ORDER BY s.updated_at DESC NULLS LAST, s.id DESC"
 
             async with self.read() as rc, rc.execute(sql, params) as c:
                 rows = await c.fetchall()
@@ -733,18 +808,33 @@ class MediaMixin:
         return mapping
 
     async def _hydrate_screenshot_paths(self, items: List[Dict], batch_id: int = None):
-        """**原地修改** items，无返回值。"""
-        missing = []
+        """**原地修改** items，无返回值。
+
+        F-012：缺截图的行按**自己的站点**分组去 screenshots 表兜底，同一个 ASIN
+        的美国行与加拿大行各拿各的截图。原来只按 asin 兜底，全局视图里两站的
+        两行会显示同一张图（谁的 updated_at 新就是谁的）。
+
+        行里**没有** ``marketplace`` 键 -> 不分站点，与改动前相同。两个调用方都
+        保证有这个键：get_result_by_asin 是 ``SELECT *``；get_results 的窄投影
+        （``fields=`` 没点 marketplace）在内部照样取它、回填完再摘掉 —— 返回键集
+        不变（golden results_narrow_fields 钉着），回填也不跨站点。所以这里
+        **不**把 marketplace 加进对外的强制投影列。
+        """
+        missing: Dict[Optional[str], List[str]] = {}
         for item in items:
             normalized = _normalize_screenshot_path(item.get("screenshot_path"))
             item["screenshot_path"] = normalized
             if normalized is None:
-                missing.append(item["asin"])
+                missing.setdefault(item.get("marketplace") or None, []).append(item["asin"])
 
-        fallback = await self._get_done_screenshot_paths(missing, batch_id) if missing else {}
+        fallback: Dict[Optional[str], Dict[str, str]] = {}
+        for mkt, asins in missing.items():
+            fallback[mkt] = await self._get_done_screenshot_paths(
+                asins, batch_id, marketplace=mkt)
         for item in items:
             if item["screenshot_path"] is None:
-                item["screenshot_path"] = fallback.get(item["asin"])
+                item["screenshot_path"] = fallback.get(
+                    item.get("marketplace") or None, {}).get(item["asin"])
 
     # ==================== 截图操作 ====================
 
@@ -781,15 +871,25 @@ class MediaMixin:
             # 补 ROLLBACK 不改返回值、不改异常类型、不改成功路径。
             try:
                 if status == "done" and file_path:
+                    # F-012 MISS-01：所属 (batch_id, asin) 任务正因「提交体站点 ≠
+                    # 任务站点」被拒收（老 worker）时，它随后传来的截图是 amazon.com
+                    # 的页面 —— 不落地，rowcount 0 -> 端点照旧回 409、删掉文件。
+                    # 美国站谓词恒假，路径与改动前相同。理由见 common/core/dbtables.py。
                     cursor = await self._db.execute(
-                        "UPDATE screenshots SET status=?, file_path=?, updated_at=? WHERE asin=? AND batch_id=?",
+                        "UPDATE screenshots SET status=?, file_path=?, updated_at=? WHERE asin=? AND batch_id=? "
+                        f"AND NOT {SCREENSHOT_TASK_SITE_REJECTED_SQL}",
                         (status_p, path_p, now, asin_p, bid)
                     )
                     updated = cursor.rowcount > 0
                     if updated:
+                        # F-012：只回写**这个批次任务所在站点**的那一行。只按
+                        # asin 写的话，美国批次的截图会盖掉同一 ASIN 加拿大行的
+                        # screenshot_path（反之亦然），结果页就显示另一个国家的页面。
+                        # 片段里那个 `?` 是本批 batch_id（见 dbtables.task_marketplace_sql）。
                         await self._db.execute(
-                            "UPDATE asin_data SET screenshot_path=? WHERE asin=?",
-                            (path_p, asin_p)
+                            "UPDATE asin_data SET screenshot_path=? WHERE asin=? "
+                            f"AND marketplace = {task_marketplace_sql('?', 'asin_data.asin')}",
+                            (path_p, asin_p, bid)
                         )
                 elif status == "failed":
                     cursor = await self._db.execute(

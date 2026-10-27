@@ -36,6 +36,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
 from common import config
+from common.core import marketplace as _mkt
 
 
 def _srv():
@@ -63,6 +64,21 @@ def _cst_filter(value):
 templates.env.filters["cst"] = _cst_filter
 
 
+def _marketplace_options():
+    """站点下拉框的选项：``[(id, label, default_postal), ...]``（F-012 blocker 3）。
+
+    直接从站点注册表渲染，模板里**不许**再写第二份站点表 —— 两份表迟早分叉，
+    分叉的后果是下拉里有一个服务端会 400 的站点，或者少一个能采的站点。
+
+    顺序：美国站固定第一个，其余按注册表的排序。``all_ids()`` 是按字母排的，
+    ``amazon.ca`` 排在 ``amazon.com`` 前面 —— 模板里哪个分支要是「默认选第一个」，
+    默认站点就悄悄变成了加拿大。默认值由模板按 ``DEFAULT_MARKETPLACE`` 显式选中，
+    这里把美国站放第一个只是让下拉的观感与「默认 = 美国站」一致。
+    """
+    ids = sorted(_mkt.all_ids(), key=lambda i: i != _mkt.DEFAULT_MARKETPLACE)
+    return [(i, _mkt.get(i).label, _mkt.get(i).default_postal) for i in ids]
+
+
 # ==================== HTML 页面 ====================
 
 @router.get("/", response_class=HTMLResponse)
@@ -87,6 +103,8 @@ async def page_tasks(request: Request):
         "request": request,
         "batches": batches,
         "default_zip_code": _srv()._runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE),
+        "marketplaces": _marketplace_options(),
+        "default_marketplace": _mkt.DEFAULT_MARKETPLACE,
     })
 
 
@@ -105,6 +123,8 @@ async def page_settings(request: Request):
     return templates.TemplateResponse(request=request, name="settings.html", context={
         "request": request,
         "settings": _srv()._runtime_settings,
+        "marketplaces": _marketplace_options(),
+        "default_marketplace": _mkt.DEFAULT_MARKETPLACE,
         "config": {
             "port": config.SERVER_PORT,
             "timeout": config.REQUEST_TIMEOUT,

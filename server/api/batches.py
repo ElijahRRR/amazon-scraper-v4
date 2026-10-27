@@ -61,7 +61,10 @@ from typing import Dict, List, Optional
 import openpyxl
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
 
-from common import config
+# 起别名而不是 `from common.core import marketplace`：`/api/upload` 有个同名
+# Form 参数 `marketplace`，函数体里它会遮蔽模块级同名 import —— 到时候
+# `marketplace.DEFAULT_MARKETPLACE` 取的是一个字符串的属性，当场 AttributeError。
+from common.core import marketplace as _mkt
 from common.core.timeutil import now_ts
 
 
@@ -84,6 +87,7 @@ async def _create_batch_with_tasks(
     callback_url: Optional[str],
     external_id: Optional[str],
     expand_variants: bool,
+    spec: "_mkt.MarketplaceSpec",
 ) -> Dict:
     """「建批次 + 建任务 + 撞名 409 + 回显存下来的值」——**唯一**一份实现。
 
@@ -97,6 +101,13 @@ async def _create_batch_with_tasks(
     之后**两个端点都不报错**，只是行为不同。
 
     入参 `unique_asins` 必须已经去重且保序（谁调谁负责），本函数不再去一次。
+
+    `spec`（F-012 blocker 3）：本批次的采集站点，**端点负责解析**
+    （`_s._resolve_marketplace`），本函数不再校验。必须在端点里解析的原因：
+    `create_batch_if_absent` 在自己的事务里先把批次行提交了，站点若要等到
+    `create_tasks` 才发现不合法，留下的是一个空批次 + 500，调用方重试还会
+    撞上 409。不给默认值也是有意的：新加一个调用方忘了传站点，应该当场
+    TypeError，而不是悄悄建成美国站批次。
     """
     _s = _srv()
 
@@ -112,55 +123,62 @@ async def _create_batch_with_tasks(
 
     ext_id = (external_id or "").strip()[:120] or None  # 上限 120 字符防滥用
 
-    zc = zip_code or _s._runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE)
+    # 没给邮编时按站点取默认：美国站原样用全局设置（与改造前逐字节一致），
+    # 其它站点不会拿到全局那个美国邮编 —— 见 `_site_default_zip`。
+    zc = zip_code or _s._site_default_zip(spec)
 
     # 构造 status URL（调用方可以轮询）。409 也要带上它，所以在建批次之前先算好。
     base = str(request.base_url).rstrip("/")
     status_url = f"{base}/api/batches/{batch_name}/status"
 
-    batch_id, created = await _s.db.create_batch_if_absent(
-        batch_name, needs_screenshot,
-        external_id=ext_id, callback_url=cb_url,
-        expand_variants=expand_variants,
-    )
-    if not created:
-        # 撞名 -> 409，**绝不静默合并**。
-        #
-        # 以前这里是 200 + 既有 batch_id，实测后果（Phase 4.7 已证明撞名不是
-        # no-op，本轮修的就是它）：
-        #   * 本次的新 ASIN 被悄悄塞进上一个批次，「一次采集」的语义破掉；
-        #   * `inserted` 在部分重叠时是非零，看起来像成功新建；
-        #   * **本次的 external_id / callback_url 被静默丢弃**（INSERT OR IGNORE
-        #     整行不插，既有行一个字段都不更新），而响应回显的是**请求**里的值 ——
-        #     调用方以为回调注册好了，回调永远不会触发。
-        #
-        # 为什么是 409，而不是「自动加后缀」或「200 加个 merged 标志」：只有让
-        # 撞名变成一个**可识别的失败**，上传/推送才是可安全重试的 —— 网络超时后
-        # 重发，上一次若其实成功了，这里回的是 409 + 那个 batch_id。
-        # 自动加后缀会让重试造出第二个批次，200+标志则要求每个调用方都记得读那个
-        # 标志，漏读的代价与今天一模一样。
-        #
-        # 注意 batch_id 是**既有批次**的 id（create_batch_if_absent 撞名时照样把它
-        # SELECT 回来），调用方可以直接拿 status_url 接着轮询，不必再查一次。
-        raise HTTPException(409, {
-            "error": _s._BATCH_NAME_CONFLICT_CODE,
-            "message": f"批次名已存在: {batch_name}（未合并，也未改动既有批次）",
-            "batch_id": batch_id,
-            "batch_name": batch_name,
-            "status_url": status_url,
-        })
+    # 建批次行与写任务是两个事务，中间有一段「批次已存在、还没有任务」的窗口；
+    # 「同名 = 合并」的入口（插件 / 关键词 / 卖家上传）在这段窗口里查站点会放行，
+    # 把别的站点的任务并进来。同一把按批次名的锁让它们等本批任务写完再查
+    # （server/app.py::_batch_name_lock）。本入口自己撞名仍是下面的 409。
+    async with _s._batch_name_lock(batch_name):
+        batch_id, created = await _s.db.create_batch_if_absent(
+            batch_name, needs_screenshot,
+            external_id=ext_id, callback_url=cb_url,
+            expand_variants=expand_variants,
+        )
+        if not created:
+            # 撞名 -> 409，**绝不静默合并**。
+            #
+            # 以前这里是 200 + 既有 batch_id，实测后果（Phase 4.7 已证明撞名不是
+            # no-op，本轮修的就是它）：
+            #   * 本次的新 ASIN 被悄悄塞进上一个批次，「一次采集」的语义破掉；
+            #   * `inserted` 在部分重叠时是非零，看起来像成功新建；
+            #   * **本次的 external_id / callback_url 被静默丢弃**（INSERT OR IGNORE
+            #     整行不插，既有行一个字段都不更新），而响应回显的是**请求**里的值 ——
+            #     调用方以为回调注册好了，回调永远不会触发。
+            #
+            # 为什么是 409，而不是「自动加后缀」或「200 加个 merged 标志」：只有让
+            # 撞名变成一个**可识别的失败**，上传/推送才是可安全重试的 —— 网络超时后
+            # 重发，上一次若其实成功了，这里回的是 409 + 那个 batch_id。
+            # 自动加后缀会让重试造出第二个批次，200+标志则要求每个调用方都记得读那个
+            # 标志，漏读的代价与今天一模一样。
+            #
+            # 注意 batch_id 是**既有批次**的 id（create_batch_if_absent 撞名时照样把它
+            # SELECT 回来），调用方可以直接拿 status_url 接着轮询，不必再查一次。
+            raise HTTPException(409, {
+                "error": _s._BATCH_NAME_CONFLICT_CODE,
+                "message": f"批次名已存在: {batch_name}（未合并，也未改动既有批次）",
+                "batch_id": batch_id,
+                "batch_name": batch_name,
+                "status_url": status_url,
+            })
 
-    inserted = await _s.db.create_tasks(
-        batch_id, unique_asins, zc, needs_screenshot,
-        per_asin_zip=per_asin_zip,
-    )
+        inserted = await _s.db.create_tasks(
+            batch_id, unique_asins, zc, needs_screenshot,
+            per_asin_zip=per_asin_zip, marketplace=spec.id,
+        )
 
     # 回显**存下来的**值，不是请求里的值。
     # 撞名已经在上面 409 掉了，所以走到这里两者必然相等——但「回显请求值」这个
     # 写法本身就是上面那个回调撒谎 bug 的载体，留着它等于把地雷埋回去。
     # 读回一行的代价（一次主键级 SELECT）远小于「回调注册成功了吗」这种问题。
     stored = await _s.db.get_batch_by_name(batch_name)
-    return {
+    resp = {
         "batch_id": batch_id,
         "batch_name": batch_name,
         "external_id": stored.get("external_id") if stored else ext_id,
@@ -171,6 +189,12 @@ async def _create_batch_with_tasks(
         "callback_url": stored.get("callback_url") if stored else cb_url,
         "status_url": status_url,
     }
+    # 站点只在**非美国站**时回显：美国站批次的响应键集合是黄金基线与 erpAPI
+    # 契约钉着的，老调用方一个键都不该多看到；加拿大站是新调用方，多一个键
+    # 让它能确认「这批真的建在了 amazon.ca 上」。
+    if spec.id != _mkt.DEFAULT_MARKETPLACE:
+        resp["marketplace"] = spec.id
+    return resp
 
 
 @router.post("/api/upload")
@@ -181,13 +205,24 @@ async def api_upload(request: Request,
                      needs_screenshot: bool = Form(False),
                      callback_url: str = Form(None),
                      external_id: str = Form(None),
-                     expand_variants: bool = Form(False)):
+                     expand_variants: bool = Form(False),
+                     marketplace: str = Form(None)):
     """上传 ASIN 文件创建批次。
 
     支持 xlsx / csv / txt 三种格式：
-    - **xlsx / csv**：A 列 = ASIN，B 列（可选）= 该 ASIN 单独的采集邮编（5 位数字）
-      B 列为空 → 用本次上传指定的 batch zip（或服务端默认）
+    - **xlsx / csv**：A 列 = ASIN，B 列（可选）= 该 ASIN 单独的采集邮编，形状随站点
+      （美国站 5 位数字，如 `10001`；加拿大站 `K1V 7P8` 这种，大小写与空格不限）。
+      B 列为空或不符合该站点形状 → 用本次上传指定的 batch zip（或该站点默认），
+      不符合的行数计入响应的 `invalid_zip_rows`
     - **txt**：每行一个 ASIN（无邮编列）
+
+    可选站点 `marketplace`（一个批次只属于一个站点）：
+    - 不传 / 空 → 美国站 `amazon.com`，行为与加这个字段之前完全一致
+    - `amazon.ca`（也收 `www.amazon.ca`、`https://www.amazon.ca/`，大小写不限）→ 加拿大站
+    - 不在站点注册表里 → **400**，不会静默回退到美国站，也不会建出批次
+    - 非美国站：`zip_code` 必须是该站点的邮编形状，否则 400；不传则用该站点默认
+      （全局设置里的邮编对该站点不合法时用注册表默认，加拿大站是 `K1V 7P8`），
+      200 响应里额外带 `marketplace`
 
     可选 callback：
     - `callback_url`：批次完成时（含截图）POST 到此 URL 通知调用方
@@ -207,6 +242,23 @@ async def api_upload(request: Request,
     （读回后再回显），不是请求里的值。
     """
     _s = _srv()
+    # F-012 blocker 3：站点与批次邮编都在读文件、写库**之前**定下来 ——
+    # 400 时库里不能留下批次（见 `_create_batch_with_tasks` 的 docstring）。
+    spec = _s._resolve_marketplace(marketplace)
+    if spec.id != _mkt.DEFAULT_MARKETPLACE:
+        # 只校验非美国站。美国站的批次邮编从来是原样透传、不校验的
+        # （'abcde' 也 200 并原样落库，黄金基线钉着）—— 收紧它是对老调用方
+        # 的行为改动，不在本次范围；而加拿大站是新入口，没有可兼容的旧行为，
+        # 给一个美国邮编去加拿大站只会静默落到默认地区，所以当场 400。
+        if zip_code is not None and str(zip_code).strip():
+            zip_norm = _s._normalize_zip(zip_code, spec.id)
+            if not zip_norm:
+                raise _s._site_zip_error(zip_code, spec)
+            zip_code = zip_norm
+        else:
+            # 纯空白 = 没给。不能原样往下传：核心里是 `zip_code or 默认`，
+            # '  ' 是真值，会作为邮编落到加拿大站任务上。
+            zip_code = None
     content = await file.read()
     if len(content) > _s.MAX_UPLOAD_BYTES:
         raise HTTPException(413, f"文件过大：{len(content)//1024//1024}MB，上限 {_s.MAX_UPLOAD_BYTES//1024//1024}MB")
@@ -223,7 +275,10 @@ async def api_upload(request: Request,
             return
         asins.append(asin)
         if zip_val is not None and str(zip_val).strip():
-            zip_norm = _s._normalize_zip(zip_val)
+            # B 列按**本批次站点**的规则归一：美国站 'amazon.com' 与改造前的
+            # 无参调用逐字节等价（含补零 1234 -> 01234）；加拿大站 'm5v3l9'
+            # -> 'M5V 3L9'，而一个美国 5 位邮编在加拿大批次里算非法行。
+            zip_norm = _s._normalize_zip(zip_val, spec.id)
             if zip_norm:
                 # 同一 ASIN 在多行重复时，以第一次出现的非空 zip 为准
                 per_asin_zip.setdefault(asin, zip_norm)
@@ -283,6 +338,7 @@ async def api_upload(request: Request,
         batch_name=batch_name, zip_code=zip_code,
         needs_screenshot=needs_screenshot, callback_url=callback_url,
         external_id=external_id, expand_variants=expand_variants,
+        spec=spec,
     )
 
 
@@ -307,7 +363,8 @@ async def api_create_batch(request: Request):
           "batch_name":       null,      // 可选，不传则自动生成
           "callback_url":     null,      // 可选，批次完成时 POST 通知
           "external_id":      null,      // 可选，原样回传
-          "expand_variants":  false      // 可选
+          "expand_variants":  false,     // 可选
+          "marketplace":      null       // 可选。不传 = 美国站 amazon.com
         }
 
     两个「自由选择」按调用方要的语义来：
@@ -315,7 +372,13 @@ async def api_create_batch(request: Request):
     * **邮编**：三档独立。`items[].zip_code`（这一个 ASIN）> 顶层 `zip_code`
       （这一批）> 服务端默认。想跟随服务端默认就整个不传这个键——传 `null` 也
       当没传，但**不要**传 `""` 去表达「用默认」，空串这里按缺省处理、别的地方
-      未必，少一层歧义是一层。
+      未必，少一层歧义是一层。邮编形状随站点（美国站 5 位数字，加拿大站
+      `K1V 7P8` 这种）。
+    * **站点**：`marketplace`，一个批次只属于一个站点。不传 / `null` / `""` =
+      美国站，与加这个键之前完全一致；`amazon.ca`（也收 `www.amazon.ca`、
+      `https://www.amazon.ca/`，大小写不限）= 加拿大站；不在站点注册表里 ->
+      400，不静默回退、不建批次。非美国站的服务端默认邮编是该站点自己的
+      （加拿大站 `K1V 7P8`），200 响应里额外带 `marketplace`。
     * **截图**：`needs_screenshot` 是**批次级**开关（底层 `batches` 表就一列，
       截图任务是按批派生的）。不传即 false，也就是**默认不截图**。想要一半截图
       一半不截，推两个批次——不要指望 items 里逐个开关，那个粒度库里不存在。
@@ -332,6 +395,10 @@ async def api_create_batch(request: Request):
     if not isinstance(body, dict):
         raise HTTPException(400, "请求体必须是 JSON 对象")
 
+    # F-012 blocker 3：站点必须在 add_pair 之前定下来 —— 逐 ASIN 邮编按哪个
+    # 站点的形状归一，取决于它；不合法 -> 400，此时还没有任何写库。
+    spec = _s._resolve_marketplace(body.get("marketplace"))
+
     asins: List[str] = []
     per_asin_zip: Dict[str, str] = {}
     invalid_zip_count = 0
@@ -343,7 +410,9 @@ async def api_create_batch(request: Request):
             return
         asins.append(asin)
         if zip_val is not None and str(zip_val).strip():
-            zip_norm = _s._normalize_zip(zip_val)
+            # 按本批次站点归一（美国站与改造前的无参调用逐字节等价）。下面
+            # 的冲突判定比的是归一后的值，所以 'k1v7p8' 与 'K1V 7P8' 不算冲突。
+            zip_norm = _s._normalize_zip(zip_val, spec.id)
             if zip_norm:
                 # 同一 ASIN 给了**两个不同**邮编 -> 400，不静默取第一个。
                 #
@@ -398,9 +467,12 @@ async def api_create_batch(request: Request):
     zip_code = body.get("zip_code")
     zip_code = str(zip_code).strip() if zip_code is not None else None
     if zip_code:
-        zip_norm = _s._normalize_zip(zip_code)
+        zip_norm = _s._normalize_zip(zip_code, spec.id)
         if not zip_norm:
-            raise HTTPException(400, f"非法邮编: {zip_code}")
+            if spec.id == _mkt.DEFAULT_MARKETPLACE:
+                # 美国站这句报错原文是黄金基线钉着的（json_submit_bad_zip），一字不改
+                raise HTTPException(400, f"非法邮编: {zip_code}")
+            raise _s._site_zip_error(zip_code, spec)
         zip_code = zip_norm
     else:
         # "" 与 null 同义：跟随服务端默认
@@ -421,6 +493,7 @@ async def api_create_batch(request: Request):
         callback_url=body.get("callback_url"),
         external_id=body.get("external_id"),
         expand_variants=bool(body.get("expand_variants", False)),
+        spec=spec,
     )
 
 

@@ -136,15 +136,16 @@ journalctl -u amazon-scraper -f
 
 - 支持格式：`.xlsx` / `.csv` / `.txt`
 - 自动提取 `B[0-9A-Z]{9}` 格式的 ASIN 并去重
-- 可选：指定批次名、邮编、是否截图、**是否自动采集多属性变体**
+- 可选：指定**站点**（默认美国站，可选加拿大站，见「多站点采集（F-012）」）、批次名、邮编、是否截图、**是否自动采集多属性变体**
 - **🔗 自动采集多属性变体**（开关，默认关）：开启后，采完上传的 ASIN 会把它们的同款全部变体（不同颜色/尺寸等）也采进【同一批次】，详见「多属性变体提取 + 自动展开」
-- **per-ASIN 邮编**：仅 `.xlsx` / `.csv` 的 B 列填 5 位邮编可为单个 ASIN 指定邮编（同一 batch 内不同邮编自动切换 session）；**`.txt` 上传不支持这一列**，会被忽略
+- **per-ASIN 邮编**：仅 `.xlsx` / `.csv` 的 B 列填邮编可为单个 ASIN 指定邮编（同一 batch 内不同邮编自动切换 session）；邮编形状随站点（美国站 5 位数字，加拿大站 `K1V 7P8` 这种），不符合该站点形状的行计入 `invalid_zip_rows` 并退回批次邮编；**`.txt` 上传不支持这一列**，会被忽略
 - 上传大小上限 50MB
 - **批次名撞名返回 `409 Conflict`**（不再静默合并）：响应体带 `detail.batch_id` / `detail.status_url`，可直接轮询该批次状态。旧行为是把新 ASIN 悄悄合并进同名批次、并悄悄丢弃这次请求带的 `external_id`/`callback_url`——如果你的调用方依赖旧的"重名即合并"语义，需要改成先处理 409、按需换个批次名重传
 - **API 调用**：可直接 `POST /api/upload`（multipart），支持以下额外字段：
   - `external_id`：调用方自己的批次 ID，原样回传，便于追踪
   - `callback_url`：采集完成时 POST 到此地址通知（详见下方 Webhook）
   - `expand_variants`：`true`/`false`，是否自动展开变体（同上方开关）
+  - `marketplace`：站点。不传 / 空 = 美国站 `amazon.com`（与加这个字段之前完全一致）；`amazon.ca` = 加拿大站（也收 `www.amazon.ca`、`https://www.amazon.ca/`，大小写不限）；不在站点注册表里 → `400`，不会静默回退美国站、也不会建出批次。非美国站时 `zip_code` 必须是该站点的形状（否则 `400`），不传则用该站点的默认邮编，200 响应里多一个 `marketplace` 键
 
 ### 推送采集任务（JSON API）
 
@@ -172,6 +173,7 @@ curl -X POST http://<server>:8899/api/batches \
 | `callback_url` | `null` | 完成回调，同 `/api/upload` |
 | `external_id` | `null` | 原样回传 |
 | `expand_variants` | `false` | 自动展开变体 |
+| `marketplace` | `amazon.com` | 站点，规则同 `/api/upload` 的 `marketplace`；邮编按该站点校验与取默认 |
 
 响应体、撞名 `409` 语义、回调注册与 `POST /api/upload` **完全一致**（同一份实现）。
 ASIN 去重保序；非法 ASIN 丢弃，一个都不剩 → `400`。整批邮编非法 → `400`；
@@ -247,7 +249,7 @@ ASIN 只有一行，后采的覆盖先采的；而 `/api/results?batch_id=` 的 
 | 排序 | `relevance` / `price_asc` / `price_desc` / `newest` / `review_rank` / `featured` |
 | 翻页上限 | 每个关键词翻几页，默认 7，上限 20 |
 | 广告位 | 默认丢弃（`include_sponsored=false`） |
-| 站点 | 18 个 Amazon 站点 |
+| 站点 | `domain`，18 个 Amazon 站点（详情采集目前支持其中 2 个，见下一节 F-012） |
 | `rh_extra` | 逃生口：原样拼进 `rh=` 的 refinement 串，用于本项目没预置的筛选 |
 
 ```bash
@@ -291,6 +293,119 @@ SEARCH_DELIVERY_FILTERS='{"www.amazon.de": {"prime": "p_85:xxxxxxxxx"}}'
 `GET /api/search-options?domain=<站点>` 回的就是该站点**当前**可用的取值，
 控制台的下拉框读的也是它。
 
+### 多站点采集（F-012）
+
+目前**能完整采集详情**的站点是两个：`amazon.com`（美国站）与 `amazon.ca`
+（加拿大站）。关键词搜索的**发现**阶段仍支持 18 个站点（见上一节的 `domain`），
+但那 16 个站点只能 `discover_only`。
+
+站点的唯一真源是 `common/core/marketplace.py` 的注册表，一条记录描述一个站点的
+全部差异：base URL、货币、邮编规则、locale 头、glow 判定。server 与 worker
+都从这里取。
+
+```bash
+# 建一个加拿大站的关键词批次：domain 决定整条链路的站点
+curl -X POST http://<server>:8899/api/search-batches \
+  -H 'Content-Type: application/json' -d '{
+    "keywords": ["wireless mouse"],
+    "domain": "www.amazon.ca",
+    "zip_code": "M5V 3L9",
+    "discover_mode": "with_detail"
+  }'
+```
+
+| 维度 | 美国站 | 加拿大站 |
+|---|---|---|
+| 站点键 | `amazon.com` | `amazon.ca` |
+| 币种 | USD | CAD |
+| 邮编 | 5 位数字 `10001` | `K1V 7P8`（字母数字） |
+| 默认投递地 | `10001` | `K1V 7P8` |
+| `delivery` 筛选 | 4 个取值 | 需配 `SEARCH_DELIVERY_FILTERS` 或用 `rh_extra` |
+
+#### 用 ASIN 清单采加拿大站
+
+所有「给一批 ASIN 建批次」的入口都认站点；**不指定站点 = 美国站**，与 F-012 之前逐字节一致。
+
+| 入口 | 怎么指定加拿大站 |
+|---|---|
+| 网页「任务管理」上传表单 | 「站点」下拉选加拿大站（切过去会清掉预填的美国邮编，留空 = 用加拿大站默认 `K1V 7P8`） |
+| `POST /api/upload` | form 字段 `marketplace=amazon.ca`；B 列写加拿大邮编 |
+| `POST /api/batches` | JSON 键 `"marketplace": "amazon.ca"` |
+| 定时任务（设置页 / `POST /api/schedules`） | 「站点」下拉 / form 字段 `marketplace`，可选固定 `zip_code`；「全库」模式只取**该站点**已采过的 ASIN |
+| 浏览器插件 | 插件 1.2.0 起按**当前页面**的站点推送；加拿大站邮编在插件设置里单独填 |
+
+```bash
+curl -X POST http://<server>:8899/api/upload \
+  -F file=@ca_asins.xlsx -F marketplace=amazon.ca -F zip_code='M5V 3L9'
+```
+
+一个批次只属于一个站点：「同名 = 合并 / 追加」的入口（插件推送、`POST /api/search-batches`、
+`POST /api/upload-sellers`）遇到同名批次里已有**另一个站点**的任务时返回 `409`，什么都不写；
+同站点的同名合并语义不变。批次结果、批次导出、截图都按**任务行的站点**取对应那一行
+`asin_data`（同一个 ASIN 美加各有一行时，加拿大批次只出加拿大行，美国批次只出美国行）；
+`GET /api/results/{asin}` 不带站点时只给美国行（与加站点之前一致，只在加拿大有的 ASIN 返回 404），带 `?marketplace=amazon.ca` 取加拿大行。
+
+⚠ **采加拿大站之前先把所有 worker 升级到含 F-012 的版本。** 老 worker 不认任务的站点，
+领到加拿大任务会去美国站采；服务端现在会拒收这种结果（任务记为失败，
+`error_type=server_reject`，`error_detail` 以 `marketplace_mismatch` 开头），
+不会让它覆盖美国行 —— 在失败明细里看到这一条，就是还有老 worker 在跑。
+浏览器插件同理：1.1.0 在加拿大页面上推的仍是美国站任务，要在 `chrome://extensions` 里重新加载 1.2.0。
+
+#### ⚠ 同一个 ASIN 在两个站点是**两行**
+
+`asin_data` 的唯一键是 `(asin, marketplace)`。美加两站的同一个 ASIN 是两件不同的
+商品数据（币种、卖家、库存、配送全不同），所以导出里会出现两行、价格还不一样
+—— 那是**正确结果**，不是重复数据。导出多了一列「采集站点」就是用来分辨它们的。
+
+（F-012 之前唯一键只有 `asin`，两个站点的数据会互相覆盖，后采的盖掉先采的，
+且不报错。）
+
+#### ⚠ 代理出口 IP 必须落在目标国家
+
+`worker/proxy.py` 里没有任何国家/地区配置 —— 出口 IP 落在哪个国家由你的代理
+供应商决定。用美国 IP 抓 `amazon.ca`，Amazon 会给出不同的价格/配送，甚至跳转，
+而数据一样入库、一样不报错。**这件事在代码之外，必须在代理侧配。**
+
+#### 加拿大站的三项假设：已实测通过（2026-09-19）
+
+注册表里 `amazon.ca` 现在是 `verified=True`。三项原假设的实测结论：
+
+| 假设 | 结论 |
+|---|---|
+| 地址切换接口路径同构、接受带空格邮编 | ✅ 是，`K1V 7P8` 原样被接受 |
+| glow 文案含完整邮编 | ✅ 是，不是只有前三位 FSA |
+| 价格渲染成 `$` 还是 `CDN$` | ✅ `$`，`render_symbol="$"` 对 |
+
+⚠ **验证方式是真实采集会话 + 人工核对商品页，不是 `tools/probe_marketplace.py`。**
+探针脚本在那次验证里自己吃到了 202 壳页（它用裸 curl_cffi session，没走
+`AmazonSession.initialize()` 那套 cookie 预热），所以探针的结论不能当证据。
+细节记在 `common/core/marketplace.py` 末尾的 VERIFIED 一节。
+
+加**新**站点时仍然从 `verified=False` 起步，实测过再改 True，并写清楚怎么测的：
+
+```bash
+PROXY_URL='http://user:pass@host:port' \
+  python -m tools.probe_marketplace --marketplace amazon.xx
+```
+
+#### 默认邮编的作用
+
+`default_postal` 与美国站的 `10001` 承担同一个职责：**把「页面按哪个地区渲染」钉死**。
+不指定的话 Amazon 会按出口 IP 自己挑一个地区，于是同一批任务采回来的价格、配送时长、
+库存来自不同地区 —— 而数据看起来完全正常。加拿大站当前是 `K1V 7P8`（渥太华）。
+
+
+探针只发几个 GET/POST 然后打印，不写库、不改配置。跑完把实测结果回填进注册表，
+再把 `verified` 改成 `True`。
+
+#### 加新站点
+
+往 `_REGISTRY` 里加一条记录即可，需要给全：`host`、`currency`、
+`render_symbol`、`postal_pattern`、`default_postal`、`accept_language`。
+加完必须跑 `tests/test_marketplace.py` —— 其中
+`PostalShapesAreDisjoint` 会检查新站点的邮编形状与既有站点互斥
+（`pull_tasks` 的任务分组依赖这一条），`SAMPLES` 字典也要补上新站点的样本。
+
 ### 浏览器插件采集（F-011）
 
 `extension/` 目录是一个 Chrome/Edge MV3 插件：在亚马逊页面上一键把商品推给
@@ -306,13 +421,16 @@ Server 采集，自动识别当前是商品列表页 / 卖家店铺页 / 商品�
 |---|---|
 | `GET /api/extension/ping` | 测试连接（版本 / 默认邮编 / 在线 worker 数） |
 | `POST /api/extension/collect` | 推 ASIN 与卖家 ID |
-| `POST /api/extension/resolve-sellers` | 按 ASIN 反查**已采到的**卖家 |
+| `POST /api/extension/resolve-sellers` | 按 ASIN 反查**已采到的**卖家（按 `marketplace` 只查该站点的行，缺省美国站） |
 
 **`/api/extension/collect` 的同名批次是「追加」，不是 409** —— 与
 `/api/upload` / `/api/batches` 的撞名语义相反。这是插件翻页采集的前提：
 一次「翻 10 页」是 10 次推送，必须落进同一个批次，否则控制台里会多出 10 个批次，
 导出/进度/回调全部没法看。两条语义共存是有意的，理由见
 `server/api/extension.py` 的模块文档。
+**例外（F-012）**：同名批次里已有**另一个站点**的任务 → `409`，什么都不写（一个批次只属于一个站点）。
+插件推送时带 `marketplace`（取自当前页面），不带 = 美国站；邮编按站点校验，非美国站的
+响应里 `asin_batch` / `seller_batch` 各多一个 `marketplace` 键。
 
 插件没有、也不需要服务端放 CORS 头：它的请求全部从 service worker 发出，
 凭 `host_permissions` 就不受 CORS 约束。**别"顺手"给这些端点加 CORS** ——

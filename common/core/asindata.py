@@ -153,6 +153,18 @@ ASIN_DATA_FIELDS = [
     #      这个值就变。读的人必须知道它会变。
     #   2. CONDITION 是 SQL 标准保留字（PG 里恰好非保留，但 SQLite/未来迁移不保证）。
     "offer_condition",
+    # F-012：采集来源站点（'amazon.com' / 'amazon.ca'）。
+    #
+    # ⚠ 它是唯一键 (asin, marketplace) 的一部分，也就是说它**决定写哪一行**，
+    #   而不只是行里的一个值。写入侧必须保证它非空且在注册表里 ——
+    #   空值会因为 NOT NULL 当场报错（这是有意的：一条站点不明的商品数据
+    #   没有意义，宁可失败也不要静默落进美国站那一行去覆盖真数据）。
+    #
+    # ⚠ **不在** _HASH_FIELDS 里，与 site / zip_code 同一条口径：
+    #   它是采集参数，不是商品属性（common/slowhash.py:133 的原话）。
+    #   把它算进 content_hash 会让同一个商品在两个站点产出不同的内容指纹，
+    #   而内容指纹的用途是"目录层内容变没变"，与从哪个站点采的无关。
+    "marketplace",
 ]
 
 # asin_data 合法列名集合（含内部列）：iter_results 收窄投影时用作白名单，

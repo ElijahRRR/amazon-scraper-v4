@@ -94,6 +94,7 @@ def tearDownModule():
     logging.disable(_SAVED_LOG_LEVEL)
 
 from worker.engine import SessionSlot, Worker  # noqa: E402
+from common.core import marketplace as _mp  # noqa: E402
 
 
 # ── Fakes ───────────────────────────────────────────────────────────────────
@@ -147,12 +148,24 @@ class FakeWorker:
         self.created_sessions = []
         self.create_returns_none = False
         self._create_delay_seen = []
+        # F-012：每次建 session 时 slot 传下来的站点，供用例断言"换站点会重建"。
+        self._create_marketplace_seen = []
 
-    async def _create_session_with_retry(self, delay=5):
+    async def _create_session_with_retry(self, delay=5, marketplace=None,
+                                         zip_code=None):
+        """签名必须跟 worker/engine.py 里的真实方法一致。
+
+        ⚠ 这是一个测试替身：它与被替身对象之间**没有任何机制保证签名同步**，
+        真实签名加参数时这里会 TypeError。那正是 F-012 改造时发生的事
+        （40 条用例同时红），所以把这条写下来：改 _create_session_with_retry
+        的签名时，这里要跟着改。
+        """
         self._create_delay_seen.append(delay)
+        self._create_marketplace_seen.append(marketplace)
         if self.create_returns_none:
             return None
-        s = FakeSession(zip_code=self.zip_code)
+        s = FakeSession(zip_code=zip_code or self.zip_code)
+        s.marketplace = marketplace
         self.created_sessions.append(s)
         return s
 
@@ -388,6 +401,137 @@ class SessionSlotTests(unittest.TestCase):
         run(slot.rotate(reason="第二次"))
         self.assertIsNot(slot.session, first_rotated)
         self.assertEqual(w.proxy_manager.blocked_reports, 2)
+
+    # ── rotate 保留站点/邮编（F-012 blocker 2）──────────────────────────────
+    def assertBindingConsistent(self, slot):
+        """slot 自称的站点必须等于 session 实际绑的站点。中毒形态就是这两者分叉。"""
+        if slot.session is None:
+            self.assertIsNone(slot._marketplace)
+        else:
+            self.assertEqual(slot._marketplace,
+                             _mp.get(slot.session.marketplace).id)
+
+    def test_rotate_keeps_marketplace_and_zip(self):
+        w = FakeWorker(zip_code="10001")          # worker 全局邮编是美国的
+        slot = SessionSlot(w)
+        run(slot.ensure_ready("amazon.ca", "M5V 3L9"))
+        old = slot.session
+        run(slot.rotate(reason="被封锁"))
+        self.assertIsNot(slot.session, old)
+        self.assertTrue(old.closed)
+        self.assertEqual(w.proxy_manager.blocked_reports, 1)   # 换 IP 语义不变
+        self.assertEqual(w._create_marketplace_seen, ["amazon.ca", "amazon.ca"])
+        self.assertEqual(slot.session.marketplace, "amazon.ca")
+        self.assertEqual(slot.session.zip_code, "M5V 3L9")
+        self.assertNotEqual(slot.session.zip_code, w.zip_code)
+        self.assertEqual(slot._marketplace, "amazon.ca")
+        self.assertBindingConsistent(slot)
+
+    def test_rotate_does_not_poison_slot(self):
+        """抓的就是「轮换后 slot 自称 CA 但 session 是 US」这个形态。"""
+        w = FakeWorker(zip_code="10001")
+        slot = SessionSlot(w)
+        run(slot.ensure_ready("amazon.ca", "M5V 3L9"))
+        run(slot.rotate(reason="被封锁"))
+        after_rotate = slot.session
+        self.assertTrue(run(slot.ensure_ready("amazon.ca", "M5V 3L9")))
+        # ensure_ready 认为「站点没变」所以复用 —— 那就必须真的是 CA 那个
+        self.assertIs(slot.session, after_rotate)
+        self.assertEqual(slot.session.marketplace, "amazon.ca")
+        self.assertEqual(len(w.created_sessions), 2)   # 没有"建一个立刻丢掉"
+        self.assertEqual(w._create_delay_seen, [3, 1])
+
+    def test_rotate_keeps_zip_for_paths_without_ensure_zip(self):
+        """卖家/搜索任务不调 ensure_zip：轮换丢邮编 = 悄悄采另一个地区。"""
+        w = FakeWorker(zip_code="10001")
+        slot = SessionSlot(w)
+        run(slot.ensure_ready("amazon.ca", "K1V 7P8"))
+        run(slot.rotate(reason="列表页 blocked"))
+        self.assertEqual(slot.session.zip_code, "K1V 7P8")
+
+    def test_rotate_keeps_zip_set_by_ensure_zip(self):
+        """邮编是 ensure_zip 中途切过去的（详情路径），轮换也要带走切后的值。"""
+        w = FakeWorker(zip_code="10001")
+        slot = SessionSlot(w)
+        run(slot.ensure_ready("amazon.com", "10001"))
+        run(slot.ensure_zip("90210"))
+        run(slot.rotate(reason="被封锁"))
+        self.assertEqual(slot.session.zip_code, "90210")
+        self.assertBindingConsistent(slot)
+
+    def test_rotate_us_unchanged(self):
+        """美国站（老 server 不下发 marketplace）：站点与邮编都不变。"""
+        w = FakeWorker(zip_code="10001")
+        slot = SessionSlot(w)
+        run(slot.ensure_ready())
+        run(slot.rotate(reason="被封锁"))
+        # 传 "amazon.com" 与改前传 None 解析到**同一个** spec 对象，
+        # 所以这条断言钉的是"走同一段代码"，不是行为差异。
+        self.assertIs(_mp.get(None), _mp.get("amazon.com"))
+        self.assertEqual(w._create_marketplace_seen, ["amazon.com", "amazon.com"])
+        self.assertEqual(slot._marketplace, "amazon.com")
+        self.assertEqual(slot.session.zip_code, "10001")
+        self.assertEqual(w._create_delay_seen, [3, 1])   # 轮换仍走 delay=1 快重试
+        self.assertEqual(len(w.created_sessions), 2)
+        self.assertEqual(w.proxy_manager.blocked_reports, 1)
+
+    def test_rotate_create_failure_clears_marketplace(self):
+        w = FakeWorker()
+        slot = SessionSlot(w)
+        run(slot.ensure_ready("amazon.ca", "M5V 3L9"))
+        w.create_returns_none = True
+        run(slot.rotate(reason="被封锁"))
+        self.assertIsNone(slot.session)
+        self.assertIsNone(slot._marketplace)   # 不留"自称 CA 却没 session"的半状态
+        self.assertBindingConsistent(slot)
+        w.create_returns_none = False
+        self.assertTrue(run(slot.ensure_ready("amazon.ca", "M5V 3L9")))
+        self.assertEqual(slot.session.marketplace, "amazon.ca")
+        self.assertEqual(slot.session.zip_code, "M5V 3L9")
+
+    def test_rotate_debounce_does_not_poison(self):
+        """防抖提前 return 的那条路不许碰站点绑定。"""
+        w = FakeWorker()
+        slot = SessionSlot(w)
+        run(slot.ensure_ready("amazon.ca", "M5V 3L9"))
+        run(slot.rotate(reason="第一次"))
+        seen = list(w._create_marketplace_seen)
+        run(slot.rotate(reason="第二次"))          # 5s 内被防抖吃掉
+        self.assertEqual(w._create_marketplace_seen, seen)
+        self.assertEqual(slot._marketplace, "amazon.ca")
+        self.assertBindingConsistent(slot)
+
+    def test_rotate_without_session_matches_old_behaviour(self):
+        """从没建过 session 就被 rotate（今天 20 个调用点都到不了的极端路径）。"""
+        w = FakeWorker()
+        slot = SessionSlot(w)
+        run(slot.rotate(reason="被封锁"))
+        self.assertIsNone(w._create_marketplace_seen[0])   # 与改前逐字节相同
+        self.assertEqual(slot._marketplace, "amazon.com")  # 归一后与真实 session 一致
+        self.assertBindingConsistent(slot)
+
+    def test_rotate_on_empty_keeps_marketplace(self):
+        """覆盖 rotate_on_empty → rotate 这条委托路径（engine.py:301/303）。"""
+        w = FakeWorker()
+        slot = SessionSlot(w)
+        run(slot.ensure_ready("amazon.ca", "M5V 3L9"))
+        run(slot.rotate_on_empty("B0TEST", reason="标题为空"))
+        self.assertEqual(slot.session.marketplace, "amazon.ca")
+        self.assertEqual(slot.session.zip_code, "M5V 3L9")
+        self.assertBindingConsistent(slot)
+
+    def test_ensure_ready_rebuilds_on_marketplace_change(self):
+        """换站点重建分支（engine.py:230）此前零覆盖。"""
+        w = FakeWorker()
+        slot = SessionSlot(w)
+        run(slot.ensure_ready("amazon.com", "10001"))
+        first = slot.session
+        run(slot.ensure_ready("amazon.ca", "M5V 3L9"))
+        self.assertIsNot(slot.session, first)
+        self.assertTrue(first.closed)
+        self.assertEqual(w._create_marketplace_seen, ["amazon.com", "amazon.ca"])
+        self.assertEqual(w.proxy_manager.blocked_reports, 0)   # 换站点不是轮换
+        self.assertBindingConsistent(slot)
 
     # ── rotate_on_empty（空标题机制1+2）──────────────────────────────────────
     def test_rotate_on_empty_single_trigger(self):

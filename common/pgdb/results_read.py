@@ -124,7 +124,16 @@ from common.pgdb._shared import (  # noqa: F401
     _normalize_screenshot_path,
     search_like_pattern,
 )
-from common.core.dbtables import TOTAL_ESTIMATE_MIN_ROWS
+from common.core import marketplace as _marketplace
+from common.core.dbtables import (
+    BA_ROW_MARKETPLACE_SQL,
+    BATCH_ORPHAN_PROBE_SQL,
+    BATCH_SITE_RANGE_SQL,
+    DEFAULT_MARKETPLACE_SQL,
+    TOTAL_ESTIMATE_MIN_ROWS,
+    batch_site_literal,
+    task_marketplace_sql,
+)
 from common.core.results_sort import (
     DEFAULT_SORT,
     CursorExpired,
@@ -221,8 +230,17 @@ class ResultsReadMixin:
             screenshot_path 同上（它要就地归一化这一列）
             updated_at     `_hydrate_batch_task_status` 的 batch_asin_data_updated_at
         少任何一个都是"看起来能用、翻两页或点开截图才炸"的那种坏法。
+        （F-012：没点 ``marketplace`` 时内部还会多取它给截图回填按站点兜底，
+        回填完就从 items 里摘掉 —— 对外仍然只多这四列。）
         """
         proj = None
+        # F-012：窄投影没点 marketplace 时，内部照样取它（排在最后），截图回填按
+        # 行的站点兜底之后再从 items 里摘掉 —— 返回的键集与改动前逐字相同
+        # （golden results_narrow_fields 钉着），回填却不再跨站点借图。
+        # 不这么做的话，`fields=asin,current_price` 的美国批次视图会在加拿大
+        # 截图落地之后显示加拿大的页面（反之亦然），而默认投影是对的 ——
+        # 同一行在两种投影下给出两张不同的截图。
+        drop_marketplace = False
         if columns:
             # 白名单过滤：列名会拼进 SQL。端点层已经拒绝过非法列名（422），
             # 这里是第二道 —— db 层不假设调用方一定是那个端点。
@@ -231,6 +249,9 @@ class ResultsReadMixin:
                 for forced in ("id", "asin", "screenshot_path", "updated_at"):
                     if forced not in wanted:
                         wanted.append(forced)
+                if "marketplace" not in wanted:
+                    wanted.append("marketplace")
+                    drop_marketplace = True
                 proj = ", ".join(f"d.{c}" for c in wanted)
 
         sort = normalize_sort(sort)
@@ -258,9 +279,30 @@ class ResultsReadMixin:
         where_params: list = []
 
         # 批次筛选 - 通过 batch_asins JOIN
+        #
+        # F-012：除了 asin，还要按**任务行的站点**钉住 d.marketplace。asin_data 的
+        # 唯一键是 (asin, marketplace)，只按 asin 关联的话，加拿大批次会把同一
+        # ASIN 的美国行也带出来（反之亦然），total 跟着翻倍，每一行还都挂上本批
+        # 任务的 batch_task_status —— 美国行看起来就像这批刚采的加拿大数据。
+        #
+        # ⚠ 能证明整批是同一个站点时（绝大多数批次），钉的是**字面量**
+        #   `d.marketplace = 'amazon.com'`，不是逐行片段。逐行片段在这里是
+        #   PG 规划器的悬崖：`列 = (SubPlan)` 只能套默认选择性，规划器因此丢掉
+        #   「主键倒序扫、凑够一页就停」的计划，每次翻页都 Seq Scan 整张
+        #   asin_data（10 万行批次翻页 3.5ms -> 628ms）。字面量让它用列统计，
+        #   计划与 F-012 之前完全相同。判定规则与实测见 common/core/dbtables.py
+        #   的「批次 -> 常量站点」；证明不了（混合批次）才退回逐行片段，慢但对。
+        # 两种写法都不含 `?`，所以下面所有「参数顺序 = SQL 文本顺序」的注释
+        # 照旧成立。
+        # ⚠ 字符串必须仍以 "JOIN batch_asins ba " 开头：bset 分支靠这个前缀把
+        #   主批次连接从 other_joins 里摘掉。
+        batch_site = None
         if batch_id:
-            join_parts.append("JOIN batch_asins ba ON ba.asin = d.asin AND ba.batch_id = ?")
-            count_join_parts.append("JOIN batch_asins ba ON ba.asin = d.asin AND ba.batch_id = ?")
+            batch_site = await self._batch_site_literal(batch_id)
+            batch_join = ("JOIN batch_asins ba ON ba.asin = d.asin AND ba.batch_id = ? "
+                          f"AND d.marketplace = {batch_site or BA_ROW_MARKETPLACE_SQL}")
+            join_parts.append(batch_join)
+            count_join_parts.append(batch_join)
             join_params.append(as_int(batch_id))
 
         # 变动筛选 —— 由 `JOIN (SELECT DISTINCT asin FROM asin_changes ...)`
@@ -437,15 +479,32 @@ class ResultsReadMixin:
             # ⚠ 只换掉**主批次连接**。change_filter='new' 会再加一个
             #   `JOIN batch_asins ba2 ... is_new = 1`，那条原样保留 —— 它是另一个
             #   语义（"本批新增"），不是候选集限制。
+            #
+            # F-012：站点钉法与主批次连接相同（见那里）：
+            #   * 单一站点 -> bset 形状与 F-012 之前逐字相同，外层连接多一个
+            #     `d.marketplace = '<站点>'` 字面量；
+            #   * 混合批次 -> bset 顺带物化每行任务的站点（同一份逐行片段，外层
+            #     列引用换成不带别名的 batch_asins.*），外层按它钉 d.marketplace。
+            # 两种写法都让 `FROM batch_asins WHERE batch_id` 只出现一次、`?` 一个
+            # 没加，tests/test_search_no_planner_cliff.py 钉的形状照旧。
+            # ⚠ 单一站点时**不要**也走物化列：MATERIALIZED CTE 的列没有统计，
+            #   `bset.marketplace = d.marketplace` 又会落回默认选择性。
             other_joins = [j for j in join_parts if "batch_asins ba " not in j]
             # join_params 的第一个就是主批次连接的 batch_id（它最先 append）
             other_join_params = join_params[1:]
+            if batch_site:
+                bset_cols = "asin"
+                bset_on = f"bset.asin = d.asin AND d.marketplace = {batch_site}"
+            else:
+                bset_mkt = task_marketplace_sql("batch_asins.batch_id", "batch_asins.asin")
+                bset_cols = f"asin, {bset_mkt} AS marketplace"
+                bset_on = "bset.asin = d.asin AND bset.marketplace = d.marketplace"
             sql = f"""
                 WITH bset AS MATERIALIZED (
-                    SELECT asin FROM batch_asins WHERE batch_id = ?
+                    SELECT {bset_cols} FROM batch_asins WHERE batch_id = ?
                 )
                 SELECT {proj or 'd.*'} FROM asin_data d
-                JOIN bset ON bset.asin = d.asin
+                JOIN bset ON {bset_on}
                 {' '.join(other_joins)}
                 WHERE {where_clause} AND {search_pred}
                 ORDER BY {order_by_clause}
@@ -521,6 +580,10 @@ class ResultsReadMixin:
 
         # 注意：读连接已经归还，_hydrate 内部还要再借一条（避免池内嵌套借用）
         await self._hydrate_screenshot_paths(items, batch_id)
+        if drop_marketplace:
+            # 只为截图回填按站点兜底而取（见上方 drop_marketplace），调用方没点
+            for item in items:
+                item.pop("marketplace", None)
         if batch_id:
             await self._hydrate_batch_task_status(items, batch_id)
 
@@ -645,6 +708,29 @@ class ResultsReadMixin:
     #: `GET /api/export/batch/{name}/records` 的 `coverage`，或直接比对
     #: `/api/batches/{name}/status` 的任务数。这条差异有用例钉着。
 
+    async def _batch_site_literal(self, batch_id) -> Optional[str]:
+        """F-012：这一批能不能把站点钉成常量 —— 返回站点的 SQL 字面量，或
+        ``None``（= 证明不了单一站点，调用方用逐行片段）。
+
+        为什么要钉常量、判定规则、与逐行片段逐行等价的论证，都在
+        common/core/dbtables.py 的「批次 -> 常量站点」；判定本身是那里的
+        ``batch_site_literal``（两个后端调同一个函数），这里只负责发探针。
+
+        两条探针都按 batch_id 走索引（idx_tasks_batch / batch_asins 主键），代价与
+        **批次**大小成正比、与 asin_data 总行数无关；孤儿探针只在单一**非美国**
+        站点时才发，美国批次永远只有一条。SQLite 侧同名方法逐字同构。
+        """
+        bid = as_int(batch_id)
+        has_orphans = None
+        async with self.read() as rc:
+            async with rc.execute(BATCH_SITE_RANGE_SQL, (bid,)) as c:
+                row = await c.fetchone()
+            lo, hi = (row["lo"], row["hi"]) if row else (None, None)
+            if lo is not None and lo == hi and lo != _marketplace.DEFAULT_MARKETPLACE:
+                async with rc.execute(BATCH_ORPHAN_PROBE_SQL, (bid,)) as c:
+                    has_orphans = (await c.fetchone()) is not None
+        return batch_site_literal(lo, hi, has_orphans)
+
     async def _hydrate_batch_task_status(self, items: List[Dict], batch_id):
         """**原地修改** items，无返回值。只在带 `batch_id` 时调用。
 
@@ -736,11 +822,24 @@ class ResultsReadMixin:
         async with self.read() as rc, rc.execute(sql, params) as c:
             return {row["asin"] for row in await c.fetchall()}
 
-    async def get_result_by_asin(self, asin: str) -> Optional[Dict]:
+    async def get_result_by_asin(self, asin: str, marketplace: str = None) -> Optional[Dict]:
+        """单个 ASIN 的结果行（``GET /api/results/{asin}``）。
+
+        F-012：同一个 ASIN 可以在两个站点各有一行。
+          * ``marketplace=None``（老调用方）-> **只要美国行**，没有就 None（404）。
+            原来是裸 ``WHERE asin = ?`` + fetchone，取哪行由索引顺序决定 ——
+            (asin, marketplace) 索引里 'amazon.ca' 排在 'amazon.com' 前面，于是不传
+            站点的老调用方**拿到加拿大数据**。也**不**退而给别的站点的行：只在加拿大
+            才有的 ASIN，对不传站点的调用方在加拿大数据入库前是 404，入库后若变成
+            200 + 加元价格/加拿大卖家，调用方会把它当美国数据用。现在不传站点的答案
+            与 F-012 之前（库里只有美国行）逐字相同。
+          * 给了站点 -> 只要那个站点的行，没有就 None。不认识的站点抛 ValueError
+            （端点层先拦过一道）。
+        """
         # 注意：先释放读连接再 _hydrate（其内部还要借读连接），避免池内嵌套借用导致死锁
-        async with self.read() as rc, rc.execute(
-            "SELECT * FROM asin_data WHERE asin = ?", (text_affinity(asin),)
-        ) as c:
+        sql = "SELECT * FROM asin_data WHERE asin = ? AND marketplace = ?"
+        params = (text_affinity(asin), text_affinity(_marketplace.get(marketplace).id))
+        async with self.read() as rc, rc.execute(sql, params) as c:
             row = await c.fetchone()
         if not row:
             return None
@@ -748,12 +847,26 @@ class ResultsReadMixin:
         await self._hydrate_screenshot_paths([item])
         return item
 
-    async def get_asin_changes(self, asin: str) -> List[Dict]:
-        """获取 ASIN 的变动历史"""
-        async with self.read() as rc, rc.execute(
-            "SELECT * FROM asin_changes WHERE asin = ? ORDER BY id DESC",
-            (text_affinity(asin),)
-        ) as c:
+    async def get_asin_changes(self, asin: str, marketplace: str = None) -> List[Dict]:
+        """获取 ASIN 的变动历史
+
+        F-012 ``marketplace``：给了就只要**这个站点**的变动。asin_changes 没有站点
+        列，一条变动属于哪个站点由它那一行 (batch_id, asin) 的任务决定（同一份
+        片段，见 common/core/dbtables.py；batch_id 为空 / 查不到任务行 -> 美国站，
+        那正是 F-012 之前的答案）。不限定的话，加拿大行的变动会混进美国详情的
+        ``changes``（反之亦然）—— 美国调用方的响应在加拿大数据入库后就变了。
+        ``None`` -> 与改动前相同（不分站点）。
+        """
+        if marketplace is None:
+            sql = "SELECT * FROM asin_changes WHERE asin = ? ORDER BY id DESC"
+            params = (text_affinity(asin),)
+        else:
+            sql = ("SELECT ac.* FROM asin_changes ac WHERE ac.asin = ? "
+                   f"AND {task_marketplace_sql('ac.batch_id', 'ac.asin')} = ? "
+                   "ORDER BY ac.id DESC")
+            params = (text_affinity(asin),
+                      text_affinity(_marketplace.get(marketplace).id))
+        async with self.read() as rc, rc.execute(sql, params) as c:
             return [dict(r) for r in await c.fetchall()]
 
     # ==================== 导出操作 ====================
@@ -784,9 +897,19 @@ class ResultsReadMixin:
             while True:
                 if batch_id:
                     d_select = ", ".join(f"d.{c}" for c in proj_cols) if proj_cols else "d.*"
+                    # F-012：先连 tasks，再按**任务行的站点**连 asin_data。
+                    # 只按 asin 连的话，同一个 ASIN 两站各一行会让一条 batch_asins
+                    # 行变成两行：导出里多出别的站点的数据（还被 data_source 标成
+                    # 「历史产品库数据」），而且 keyset 是 `ba.asin > ?` —— 页边界
+                    # 正好落在两行之间时第二行被**静默跳过**，导出内容随 batch_size
+                    # 变化。钉住站点后恢复「每条 batch_asins 行恰好一行」，keyset
+                    # 重新精确。
+                    # 顺序是承重的：PG 的 ON 子句只能引用它前面的 FROM 项，
+                    # t 必须先于 d 出现。
                     joins = [
-                        "LEFT JOIN asin_data d ON d.asin = ba.asin",
                         "LEFT JOIN tasks t ON t.batch_id = ba.batch_id AND t.asin = ba.asin",
+                        "LEFT JOIN asin_data d ON d.asin = ba.asin "
+                        f"AND d.marketplace = COALESCE(t.marketplace, {DEFAULT_MARKETPLACE_SQL})",
                     ]
                     join_params: list = []
                     where = ["ba.batch_id = ?", "ba.asin > ?"]
@@ -876,10 +999,19 @@ class ResultsReadMixin:
         async with self.read() as rc, rc.execute("SELECT COUNT(*) FROM asin_data") as c:
             return (await c.fetchone())[0]
 
-    async def get_all_asins(self) -> List[str]:
-        """获取所有已知 ASIN（用于自动采集）"""
+    async def get_all_asins(self, marketplace: str = None) -> List[str]:
+        """获取某个站点全部已知 ASIN（用于定时任务的「全库」模式）。
+
+        F-012：``asin_data`` 的唯一键是 ``(asin, marketplace)``，不按站点过滤的话
+        同一个 ASIN 两站各一行会返回两次，而且调用方（定时任务）会把加拿大独有的
+        ASIN 当成美国任务去采。``marketplace=None`` -> 美国站，返回的正是 F-012
+        之前那份列表（那时库里只有美国行）。不认识的站点抛 ValueError。
+        """
+        mkt = _marketplace.get(marketplace).id
         result = []
-        async with self.read() as rc, rc.execute("SELECT asin FROM asin_data ORDER BY id") as c:
+        async with self.read() as rc, rc.execute(
+                "SELECT asin FROM asin_data WHERE marketplace = ? ORDER BY id",
+                (text_affinity(mkt),)) as c:
             async for row in c:
                 result.append(row["asin"])
         return result

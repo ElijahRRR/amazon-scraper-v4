@@ -12,17 +12,26 @@
     <div class="card-body">
         <form id="uploadForm" enctype="multipart/form-data">
             <div class="row g-3 mb-3">
-                <div class="col-md-4">
+                <div class="col-md-3">
                     <label class="form-label">批次名称（可选）</label>
                     <input type="text" class="form-control" name="batch_name" placeholder="自动生成">
                 </div>
-                <div class="col-md-4">
+                <div class="col-md-3">
+                    <label class="form-label">站点</label>
+                    {# 选项来自服务端站点注册表（pages.py），这里不写第二份站点表 #}
+                    <select class="form-select" name="marketplace" id="upMarketplace" autocomplete="off">
+                        {% for id, label, postal in marketplaces %}
+                        <option value="{{ id }}" data-postal="{{ postal }}"{{ ' selected' if id == default_marketplace }}>{{ label }}（{{ id }}）</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="col-md-3">
                     <label class="form-label">配送邮编</label>
-                    <input type="text" class="form-control" name="zip_code"
+                    <input type="text" class="form-control" name="zip_code" id="upZip" autocomplete="off"
                            value="{{ default_zip_code }}" placeholder="10001">
                     <small class="text-secondary">可在系统设置中修改默认值</small>
                 </div>
-                <div class="col-md-4">
+                <div class="col-md-3">
                     <label class="form-label">ASIN 文件</label>
                     <input type="file" class="form-control" name="file" accept=".xlsx,.xls,.csv,.txt" required>
                 </div>
@@ -291,8 +300,50 @@
 
 {% block extra_js %}
 <script>
+// F-012 blocker 3：站点切换时同步邮编框。站点表只有一份 —— 上传表单站点下拉
+// 那几个由服务端注册表渲染的 <option>（data-postal = 该站点默认邮编），这里只读它。
+const SERVER_DEFAULT_ZIP = String({{ default_zip_code|tojson }} ?? '');  // 与输入框 value 同形（字符串）
+const DEFAULT_MKT = {{ default_marketplace|tojson }};
+const SITE_POSTAL = Object.fromEntries(
+    [...document.getElementById('upMarketplace').options].map(o => [o.value, o.dataset.postal]));
+
+{# 只在**跨站点**时动框里的值（ZIP_SITE 记每个框上一次的站点，初始都是美国站）。
+   框里还是「预填的全局默认」「某个站点的默认邮编」或空 = 用户没动过，跟着站点换：
+   切回美国站填回全局默认，切到别的站点清空 —— 美国邮编送去加拿大站必 400，
+   留空则服务端用该站点自己的默认。用户自己填的值不碰。同站点内换主机（kwDomain
+   在 www.amazon.com 与不在注册表、按美国站算的站点之间切）一个字都不碰，与改造前一致。
+   写成模板注释：不随页面下发（这页已经很大）。 #}
+const ZIP_SITE = new WeakMap();
+function applySiteZip(input, mktId) {
+    if (!SITE_POSTAL[mktId]) mktId = DEFAULT_MKT;
+    const prev = ZIP_SITE.get(input) || DEFAULT_MKT;
+    ZIP_SITE.set(input, mktId);
+    input.placeholder = SITE_POSTAL[mktId];
+    if (mktId === prev) return;
+    const v = input.value.trim();
+    if (v === '' || v === SERVER_DEFAULT_ZIP || Object.values(SITE_POSTAL).includes(v)) {
+        input.value = (mktId === DEFAULT_MKT) ? SERVER_DEFAULT_ZIP : '';
+    }
+}
+document.getElementById('upMarketplace').addEventListener('change', (e) => {
+    applySiteZip(document.getElementById('upZip'), e.target.value);
+});
+
 document.getElementById('uploadForm').addEventListener('submit', async (e) => {
     e.preventDefault();
+    {# 站点下拉默认是美国站。用户要采加拿大却忘了切站点、只在邮编框里填了加拿大邮编：
+       服务端对美国站的批次邮编是原样透传（历史行为，API 调用方依赖它），批次照样
+       建成美国站 —— 加拿大邮编被送去 amazon.com，数据从美国站来，而成功提示看起来
+       一切正常。美国邮编里不会有字母，所以这里只认「含字母」这一条，不在页面里再
+       抄一份各站点的邮编规则。只拦网页表单，API 行为不变。 #}
+    const upMkt = document.getElementById('upMarketplace').value;
+    const upZipVal = document.getElementById('upZip').value.trim();
+    if (upMkt === DEFAULT_MKT && /[A-Za-z]/.test(upZipVal) &&
+        !confirm(`邮编 ${upZipVal} 不是美国邮编，但站点选的是美国站。\n` +
+                 `如果这是加拿大邮编，请点「取消」，把站点切换为加拿大站后再上传。\n` +
+                 `仍要按美国站上传吗？`)) {
+        return;
+    }
     const btn = document.getElementById('uploadBtn');
     const resultDiv = document.getElementById('uploadResult');
     btn.disabled = true;
@@ -316,8 +367,20 @@ document.getElementById('uploadForm').addEventListener('submit', async (e) => {
             alertDiv.className = 'alert alert-success';
             alertDiv.append('✅ 上传成功！批次: ', batchSpan,
                 `，共 ${parseInt(data.total_asins)} 个 ASIN，插入 ${parseInt(data.inserted)} 个任务`);
+            // 非美国站批次服务端才回显 marketplace；B 列邮编按站点校验，不合格的行
+            // 退回批次邮编 —— 不提示的话，填错站点的那一列邮编就无声无息地没生效。
+            // 美国站只在真有行被退回时才多这一句（没有退回时提示与改造前逐字相同）：
+            // 最常见的原因正是「B 列填的加拿大邮编、站点却没切」。
+            if (data.marketplace) alertDiv.append(`，站点 ${data.marketplace}`);
+            const badZip = parseInt(data.invalid_zip_rows) || 0;
+            if (badZip > 0) {
+                alertDiv.append(`（${badZip} 行 B 列邮编不符合该站点形状，已改用批次邮编` +
+                    (data.marketplace ? '）' : '；如果那是加拿大邮编，请改选加拿大站重新上传）'));
+            }
             resultDiv.appendChild(alertDiv);
-            setTimeout(() => location.reload(), 1500);
+            // 有邮编被退回时不自动刷新：1.5 秒后提示就没了，用户来不及看到
+            // 「站点可能选错了」。没有退回时与改造前一样自动刷新。
+            if (!(badZip > 0)) setTimeout(() => location.reload(), 1500);
         } else {
             resultDiv.style.display = 'block';
             const alertDiv = document.createElement('div');
@@ -455,6 +518,10 @@ async function loadSearchOptions(domain) {
 
 document.getElementById('kwDomain').addEventListener('change', (e) => {
     loadSearchOptions(e.target.value);
+    {# 同一个邮编陷阱：站点切到加拿大、框里还是预填的美国邮编 -> 服务端 400。
+       kwDomain 的值是带 www. 的主机名，去掉 www. 才是站点键；不在站点注册表里的站点只能
+       discover_only，服务端按美国站校验邮编，applySiteZip 对它同样回落美国站。 #}
+    applySiteZip(document.getElementById('kwZip'), e.target.value.replace(/^www\./, ''));
 });
 loadSearchOptions();
 
@@ -677,10 +744,18 @@ function localizeErrorDetail(etype, detail) {
     if (m) {
         return `实际页面 ASIN：<code>${m[1]}</code>，请求的是：<code>${m[2]}</code>（亚马逊返回了同 parent 下的兄弟变体）`;
     }
-    // zip_switch："current=10001 target=90210"（保险起见 esc）
-    m = d.match(/^current=(\S*)\s+target=(\S+)$/);
+    // zip_switch："current=10001 target=90210"（保险起见 esc）。加拿大邮编中间有空格
+    // （形如 "A1A 1A1"），所以两段都不能用 \S+；美国邮编结果不变。
+    m = d.match(/^current=(.*?)\s+target=(.+)$/);
     if (m) {
         return `当前 Session 邮编：<code>${esc(m[1]) || '未知'}</code>，目标邮编：<code>${esc(m[2])}</code>`;
+    }
+    // F-012：结果的站点与任务的站点不一致，服务端拒收（典型是没升级的老 worker
+    // 领到了加拿大任务、去美国站采了回来）。原文只会被当成「结果不合格」读，
+    // 真正要做的是升级那台 worker。
+    m = d.match(/^marketplace_mismatch task=(\S+) payload=(\S+)/);
+    if (m) {
+        return `任务站点 <code>${esc(m[1])}</code>，worker 按 <code>${esc(m[2])}</code> 采集，结果已拒收（未写入任何数据）—— 这台 worker 需要升级到多站点版本`;
     }
     // 兜底：原始 detail 必须 esc 后返回避免 XSS；超长截断 300 字符 + tooltip 看全文
     if (d.length > 300) {

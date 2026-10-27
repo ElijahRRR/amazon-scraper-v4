@@ -15,6 +15,16 @@
  *
  * 详情页排在最前：`/dp/ASIN` 是无歧义的，且详情页上也有
  * "相关商品" 之类的 `[data-asin]` 卡片，先判列表会把详情页认成列表。
+ *
+ * ──────────────────────────────────────────────────────────────
+ * 站点（F-012）的纯函数也住在这里，service worker 同样 import 本文件
+ * ──────────────────────────────────────────────────────────────
+ * 「这个页面 / 这条队列条目 / 这次翻页属于哪个站点」「推这个站点该带哪个
+ * 邮编」这几条规则，content script（识别页面）和 background（推送、队列、
+ * 翻页状态机）都要用。各写一份的话迟早分叉 —— 分叉的症状是加拿大页面上
+ * 识别出来是 amazon.ca，推过去却是美国站，没有任何一侧会报错。
+ * 所以只写这一份：background.js 顶部 `import './page.js'`（它是 module
+ * service worker），本文件作为模块求值时同样把 AmzPage 挂到 globalThis 上。
  */
 
 (function () {
@@ -36,11 +46,33 @@
   /** 从任意 URL / href 里抠卖家 ID（`me=` 与 `seller=` 两种参数名）。 */
   const SELLER_PARAM_RE = /[?&](?:me|seller|isAmazonFulfilled|merchant)=([A-Z0-9]{10,16})/i;
 
-  /** Amazon 自营的 merchant ID（美国站）。整店采集对它没意义，见下。 */
+  /** Amazon 自营的 merchant ID（各站点不同）。整店采集对它没意义，见下。 */
   const AMAZON_SELF_MERCHANTS = new Set([
     'ATVPDKIKX0DER',   // amazon.com
     'A3P5ROKL5A1OLE',  // amazon.com（部分类目）
+    // amazon.ca（F-012）：取自实采的 amazon.ca 详情页（卖家栏写 Amazon.ca，
+    // 隐藏字段 merchantID 就是它）。不加的话加拿大自营店铺页上没有「商品数以
+    // 百万计」的警告，用户会对着 Amazon.ca 点整店采集。
+    'A3DWYIK6Y9EEQB',
   ]);
+
+  /** 美国站的站点键。与服务端 `common/core/marketplace.DEFAULT_MARKETPLACE` 同值。 */
+  const DEFAULT_MARKETPLACE = 'amazon.com';
+
+  /**
+   * 亚马逊主机名 -> 站点键的**形状**规则：`amazon.<2-3 个字母>`，后面可选再跟
+   * 一段 2 个字母的国家码（`co.uk` / `com.au` / `com.br` / `co.jp`），前面可以有
+   * 任意子域（`www.` / `smile.`）。站点键与服务端注册表同形：不带 `www.`。
+   *
+   * ⚠ 这**不是**站点白名单，也不该变成白名单：哪些站点能采是服务端注册表
+   *   （`common/core/marketplace.py`）说了算。插件里再抄一份的话两边必然分叉 ——
+   *   服务端新开一个站点，插件这边却还把它当美国站推。不支持的站点推过去，
+   *   服务端回 400，popup 把 detail 原样弹给用户，当场看得见。
+   *
+   * 末尾锚定 `$` 是承重的：`www.amazon.ca.evil.com` 必须认不出来，而不是被
+   * 认成 amazon.ca；`(?:^|\.)` 挡掉 `notamazon.ca` 这种前缀拼接。
+   */
+  const AMAZON_HOST_RE = /(?:^|\.)(amazon\.[a-z]{2,3}(?:\.[a-z]{2})?)$/;
 
   const PAGE_TYPES = {
     DETAIL: 'detail',
@@ -87,6 +119,22 @@
     return null;
   }
 
+  /**
+   * URL -> 站点键（`https://www.amazon.ca/s?k=x` -> `amazon.ca`）。
+   * 不是亚马逊的地址、或者根本解析不了 -> `null`，由调用方决定怎么兜底。
+   */
+  function marketplaceFromUrl(url) {
+    if (!url) return null;
+    let host;
+    try {
+      host = new URL(String(url)).hostname.toLowerCase().replace(/\.$/, '');
+    } catch (e) {
+      return null;
+    }
+    const m = host.match(AMAZON_HOST_RE);
+    return m ? m[1] : null;
+  }
+
   /** URL 里的卖家 ID（店铺页 `/s?me=`、卖家资料页 `/sp?seller=`）。 */
   function sellerIdFromUrl(url) {
     const m = url.match(SELLER_PARAM_RE);
@@ -104,6 +152,10 @@
     const out = {
       type: PAGE_TYPES.UNKNOWN,
       url,
+      // 这一页属于哪个站点（F-012）。popup 显示它，推送按它建批次、取邮编。
+      // 不进 content.js 的 fingerprint：换站点必然是整页导航，content script
+      // 会重新注入，用不着靠指纹察觉。
+      marketplace: marketplaceFromUrl(url),
       asin: null,
       title: '',
       sellerId: null,
@@ -407,7 +459,9 @@
     if (!out.sellerId) {
       const info = doc.querySelector('#merchant-info, #tabular-buybox, #sellerProfileTriggerId');
       const txt = (info?.textContent || '').replace(/\s+/g, ' ');
-      if (/sold by amazon(\.[a-z.]+)?\b/i.test(txt) || /亚马逊/.test(txt)) {
+      // `vendu par Amazon.ca`：amazon.ca 的法语页面（F-012），英文页面走第一条
+      if (/sold by amazon(\.[a-z.]+)?\b/i.test(txt) || /vendu par amazon\b/i.test(txt) ||
+          /亚马逊/.test(txt)) {
         out.isAmazonSelf = true;
         out.sellerName = 'Amazon';
       }
@@ -448,6 +502,126 @@
     return !!nextPageLink(doc);
   }
 
+  // ────────────────────────────────────────────────────────────
+  // 站点（F-012）：推送、队列、翻页任务共用的几条规则
+  // ────────────────────────────────────────────────────────────
+  //
+  // 总原则：**一个批次只属于一个站点**（服务端对跨站点追加回 409，见
+  // server/api/extension.py 头注）。所以插件这边每一次推送都必须先回答
+  // "这批东西是哪个站点的"，并且只带**那个站点**的邮编。
+
+  /**
+   * **当下这一页**属于哪个站点：显式字段 > 从页面 URL 推 > 美国站。
+   *
+   * 只给"正在发生的动作"用（单页采集、开始翻页、加入队列 —— 页面 URL 就是
+   * 用户眼前那一页）。**存下来的老数据不走这里**，见 storedMarketplace。
+   */
+  function resolveMarketplace(explicit, url) {
+    return explicit || marketplaceFromUrl(url) || DEFAULT_MARKETPLACE;
+  }
+
+  /**
+   * 推某个站点时带哪个邮编。`null` = 不带，由服务端按站点取默认。
+   *
+   * 美国站读老键 `zipCode`，与 v1.1.0 **逐字节一致**（选项页上那一栏
+   * 存的就是它，升级不用重填）。其它站点只读 `zipCodes[站点]`，**绝不**
+   * 回落到 `zipCode`：美国邮编发给加拿大站，服务端会 400（站点邮编形状
+   * 不对）；就算不 400，Amazon 也会静默落到默认地区。
+   */
+  function zipFor(settings, mkt) {
+    const s = settings || {};
+    if (!mkt || mkt === DEFAULT_MARKETPLACE) return s.zipCode || null;
+    const per = s.zipCodes || {};
+    return String(per[mkt] || '').trim() || null;
+  }
+
+  /**
+   * 批次名里的站点标记：`amazon.ca` -> `ca`，`amazon.co.uk` -> `co_uk`；美国站 -> `''`。
+   *
+   * 美国站不加标记，批次名与 v1.1.0 一字不差（`ext_list_<时间戳>`）。
+   * 点号换成下划线：批次名会进截图落盘路径，服务端拒绝含 `..` 的名字。
+   */
+  function siteTag(mkt) {
+    if (!mkt || mkt === DEFAULT_MARKETPLACE) return '';
+    return String(mkt).toLowerCase().replace(/^amazon\./, '').replace(/[^a-z0-9]+/g, '_');
+  }
+
+  /** `makeBatchName` 的 kind 加站点标记：`('list', 'amazon.ca')` -> `'list_ca'`。 */
+  function siteKind(kind, mkt) {
+    const tag = siteTag(mkt);
+    return tag ? `${kind}_${tag}` : kind;
+  }
+
+  /**
+   * **存下来的**队列条目 / 翻页任务属于哪个站点：有字段用字段，没有 = 美国站。
+   *
+   * 没有字段的只可能是 v1.1.0 存下来的东西，而 v1.1.0 推什么都是美国站 ——
+   * 升级后照旧按美国站推，与升级前那一刻点「提交」的结果逐字节相同（SPEC B3：
+   * 老存储数据视为 amazon.com）。**不**按条目的 `url` 去猜：那会让升级这个动作
+   * 本身改变一条已经排好队的东西去哪个站点 —— 一条 amazon.de 页面上加的老条目
+   * 会突然推成 amazon.de 被服务端 400；一个 amazon.ca 上开始的老翻页任务会把
+   * 后面几页推成加拿大站、撞上它自己那个美国站批次（409）。
+   */
+  function storedMarketplace(explicit) {
+    return explicit || DEFAULT_MARKETPLACE;
+  }
+
+  /** 队列条目属于哪个站点（老条目 = 美国站，见 storedMarketplace）。 */
+  function queueItemMarketplace(item) {
+    return storedMarketplace(item && item.marketplace);
+  }
+
+  /**
+   * 两条队列条目是不是"同一个"：键是 **(asin, 站点)**，不是 asin。
+   *
+   * 同一个 ASIN 在美国站和加拿大站是两件事（价格、卖家、库存都不同），
+   * 只按 asin 去重的话，后加的那条会把先加的覆盖掉 —— 连 url 一起，
+   * 于是另一个站点的那条悄悄消失。
+   */
+  function sameQueueItem(a, b) {
+    return !!a && !!b && a.asin === b.asin &&
+      queueItemMarketplace(a) === queueItemMarketplace(b);
+  }
+
+  /**
+   * 按站点分组。返回 `[[站点, [条目...]], ...]`，提交队列时一组一个批次。
+   *
+   * 组的顺序：**美国站那组永远第一**，其余按该站点第一次出现的顺序；组内保持
+   * 原顺序。美国站排第一是为了让它那一次推送与 v1.1.0 一样是最先发出的请求，
+   * 不排在一个可能被服务端拒掉的站点（amazon.de 等）后面 —— 调用方虽然会
+   * 一组失败接着推下一组，但美国站条目的命运不该取决于队列里谁先加进来。
+   */
+  function groupByMarketplace(items, mktOf = queueItemMarketplace) {
+    const groups = new Map();
+    for (const it of items || []) {
+      const mkt = mktOf(it);
+      if (!groups.has(mkt)) groups.set(mkt, []);
+      groups.get(mkt).push(it);
+    }
+    const out = [...groups.entries()];
+    const us = out.findIndex(([mkt]) => mkt === DEFAULT_MARKETPLACE);
+    if (us > 0) out.unshift(...out.splice(us, 1));
+    return out;
+  }
+
+  /** 翻页任务属于哪个站点。v1.1.0 存下来的 activeRun 没有这个字段 = 美国站（见 storedMarketplace）。 */
+  function runMarketplace(run) {
+    return storedMarketplace(run && run.marketplace);
+  }
+
+  /**
+   * 这一页是不是已经离开了翻页任务的站点（用户在跑批的标签页里手动切了站点）。
+   *
+   * 翻页链接本身不会跨站点，但跑批归属只看 tabId（见 background.js
+   * CONTENT_READY），用户手动把那个标签页导航到另一个站点时，不拦的话
+   * 加拿大的页会被追加进美国的批次（服务端会 409，这里是第一道闸）。
+   * 页面 URL 推不出站点时不拦（content script 只注入亚马逊页面，理论上不会发生）。
+   */
+  function pageLeavesRunSite(run, pageUrl) {
+    const pageMkt = marketplaceFromUrl(pageUrl);
+    return !!pageMkt && pageMkt !== runMarketplace(run);
+  }
+
   // 挂到 globalThis 而不是 window：content script 里两者等价，但单测在
   // 纯 Node（无 jsdom 全局）下跑时只有 globalThis，写 window 会当场 ReferenceError。
   const AmzPage = {
@@ -468,6 +642,20 @@
     extractDetailSeller,
     nextPageLink,
     hasNextPage,
+    // 站点（F-012）
+    DEFAULT_MARKETPLACE,
+    AMAZON_HOST_RE,
+    marketplaceFromUrl,
+    resolveMarketplace,
+    storedMarketplace,
+    zipFor,
+    siteTag,
+    siteKind,
+    queueItemMarketplace,
+    sameQueueItem,
+    groupByMarketplace,
+    runMarketplace,
+    pageLeavesRunSite,
   };
 
   globalThis.AmzPage = AmzPage;

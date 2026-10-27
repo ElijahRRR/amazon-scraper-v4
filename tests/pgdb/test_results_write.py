@@ -20,7 +20,7 @@ from common.pgdb._shared import LOCK_STATS, _normalize_screenshot_path
 # media.py（agent G）尚未落地时的临时垫背：results_write 只依赖
 # _get_done_screenshot_path 一个方法。media 实现后这段自动失效（不再打补丁）。
 # --------------------------------------------------------------------------
-async def _fallback_get_done_screenshot_path(self, asin, batch_id=None):
+async def _fallback_get_done_screenshot_path(self, asin, batch_id=None, marketplace=None):
     queries = []
     if batch_id is not None:
         queries.append((

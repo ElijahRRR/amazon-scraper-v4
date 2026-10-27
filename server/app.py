@@ -19,14 +19,17 @@ from typing import Optional, Dict, Set
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 import openpyxl
 
 from common import config
 from common.core.idents import ASIN_RE as _ASIN_RE
-from common.core.zipcode import _zfill_short_numeric
+# F-012：邮编归一化整体搬进 common/core/marketplace.py（站点感知）。
+# 补零那一小步的真源仍是 common/core/zipcode.py，marketplace 在内部调它，
+# 所以本模块与 relay 的「补零规则必须一致」这条承重约束没有松动。
+from common.core import marketplace as _marketplace
 from common.core.timeutil import now_ts, ts_from, utc_now
 from common.database import Database
 from common.dbfactory import create_database
@@ -879,26 +882,40 @@ async def _auto_scrape_scheduler():
                     except ValueError:
                         pass
 
-                # 获取 ASIN 列表：优先从文件，否则全库
+                # F-012 blocker 3：站点（存储值每次重新校验，见 _schedule_spec）。
+                # 不合法 -> 记日志（每条每天一次，见 _bad_site_sched_logged）、只跳过**这一条**。
+                # 绝不能让它抛出去：外层只有一个 try 包着整个 for，抛出去等于本轮
+                # 排在它后面的定时任务全部不跑。
+                # 也必须在 create_batch 之前，否则每 60 秒留下一个空批次。
+                try:
+                    spec = _schedules_api._schedule_spec(sched)
+                except HTTPException as e:
+                    key = str(sched.get("id"))
+                    if _bad_site_sched_logged.get(key) != today:
+                        _bad_site_sched_logged[key] = today
+                        logger.error(f"定时任务站点非法，已跳过（修好之前每轮都跳过，同一条每天只记一次）: {e.detail}")
+                    continue
+
+                # 获取 ASIN 列表：优先从文件，否则全库（= 本定时任务那个站点的全库）
                 source_file = sched.get("source_file", "")
                 if source_file and os.path.isfile(source_file):
                     asins = _extract_asins_from_file(source_file)
                 else:
-                    asins = await db.get_all_asins()
+                    asins = await db.get_all_asins(marketplace=spec.id)
 
                 if not asins:
                     continue
 
-                sched_name = sched.get("name", "task")
                 # P4.7：**分钟 -> 秒**（有意的行为改动，见 _batch_name 的 docstring）。
                 # 分钟精度下「同一分钟内自动 + 手动触发同一个定时任务」会撞名，
                 # 而撞名不是 no-op：create_batch 返回既有批次 id，新 ASIN 被
-                # 悄悄塞进上一个批次。
-                batch_name = _batch_name(f"auto_{sched_name}")
-                zc = _runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE)
+                # 悄悄塞进上一个批次。前缀 / 邮编与「立即执行」共用同一组函数
+                # （美国站与改造前一字不差，见 server/api/schedules.py）。
+                batch_name = _batch_name(_schedules_api._auto_batch_prefix(sched, spec))
+                zc = _schedules_api._schedule_zip(sched, spec)
                 ns = sched.get("needs_screenshot", False)
                 batch_id = await db.create_batch(batch_name, ns, is_auto=True)
-                await db.create_tasks(batch_id, asins, zc, ns)
+                await db.create_tasks(batch_id, asins, zc, ns, marketplace=spec.id)
                 sched["last_run_date"] = today
                 changed = True
                 logger.info(f"自动采集已调度: {batch_name}, {len(asins)} ASINs (间隔{interval}天)")
@@ -980,6 +997,11 @@ _completion_check_set: Set[int] = set()
 # 若第 2 次展开仍新增（=采集第 3 轮）则打 WARNING（家族列表不一致信号），但靠
 # UNIQUE(batch_id,asin) 去重仍保证收敛、不死循环。批次完成后清理。
 _expand_rounds: Dict[int, int] = {}
+# 自动调度里「存的站点不合法」的定时任务：sched id -> 最近一次记 error 的日期。
+# 这种定时任务过点后每 60 秒都会被重新判定一次（跳过时不推进 last_run_date ——
+# 推进了等于假装它跑过），不去重的话一条坏定时任务一天能刷上千行 ERROR，
+# 把日志告警打穿。每条每天记一次就够人看见了。
+_bad_site_sched_logged: Dict[str, str] = {}
 # 待发送的 callback 内存队列：
 # - _completion_watcher 把刚标记 completed 的 batch_id 入队
 # - _timeout_task_loop 兜底从 DB 扫描入队（处理重启 / 实时漏掉的）
@@ -1062,13 +1084,9 @@ async def _is_safe_callback_url(url: str) -> tuple[bool, str]:
 # `_ASIN_RE` 现在从 common/core/idents.py import（见文件头），本地不再定义。
 # 那份真源与 worker/parser.py 共用；`.strip().upper()` 的归一留在下面
 # `_normalize_asin` 里 —— 正则自己不做大小写归一。
-# 美国邮编：5 位数字（兼容 ZIP+4，前 5 位）
-#
-# P4.6：``\Z`` 而不是 ``$``。Python 的 ``$`` 在**末尾恰好一个换行**处也匹配，
-# 于是 ``'10001\n'`` 能通过一条看起来是「只接受 5 位数字」的校验。
-# 本函数在这里之前已经 ``.strip()`` 过，所以这一改**对任何输入都不改变结果**
-# （已实测），它守的是「将来有人把 strip 挪走 / 复制这条正则去别处用」。
-_US_ZIP_RE = re.compile(r'^\d{5}\Z')
+# F-012：美国邮编正则搬进 common/core/marketplace.py 的注册表
+# （``MarketplaceSpec.postal_pattern``），因为它现在是**每个站点一条**，
+# 不再是一条全局常量。P4.6 那条 ``\Z`` vs ``$`` 的论证一并搬过去了。
 
 
 def _normalize_asin(val) -> Optional[str]:
@@ -1078,28 +1096,150 @@ def _normalize_asin(val) -> Optional[str]:
     return s if _ASIN_RE.match(s) else None
 
 
-def _normalize_zip(val) -> Optional[str]:
-    """规范化邮编。返回 5 位数字字符串，无效则 None。
-    支持去掉前导/尾随空白、ZIP+4（取前 5 位）、Excel 数字单元格（如 10001 不会带前导 0 的损失）。
+def _normalize_zip(val, marketplace: str = None) -> Optional[str]:
+    """规范化投递地编码。不合法返回 ``None``。
+
+    ``marketplace=None``（默认）-> 美国站，行为与 F-012 之前**逐字节一致**：
+    去空白、ZIP+4 取前段、Excel 数字单元格（``90001.0``）、短数字补零，
+    最后按 ``^\d{5}$`` 校验。这条等价性是实测过的，不是推断的：
+    4530 组输入（含随机模糊串、整数、浮点数）下新旧实现零差异，
+    用例在 ``tests/test_marketplace.py::UsZipEquivalence``。
+
+    ``marketplace='amazon.ca'`` -> 加拿大邮编（``M5V 3L9``）。**补零规则不适用**
+    （它不是纯数字），归一化到带空格的大写规范形。
+
+    实现委托给 ``common/core/marketplace.py`` —— 那里是「站点」这件事的唯一
+    真源。本函数留作 HTTP 边界的稳定入口：``server/app.py`` 内外有十余处
+    引用它，而且它与 ``relay.normalize_zip`` 的一致性是一条承重约束
+    （两个值会被 ``reconcile_zip_verify`` 直接比较，一边补零一边不补就是
+    凭空造出的 mismatch）。
     """
-    if val is None:
-        return None
-    s = str(val).strip()
-    if not s:
-        return None
-    # Excel 数字 90001.0 → "90001"
-    if s.endswith(".0") and s[:-2].isdigit():
-        s = s[:-2]
-    # 前 5 位（兼容 "10001-1234"）
-    head = s.split("-", 1)[0].strip()
-    # 数字邮编位数补 0（Excel 把 "01234" 存为 1234）
-    # P4.6：补零规则的唯一真源是 common/core/zipcode.py —— 本函数归一出来的值
-    # 会去和 relay 归一出来的 zip_requested 比对，两边一边补零一边不补，
-    # 就是凭空造出的 mismatch。原先这里写的是 ``len(head) <= 5``，
-    # 而 ``"12345".zfill(5) == "12345"``，所以 ``or head`` 这一支覆盖的
-    # 「5 位数字」情形结果完全一致（已实测）。
-    head = _zfill_short_numeric(head) or head
-    return head if _US_ZIP_RE.match(head) else None
+    return _marketplace.normalize_postal(val, marketplace)
+
+
+def _resolve_marketplace(raw) -> "_marketplace.MarketplaceSpec":
+    """HTTP 边界上的站点参数 -> 注册表 spec（F-012 blocker 3）。
+
+    ``None`` / 空串 / 纯空白 -> 美国站：老客户端不传这个字段，行为必须与
+    F-012 之前逐字节一致。收的写法同 ``marketplace.normalize_id``
+    （``amazon.ca`` / ``www.amazon.ca`` / ``https://www.amazon.ca/`` / 大小写）。
+
+    不在注册表里 -> **400**，绝不静默回退到美国站：调用方以为在采加拿大、
+    实际采的是美国，而任何一侧都不会响 —— 这正是 blocker 3 本身的形状。
+    """
+    if raw is None or not str(raw).strip():
+        return _marketplace.get(None)
+    try:
+        return _marketplace.get(raw)
+    except ValueError as e:
+        raise HTTPException(400, f"{e}。ASIN 清单只能建在可采详情的站点上") from None
+
+
+def _site_default_zip(spec: "_marketplace.MarketplaceSpec") -> str:
+    """调用方没给邮编时，某个站点的批次默认邮编（F-012 blocker 3）。
+
+    * 美国站：原样返回全局设置里的 ``zip_code``，**不校验** —— 与 F-012 之前
+      ``zip_code or _runtime_settings.get(...)`` 逐字节一致（golden 钉着）。
+    * 其它站点：全局设置里存的是美国邮编，拿它去加拿大站 Amazon 不会报错，
+      而是静默落到默认地区。所以全局值对该站点合法才用，否则用注册表的
+      ``default_postal``。口径同 ``server/api/searches.py`` 的关键词批次。
+    """
+    zc = _runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE)
+    if spec.id == _marketplace.DEFAULT_MARKETPLACE:
+        return zc
+    return _normalize_zip(zc, spec.id) or spec.default_postal
+
+
+def _site_zip_error(raw, spec: "_marketplace.MarketplaceSpec") -> HTTPException:
+    """调用方给的邮编不符合该站点形状时的 400（F-012 blocker 3）。
+
+    报错原文与 ``server/api/searches.py`` 关键词批次那句同口径：带上站点名和
+    一个合法示例。只说「非法邮编」的话，一个往加拿大站批次里填了 ``10001``
+    的用户看不出错在哪 —— 那是个完全合法的美国邮编。
+
+    返回而不是直接 raise，是让调用点写成 ``raise _s._site_zip_error(...)``，
+    读代码的人在调用点就能看到这里会中断。
+    """
+    return HTTPException(
+        400, f"非法邮编: {raw!r}（{spec.label}需要 {spec.default_postal!r} 这种形状）")
+
+
+#: 每个批次名一把锁 + 引用计数（见 ``_batch_name_lock``）。用完即删，不会随批次名增长。
+_batch_name_locks: Dict[str, list] = {}
+
+
+@asynccontextmanager
+async def _batch_name_lock(*names):
+    """同名批次的「查站点 -> 写任务」串行化（F-012 blocker 3）。
+
+    ``_reject_cross_site_batch`` 是先查后写：两个同名、不同站点的请求同时到达时，
+    两边都查到「没有别的站点的任务」，然后都写进去 —— 批次就混了站点，之后同名的
+    每一次推送都是 409。把「查 + 写」放进同一把按批次名的锁里，第二个请求就会在
+    第一个写完之后再查，查到别的站点 -> 409。
+
+    只锁同名请求，不同批次名之间互不等待；美国站同名追加的响应不变，只是同名
+    请求之间排队。锁是**进程内**的 —— server 是单进程（``main()`` 的
+    ``uvicorn.run`` 没开多 worker），多进程部署需要换成库里的行锁。
+    多个名字按排序后的顺序加锁，两个各要两把锁的请求不会互相死等。
+    """
+    keys = sorted({str(n) for n in names})
+    entries = []
+    for k in keys:
+        ent = _batch_name_locks.setdefault(k, [asyncio.Lock(), 0])
+        ent[1] += 1
+        entries.append((k, ent))
+    acquired = []
+    try:
+        for _k, ent in entries:
+            await ent[0].acquire()
+            acquired.append(ent[0])
+        yield
+    finally:
+        for lock in reversed(acquired):
+            lock.release()
+        for k, ent in entries:
+            ent[1] -= 1
+            if ent[1] == 0 and _batch_name_locks.get(k) is ent:
+                del _batch_name_locks[k]
+
+
+async def _reject_cross_site_batch(name, spec: "_marketplace.MarketplaceSpec") -> None:
+    """同名批次里已有**别的站点**的任务 -> 409（F-012 blocker 3）。
+
+    给「同名 = 合并 / 追加」的入口用（插件推送、关键词批次、卖家文件上传）：
+    一个批次只能属于一个站点 —— tasks 是 UNIQUE(batch_id, asin)，批次结果 /
+    导出 / 变体展开都按任务行的站点取数据、按「整批同一站点」挑查询形状。
+    把两个站点混进一个批次，这些读路径就只能走慢的逐行兜底，变体展开取哪条
+    任务行的站点也说不准。调用方要把这个检查和随后的写放进 ``_batch_name_lock``。
+
+    问的是「有没有任何一条任务不属于这个站点」，而不是「第一条任务是哪个站点」：
+    只看 ``LIMIT 1`` 的话，一个已经混了站点的老批次会因为恰好先读到同站点那条而
+    放行，越混越多。批次不存在 / 还没有任务 -> 放行。
+
+    批次名按库层写入时的同一条规则绑定（PG 走 ``text_affinity``，OWNERSHIP.md
+    规则 7）：关键词批次的 ``batch_name`` 可以是 JSON 数字，库层 create_* 会把它
+    转成文本存下；这里若把 int 原样绑到 text 列，asyncpg 直接 DataError -> 500，
+    而改动前同一个请求是 200。SQLite 靠列亲和性，不需要转换。
+    """
+    name_p = db.text_affinity(name) if hasattr(db, "text_affinity") else name
+    sql = (
+        "SELECT t.marketplace FROM tasks t JOIN batches b ON b.id = t.batch_id "
+        "WHERE b.name = ? AND t.marketplace <> ? LIMIT 1"
+    )
+    async with db.read() as rc, rc.execute(sql, (name_p, spec.id)) as c:
+        row = await c.fetchone()
+    if not row:
+        return
+    existing = dict(row)["marketplace"] or _marketplace.DEFAULT_MARKETPLACE
+    try:
+        existing_label = _marketplace.get(existing).label
+    except ValueError:
+        existing_label = existing
+    raise HTTPException(
+        409,
+        f"批次 {name!r} 已经是{existing_label}（{existing}）的批次，不能追加"
+        f"{spec.label}（{spec.id}）的任务：一个批次只能属于一个站点。"
+        f"换一个批次名重新提交。")
 
 
 def _safe_fs_component(name: str) -> Optional[str]:

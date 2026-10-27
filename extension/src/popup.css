@@ -66,6 +66,10 @@ header {
 .badge-seller  { background: #e2f6ea; color: #0b6b3a; }
 .badge-detail  { background: #fdf0e0; color: #96560a; }
 .badge-unknown { background: var(--panel); color: var(--muted); }
+/* 站点徽标：描边而不是填色，与页面类型徽标区分开 —— 它说的是"推到哪个站点"，
+   不是"这是什么页面"。 */
+.badge-site    { background: transparent; color: var(--fg); border: 1px solid var(--border);
+                 font-weight: 500; padding: 2px 8px; margin-left: 4px; }
 
 .meta {
   color: var(--muted);
@@ -173,6 +177,8 @@ input[type="number"] {
   color: var(--muted);
 }
 .queue .q-seller { color: var(--accent); font-size: 11px; }
+/* 非美国站条目的站点标记。提交时按站点拆批次，用户得能看出队列里混了几个站点。 */
+.queue .q-site { color: var(--primary); font-size: 11px; white-space: nowrap; }
 .queue .q-del {
   border: none;
   background: none;

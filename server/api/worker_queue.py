@@ -62,6 +62,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Query, Request, Upload
 
 from common import config
 from common.core import error_types
+from common.core import marketplace as _marketplace
 
 
 def _srv():
@@ -127,6 +128,15 @@ async def api_pull_tasks(request: Request,
     # 走 ``_s._normalize_zip``（属性访问）而不是 from-import：本模块承重约束 1/3，
     # 名字必须留在 `server.app` 上，夹具按名字打补丁。
     pz = _s._normalize_zip(prefer_zip)
+    if pz is None and prefer_zip:
+        # F-012：用 `--zip-code 'K1V 7P8'` 起的 worker，按美国规则归一必然是 None，
+        # 任务分配就悄悄退回「不挑邮编」—— 先领到美国任务、每跨一次站点重建一次
+        # session，只损吞吐、不损数据。美国规则不认时再按其它注册站点试一遍；
+        # 各站点邮编形状互不相交（tests/test_marketplace.py 的
+        # PostalShapesAreDisjoint 钉着），至多一个站点认得它。美国站结果不变。
+        pz = next((z for m in _marketplace.all_ids()
+                   if m != _marketplace.DEFAULT_MARKETPLACE
+                   for z in [_s._normalize_zip(prefer_zip, m)] if z), None)
 
     tasks = await _s.db.pull_tasks(worker_id, count, ns, prefer_zip=pz)
     if worker_id in _s._worker_registry:

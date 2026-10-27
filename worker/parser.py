@@ -31,6 +31,7 @@ from worker.ziputil import _GLOW_LINE2_RE as _GLOW_INGRESS_LINE2_RE
 # 局部的 `ASIN_RE = r'B[0-9A-Z]{9}'`（_extract_page_asin 里那个无锚点裸片段）
 # 是另一回事，**不搬**，理由写在 common/core/idents.py 的 docstring 里。
 from common.core.idents import ASIN_RE as _ASIN_RE
+from common.core import marketplace as _marketplace
 from common.core.textclean import clean_deep as _clean_deep
 
 # ==========================================================================
@@ -117,6 +118,178 @@ ZIP_VERIFY_UNVERIFIED = "unverified"    # 根本没测（空页 / 拦截 / 解�
 _ZIP5_RE = re.compile(r"(?<!\d)(\d{5})(?!\d)")
 
 # ==========================================================================
+# F-012：站点相关的货币口径
+# ==========================================================================
+# 解析器的方法签名上一律用 ``spec=None`` 而不是 ``marketplace: str = None``：
+# 站点在 parse_product 入口解析**一次**，之后逐层往下传的是已经解析好的
+# MarketplaceSpec 对象。每个价格方法各自再 get() 一遍是白白做十几次字典查找
+# 与归一化，而且给了"某一层忘了传、悄悄落回美国站"的机会。
+#
+# ⚠ 站点绝不存进 self。AmazonParser 的实例在 worker 里是**全协程共享**的一个
+#   （worker/engine.py:340），不同协程同时解析不同站点的页面；写进 self 就是
+#   一个只在并发下出现、且只表现为"币种偶尔记错"的竞态。
+
+def _spec_or_default(spec):
+    """``None`` -> 美国站。所有下面这些小助手的共同入口。"""
+    return spec if spec is not None else _marketplace.get(None)
+
+
+def _mid(spec) -> str:
+    """站点规范键（'amazon.com'）。"""
+    return _spec_or_default(spec).id
+
+
+def _cur(spec) -> str:
+    """该站点的期望币种（'USD' / 'CAD'）。"""
+    return _spec_or_default(spec).currency
+
+
+def _sym(spec) -> str:
+    """拼价格串时用的货币符号（页面只给了裸数字时）。
+
+    读注册表的 ``render_symbol`` 显式字段，**不**从 ``price_symbols`` 里挑：
+    那个元组的顺序对两个站点是反的（美国 ("$","US$")、加拿大 ("CDN$","C$","$")），
+    "取第一个"和"取最后一个"各自只对一半。F-012 的实现里真踩过这一脚，
+    美国站拼出了 "US$19.99"。
+    """
+    return _spec_or_default(spec).render_symbol
+
+
+def _sym_re(spec) -> str:
+    """把货币符号转义成可以安全拼进正则的形式。
+
+    ``$`` 在正则里是行尾锚点，``CDN$`` 里的 ``$`` 同理 —— 不转义的话
+    ``'on orders over $'`` 这个模式会变成"行尾之后还有内容"，永远匹配不上。
+    """
+    return re.escape(_sym(spec))
+
+
+#: 零宽 / 方向控制字符。Amazon 页面上这些混在文本里很常见
+#: （``&zwnj;`` / ``&lrm;`` / BOM），它们不可见，但会让任何"整串匹配"
+#: 的正则失配 —— 而失配的表现是字段悄悄变空，不是报错。
+#: 详情表里「这一行说的是**包装/运输件**，不是商品本身」的标志词（压紧形）。
+#:
+#: ⚠ ``parcel`` 是 F-012 实测补进来的：加拿大站的标签是 **"Parcel Dimensions"**，
+#:   不是美国站常见的 "Package Dimensions"。原判据只认 ``package``，于是
+#:   加拿大站的**包装**尺寸/重量被存进了 item_dimensions / item_weight ——
+#:   不是漏采，是**存错了字段**，而两个字段都有值、看不出哪个是错的。
+#:   这正是用户报的「包装尺寸误存为商品尺寸」。
+#: ``shipping`` 同理（"Shipping Weight"），两个站点都出现过。
+_PACKAGE_WORDS = ("package", "parcel", "shipping")
+
+#: 「原产国」在详情表里的**次选**标签（压紧形）。与 ``parcel`` 同一类问题：
+#: 加拿大站把 country_of_origin 这个属性渲染成 **"Country of Publication"**
+#: （实测 36 张加拿大页里 13 张是这个写法，写 "Country of Origin" 的只有 2 张；
+#: 书架、收纳柜这类非书商品也是这个标签）。判据只认 ``countryoforigin``，
+#: 于是整行走空、导出全是 N/A —— 不是页面没有，是标签对不上。
+#:
+#: ⚠ 只当**次选**：同页另有 "Country of Origin" 时以 Origin 为准。"Publication"
+#:   在书类商品上字面意思是出版国，不一定等于原产国，所以它只填空、不覆盖，
+#:   且与行序无关（Origin 行在前在后都赢，见 _map_detail）。
+#: ⚠ 判据不分站点（_map_detail 拿不到站点）。美国站 30 张对照页里这个标签
+#:   一次都没出现，那 30 张的输出逐字段不变；美国站哪天真出现、又没有 Origin 行，
+#:   按同一条规则填空 —— 同一个属性换了个标签，两站一个口径。
+_ORIGIN_FALLBACK_KEYS = ("countryofpublication",)
+
+#: 加拿大站装 UPC 的那一行，标签是 Amazon **没翻译的原始属性名**
+#: ``ProductIDType``（压紧形 ``productidtype``，不含 "upc" 三个字母）。
+#: 同一批 ASIN 在美国站同一位置写的是 "UPC"，值逐字相同（实测 5/5 对）；
+#: 美国站 30 张对照页里这个标签 0 次，美国站输出不变。
+#: 这个属性名本身是泛指「外部商品码」，可能装别的码，所以收值前要过 _gtin_codes。
+_PRODUCT_ID_KEYS = ("productidtype",)
+
+#: 能当 UPC 收的码：**纯数字**，12 位（UPC-A）或 13 位（EAN-13）。
+#: 8 位（UPC-E / EAN-8）、14 位（GTIN-14）、ISBN-10（可能带 X）都不收 ——
+#: 实测加拿大页上这一行的码全是 12 位，放宽长度只会把别的东西吞进 upc_list。
+#: 用 ``[0-9]`` 不用 ``\d``：后者在 str 正则里也认全角 / 阿拉伯-印度数字。
+_GTIN_CODE_RE = re.compile(r"[0-9]{12,13}")
+
+
+def _gtin_codes(v: str) -> List[str]:
+    """从「外部商品码」那一格里取出能当 UPC 收的码，保序去重。
+
+    一格可能有多个码，Amazon 用空格隔开（实测 ``673986005705 196393154472``）。
+    逐个过 _GTIN_CODE_RE，不合格的那个丢掉、合格的照收 —— 别因为一个怪值
+    把同格的好码一起扔了，也别把怪值吞进去。
+
+    逗号 / 分号在抽查的页面里没出现过，也一并当分隔符：只按空格切的话，
+    ``673986005705, 196393154472`` 会切出带逗号的 ``673986005705,``，
+    过不了 fullmatch，同格的好码就丢了一个（规格要求多个码都保留）。
+    这两个分隔符有测试钉着，不是摆设。
+    """
+    out: List[str] = []
+    for tok in re.split(r"[\s,;]+", v or ""):
+        if _GTIN_CODE_RE.fullmatch(tok) and tok not in out:
+            out.append(tok)
+    return out
+
+#: BSR 值里的 "(See Top 100 in XXX)" —— 那是个导航链接的文字，不是排名。
+_BSR_NAV_RE = re.compile(r"\(\s*See Top 100[^)]*\)", re.I)
+
+
+def _strip_bsr_nav(v: str) -> str:
+    """去掉 BSR 值里的 "(See Top 100 in ...)" 并折叠空白。"""
+    if not v:
+        return v
+    return re.sub(r"\s+", " ", _BSR_NAV_RE.sub(" ", str(v))).strip()
+
+_ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff]")
+
+
+def _extract_postal(text: str, spec=None) -> Optional[str]:
+    """从一段文字里**抽出**该站点形状的投递地编码；抽不到返回 None。
+
+    与 ``common/core/marketplace.normalize_postal`` 的区别是「抽取 vs 校验」：
+    那个函数要求整串就是一个邮编，这里要从 ``"Ottawa K1V 7P8"`` 这种
+    glow 文案里把邮编捞出来。仓库里 ``_norm_zip`` 的 docstring 把这条差别
+    叫做「串内抽取」，本函数就是它的站点感知版。
+
+    实现是**用注册表的 postal_pattern 去扫每一个候选子串**，而不是给每个
+    站点再写一条「宽松版」正则：多写一条就多一个会和 postal_pattern 分叉的
+    地方，而它俩分叉的表现是"校验说合法、抽取抽不到"（或反过来），
+    没有任何东西会响。
+
+    候选切法按空白分词后再尝试相邻两词的拼接 —— 加拿大邮编规范形里**有一个
+    空格**（``K1V 7P8``），只按空白切会把它劈成两半，两半都不匹配。
+    """
+    import html as _htmlmod
+    from common.core import marketplace as _m
+    sp = _spec_or_default(spec)
+    if not text:
+        return None
+    # ⚠ 先反转义 + 去零宽字符，再分词。
+    #
+    # 本函数的输入来自 ``_parse_zip_observed``，而那个函数是拿正则**直接扫原始
+    # HTML** 的 —— 解析器出口那道「统一剔除不可见控制字符」它享受不到。
+    # 实测（加拿大站真实页面）glow 挂件的内容是：
+    #
+    #     <span id="glow-ingress-line2">\n     K1V 7P8&zwnj;\n   </span>
+    #
+    # 尾巴上那个 ``&zwnj;``（零宽非连接符）会让 "7P8&zwnj;" 归一化失败，
+    # 于是**整个邮编抽不出来**。这是 zip_observed 恒空的第二个原因，
+    # 与第一个（用了 5 位数字正则）互相独立 —— 修好前者才看得见后者。
+    raw = _htmlmod.unescape(str(text))
+    raw = _ZERO_WIDTH_RE.sub("", raw)
+    words = raw.replace(",", " ").split()
+    # 先试单词，再试相邻两词拼接（覆盖带空格的加拿大邮编）
+    candidates = list(words)
+    candidates += [f"{a} {b}" for a, b in zip(words, words[1:])]
+    for cand in candidates:
+        norm = _m.normalize_postal(cand, sp.id)
+        if norm is not None:
+            return norm
+    return None
+
+
+#: 页面上出现了**别的国家**的货币（串区 / 代理落错国家）。
+#:
+#: 逐字节等于改造前 _slx_parse_current_price 里那条内联正则 —— 它是"标记但仍
+#: 提取"的触发条件，不是币种判定。故意**不**做成按站点取：这几个符号
+#: （CNY/EUR/GBP/JPY）对美加两站来说都是"外国货币"，而把 $ 加进去会让
+#: 美国站的每一条价格都被标记。
+_FOREIGN_PRICE_RE = re.compile(r'(?:CNY|EUR|GBP|JPY|¥|€|£)\s*[\d,]+\.?\d*')
+
+# ==========================================================================
 # P4-9：parse_engine 取值
 # ==========================================================================
 ENGINE_SELECTOLAX = "selectolax"
@@ -178,25 +351,6 @@ _DELIVERY_DATE_RE = re.compile(
     r'Oct(?:ober)?\.?\s+\d+|Nov(?:ember)?\.?\s+\d+|Dec(?:ember)?\.?\s+\d+)',
     re.IGNORECASE,
 )
-
-
-#: 详情表里「这一行说的是**包装 / 运输件**，不是商品本身」的标志词（压紧形，
-#: 见 AmazonParser._compact_key）。
-#:
-#: ``shipping`` 是后补的：Amazon 包装重量那一行有两种写法，``Package Weight``
-#: 与 ``Shipping Weight``。原判据只认 ``package``，后者两个条件都不满足，
-#: 整条 elif 链走空 —— 不是存错位置，是一个字都没存。
-_PACKAGE_WORDS = ("package", "shipping")
-
-#: BSR 值里的 "(See Top 100 in XXX)" —— 那是个导航链接的文字，不是排名。
-_BSR_NAV_RE = re.compile(r"\(\s*See Top 100[^)]*\)", re.I)
-
-
-def _strip_bsr_nav(v: str) -> str:
-    """去掉 BSR 值里的 "(See Top 100 in ...)" 并折叠空白。"""
-    if not v:
-        return v
-    return re.sub(r"\s+", " ", _BSR_NAV_RE.sub(" ", str(v))).strip()
 
 
 def _slx_iter_descendants(node):
@@ -303,7 +457,7 @@ class AmazonParser:
     # 垃圾文字黑名单（五点描述过滤用）
     #
     # 它要挡的是 Amazon 自己的**退货弹层模板句**。真实页面上（2026-10 抽查的
-    # 30 张美国页里 19 张有）buybox 的 "FREE Returns" 弹层里是这么一段：
+    # 66 张美 / 加页面每张都有）buybox 的 "FREE Returns" 弹层里是这么一段：
     #
     #   <div id="creturnsHowToReturnExpanderContent" class="a-expander-content ...">
     #     <ol> <li><span class="a-list-item">Go to your orders and start the return</span></li>
@@ -334,13 +488,14 @@ class AmazonParser:
         """这一条是不是 Amazon 混进来的模板句（而不是卖家写的卖点）。
 
         原判据是"小写后含黑名单任一子串就整条删"，于是卖家的真实卖点被误删
-        （2026-10 抽查的 30 张美国页上两例，各被删掉一条）：
+        （2026-10 抽查 33 个加拿大商品里 3 个，美国页同样复现）：
 
-            Smiley Customer Service: Welcome to Contact Us; ...                          B0D4QGVN6F
-            Instruction and High Quality Wood: ... our customer service team is always ...  B0D45YH9FL
+            Smiley Customer Service: Welcome to Contact Us; ...          B0D4QGVN6F
+            Customer Support - Comes with 1 luggage rack ... 24/7 customer service ...   B09Y3DKJKQ
+            Instruction and Customer Service: You could see the installation steps ...   B0D45YH9FL
 
         区别在形状上：模板句是**一句完整的说明**，没有小标题；卖家卖点几乎都以
-        自己的「小标题：」/「小标题 - 」/【小标题】开头。
+        自己的「小标题：」/「小标题 - 」/【小标题】开头（抽查 347 条卖点里 344 条）。
         所以收窄成：**含黑名单词，且不以卖家小标题开头**，才算模板句。
 
         ⚠ 只收窄、不放宽：黑名单词一个没删。不带小标题、又恰好提到
@@ -360,39 +515,52 @@ class AmazonParser:
     def _squash_ws(cls, s: str) -> str:
         """详情值 / 品牌的空白归一，口径经用户确认：首尾去掉、中间合并成一个空格。
 
-        为什么需要：详情表的值要用 ``text(separator=" ", strip=True)`` 取（否则 BSR
-        这种多元素的值会粘成 "#36 inChristmas Trees"），而 selectolax 的这个调用是
-        **逐文本节点** strip 再用分隔符拼接，td 里 span 两侧的缩进文本节点被 strip
-        成空串之后**仍然各贡献一个分隔符**：
+        为什么需要：selectolax 的 ``text(separator=" ", strip=True)`` 是**逐文本
+        节点** strip 再用分隔符拼接，td 里 span 两侧的缩进文本节点被 strip 成空串
+        之后**仍然各贡献一个分隔符**：
 
-            <td class="a-span9">    <span class="po-break-word">SHareconn</span>   </td>
-            -> ' SHareconn '
+            <td class="a-span9">    <span class="po-break-word">MoKitDora</span>   </td>
+            -> ' MoKitDora '
 
-        按品牌 join / 去重时 ' SHareconn ' 与 'SHareconn' 是两个品牌。两个词分在两个
-        标签里时同理会拼出双空格；``&nbsp;`` 会原样留成 ``\\xa0``（lxml 的
-        normalize-space 也不认它）。
+        真实导出 535 行里 44 行品牌带首尾空格（' SMIBUY ' / ' MoKitDora ' ...），
+        按品牌 join / 去重时与 'SMIBUY' 是两个品牌。两个词分在两个标签里时同理会
+        拼出双空格；``&nbsp;`` 会原样留成 ``\\xa0``（lxml 的 normalize-space 也不认它）。
         """
         return cls._WS_RUN_RE.sub(" ", s).strip()
 
-    def parse_product(self, html_text: str, asin: str, zip_code: str = "10001") -> Dict[str, Any]:
+    def parse_product(self, html_text: str, asin: str, zip_code: str = "10001",
+                      marketplace: str = None) -> Dict[str, Any]:
         """
         解析 Amazon 商品页面
         返回包含所有字段的字典
         即使某些字段提取失败也不会崩溃
+
+        ``marketplace``（F-012）决定**币种口径**。``None`` -> 美国站，
+        与改造前逐字节一致。
+
+        ⚠ 站点通过**参数**一路传下去，不存成 self 上的属性。
+          ``AmazonParser`` 的实例在 worker 里是**全协程共享**的一个
+          （worker/engine.py:340 `self.parser = _ParserClass()`），
+          而不同协程同时在解析不同站点的页面。把站点写进 self 会让 A 协程
+          的加拿大页面用上 B 协程刚设的美国口径 —— 一个只在并发下出现、
+          且只体现为"币种偶尔记错"的竞态。参数传递是唯一安全的做法。
         """
-        result = self._default_result(asin, zip_code)
+        spec = _marketplace.get(marketplace)
+        result = self._default_result(asin, zip_code, spec)
 
         if not html_text:
             result["title"] = "[页面为空]"
             return result
 
         # JSON-LD 优先提取：从结构化数据获取核心字段
-        jsonld = self._extract_jsonld(html_text)
+        jsonld = self._extract_jsonld(html_text, spec)
 
         if _USE_SELECTOLAX:
-            parsed = self._parse_with_selectolax(html_text, asin, zip_code, result, jsonld)
+            parsed = self._parse_with_selectolax(html_text, asin, zip_code,
+                                                 result, jsonld, spec)
         else:
-            parsed = self._parse_with_lxml(html_text, asin, zip_code, result, jsonld)
+            parsed = self._parse_with_lxml(html_text, asin, zip_code, result,
+                                           jsonld, spec)
 
         # 统一在**出口**剔除不可见控制字符（U+200E 等），两个引擎共用这一处。
         #
@@ -409,7 +577,7 @@ class AmazonParser:
         # 为什么出口还要一道：品牌有四五个来源（JSON-LD / 详情表 / byline /
         # logo alt / meta keywords），只修详情表那一路保证不了"最终值"的形状。
         # 必须排在 _clean_deep **之后**：U+200E 删掉之后才露出来的空白
-        # （"‎ SHareconn" -> " SHareconn"）在之前做就漏了。
+        # （"\u200e MoKitDora" -> " MoKitDora"）在之前做就漏了。
         # 归一后成空串说明原值只有空白 —— 回到"没取到"的哨兵，与其它来源一致。
         brand = cleaned.get("brand")
         if isinstance(brand, str):
@@ -418,7 +586,8 @@ class AmazonParser:
 
     # ==================== selectolax 解析路径 ====================
 
-    def _parse_with_selectolax(self, html_text: str, asin: str, zip_code: str, result: Dict, jsonld: Dict) -> Dict:
+    def _parse_with_selectolax(self, html_text: str, asin: str, zip_code: str,
+                               result: Dict, jsonld: Dict, spec=None) -> Dict:
         """使用 selectolax 解析"""
         # P4-9：先记引擎再解析 —— 连「解析器自己炸了」的记录也要能归因到引擎。
         result["_parse_engine"] = ENGINE_SELECTOLAX
@@ -437,7 +606,7 @@ class AmazonParser:
 
         # P4-1 / P4-2：质量信号。放在拦截判定**之后** —— 验证码页上的
         # completeness 必须是 0（未测量），而不是「三个区块都缺」。
-        self._apply_quality_signals(result, tree, html_text, zip_code)
+        self._apply_quality_signals(result, tree, html_text, zip_code, spec)
 
         # variant 偏移检测：提取页面当前 active ASIN 供上层校验
         # 多属性产品偶发 default variant 偏移，写到 result["_page_asin"]
@@ -445,7 +614,7 @@ class AmazonParser:
         result["_page_asin"] = self._extract_page_asin(tree, html_text)
 
         # v3: 提取 JS 脚本数据（额外 fallback 层）
-        sp_data = self._extract_sp_data(html_text)
+        sp_data = self._extract_sp_data(html_text, spec)
 
         # 全页预扫描 — 提取 Product Information 表格
         page_details = self._slx_parse_all_details(tree, html_text)
@@ -494,8 +663,8 @@ class AmazonParser:
             result["current_price"] = "See price in cart"
             result["buybox_price"] = "N/A"
             result["original_price"] = self._slx_parse_original_price(tree)
-            result["buybox_shipping"] = self._slx_parse_buybox_shipping(tree, None)
-            result["is_fba"] = self._slx_parse_fulfillment(tree, html_text)
+            result["buybox_shipping"] = self._slx_parse_buybox_shipping(tree, None, spec)
+            result["is_fba"] = self._slx_parse_fulfillment(tree, html_text, spec)
             avail_node = tree.css_first('div#availability span')
             stock_text = avail_node.text(strip=True) if avail_node else ""
             result["stock_status"] = stock_text if stock_text else "In Stock"
@@ -505,12 +674,12 @@ class AmazonParser:
             result["delivery_time"] = d_time
         else:
             # v3 增强价格解析
-            result["current_price"] = self._slx_parse_price_enhanced(tree, jsonld, sp_data)
+            result["current_price"] = self._slx_parse_price_enhanced(tree, jsonld, sp_data, spec)
             bb = self._slx_parse_buybox_price(tree)
             result["buybox_price"] = bb if bb else result["current_price"]
             result["original_price"] = self._slx_parse_original_price(tree)
-            result["buybox_shipping"] = self._slx_parse_buybox_shipping(tree, result["current_price"])
-            result["is_fba"] = self._slx_parse_fulfillment(tree, html_text)
+            result["buybox_shipping"] = self._slx_parse_buybox_shipping(tree, result["current_price"], spec)
+            result["is_fba"] = self._slx_parse_fulfillment(tree, html_text, spec)
             # v3 增强库存解析
             result["stock_status"] = self._slx_parse_stock_enhanced(tree, jsonld, sp_data, html_text)
             if result["current_price"] == "N/A" and result["buybox_price"] == "N/A" and result["stock_status"] == "N/A":
@@ -566,7 +735,7 @@ class AmazonParser:
         result["review_count"] = self._parse_review_count(tree, jsonld)
 
         # 卖家店铺 ID + 名（buybox 卖家档案链接）
-        seller_id, seller_name = self._parse_seller(tree, html_text)
+        seller_id, seller_name = self._parse_seller(tree, html_text, spec)
         result["seller_id"] = seller_id
         result["seller_name"] = seller_name
         # buybox offer 的品相（二手/翻新）。放在 seller 之后 —— 两者同源于
@@ -797,7 +966,7 @@ class AmazonParser:
             pass
         return "N/A"
 
-    def _slx_parse_current_price(self, tree) -> str:
+    def _slx_parse_current_price(self, tree, spec=None) -> str:
         try:
             # 会员价行被选中时改读全新行（见 _member_price_scopes）。其余情形前缀为空，
             # 选择器与原来逐字节相同。选择器在外层、作用域在内层：优先级照旧，
@@ -821,11 +990,20 @@ class AmazonParser:
                 node = tree.css_first(sel)
                 if node:
                     p = node.text(strip=True)
-                    if p and "$" in p:
+                    # F-012：认的是**本站点**的货币符号。
+                    #
+                    # ⚠ 这里绝不能反过来「按符号推币种」：美加两站的价格都
+                    #   渲染成 $24.99，按符号推会把加元当美元原样收下 ——
+                    #   数字对、币种错、没有任何标记。币种由站点决定
+                    #   （common/core/marketplace.py 的模块 docstring 第四节）。
+                    if p and _marketplace.has_local_price_symbol(p, _mid(spec)):
                         return p
-                    # v3: 检测非 USD 价格（CNY, EUR, GBP 等）— 标记但仍提取
-                    if p and re.search(r'(?:CNY|EUR|GBP|JPY|¥|€|£)\s*[\d,]+\.?\d*', p):
-                        return f"[非USD]{p}"
+                    # 页面渲染出了**别的国家**的货币（串区 / 代理落错国家）：
+                    # 标记但仍提取，让下游看得见这条记录有问题。
+                    # 标签按站点取：美国站仍是历史上的 "[非USD]"（逐字节不变），
+                    # 其它站点用 "[非CAD]" 这种同构写法。
+                    if p and _FOREIGN_PRICE_RE.search(p):
+                        return f"[非{_cur(spec)}]{p}"
             # 方法2: 拆分整数+小数（限定到价格容器）
             containers = ['#corePrice_feature_div', '#corePriceDisplay_desktop_feature_div',
                           '#corePrice_desktop', '#price', '#apex_offerDisplay_desktop']
@@ -837,7 +1015,7 @@ class AmazonParser:
                     whole = whole_node.text(strip=True)
                     frac = frac_node.text(strip=True)
                     if whole and frac:
-                        return f"${whole.replace('.', '')}.{frac}"
+                        return f"{_sym(spec)}{whole.replace('.', '')}.{frac}"
         except Exception:
             pass
         return "N/A"
@@ -871,7 +1049,7 @@ class AmazonParser:
                 continue
         return None
 
-    # ---- accordion buybox：原价 / 配送 / 运费 / 会员价时的现价只读下单那一行 ----
+    # ---- 原价：accordion buybox 只读选中那一行 ----
     #
     # 2026-09 起的多 offer accordion 布局里，**每一行 offer 都有自己的一整套价格块**，
     # 而且 id 是重复的：
@@ -879,17 +1057,17 @@ class AmazonParser:
     #   #centerCol #apex_desktop
     #       #apex_desktop_newAccordionRow   > #corePriceDisplay_desktop_feature_div
     #       #apex_desktop_usedAccordionRow  > #corePriceDisplay_desktop_feature_div
-    #           …"New Condition Price: $79.99"（basisPrice，带 data-a-strike）
+    #           …"New condition price: $112.99"（basisPrice，带 data-a-strike）
     #   #buybox #buyBoxAccordion
     #       #newAccordionRow_0.a-accordion-active > … #corePrice_feature_div
     #       #usedAccordionRow                     > … #corePrice_feature_div
     #
     # 原来全页取第一个划线价，全新行自己没有划线价时就落到二手行的
-    # "New Condition Price"（= 全新件的现价），导出成 原价 = 现价。
-    # 实例（美国页）：B0CQWZR6L8 $79.99、B0GGGQBJSB $39.99、B0GKNHN7Q5 $119.99。
+    # "New condition price"（= 全新件的现价），导出成 原价 = 现价。
+    # 实例：CA B09Y3DKJKQ / B0CG19X7RN，US B0CQWZR6L8 / B0GGGQBJSB / B0GKNHN7Q5。
     # 做法与 #24 修 offer_condition 一致：只读 a-accordion-active 那一行；
-    # 行 id 去掉 `_N` 后缀就是中栏价格块的 `apex_desktop_<行名>`（30 张美国真实页
-    # 里的 9 张 accordion 页全部对得上）。选中的是会员价行时改读全新行（与现价同一行，
+    # 行 id 去掉 `_N` 后缀就是中栏价格块的 `apex_desktop_<行名>`（36+30 张真实页
+    # 上 12 张 accordion 页全部对得上）。选中的是会员价行时改读全新行（与现价同一行，
     # 见 _accordion_offer_scopes）。
     #
     # 同一个「整个购买框里取第一个 / 取最快」的毛病还在配送与运费上（每行各有一份
@@ -897,11 +1075,11 @@ class AmazonParser:
     # （_accordion_selected_row；offer_condition 还留着 #24 的一份等价旧写法）；
     # 原价 / 配送 / 运费用 _accordion_purchase_row，会员价时的现价用 _member_price_scopes。
     #
-    # 同类字段逐个核过（抽查的 accordion 真实页）、**没改**的：库存状态取第一个
+    # 同类字段逐个核过（12 张 accordion 真实页）、**没改**的：库存状态取第一个
     # #availability、卖家取第一个卖家链接、FBA 判定取第一个 "Ships from"，
     # 选中行（或会员价行后面的全新行，两者卖家 / 发货方相同）都排在 DOM 最前，
-    # 抽查页上取到的都是对的那一行。库存数的数量下拉是**所有行**取最大值，
-    # 抽查页上都等于下单那一行的值（二手行的上限更小）。没有真实页面证据，不动。
+    # 12 张页上取到的都是对的那一行。库存数的数量下拉是**所有行**取最大值，
+    # 12 张页上都等于下单那一行的值（二手行的上限更小）。没有真实页面证据，不动。
 
     #: 行 id 要拼进 CSS / XPath，只收字母开头的字母数字下划线；别的一律当认不出。
     _ACCORDION_ROW_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
@@ -935,7 +1113,7 @@ class AmazonParser:
 
         offer_condition（``_parse_offer_condition``）里还有一份等价的旧写法
         （#24，同一条 a-accordion-active 选择器，读的是行文本、没有「退到全新行」
-        也没有 id 校验），没并过来：并的话要先在真实页上对 offer_condition
+        也没有 id 校验），没并过来：并的话要先在 66 张真实页上对 offer_condition
         做一遍前后对比，不在这次改动的范围里。
         """
         if not self._has_any_block(tree, ("buyBoxAccordion",)):
@@ -959,10 +1137,10 @@ class AmazonParser:
         """普通买家实际下单的那一行：选中行；选中的是会员价行时换成全新行。
 
         配送日期 / 天数 / 运费用它：会员价行**不带配送信息**，只读它会恒为 N/A；
-        而回落全页又会读到别的行（用户实测美国 B0CQWZR6L8：未选中的二手行有 Prime
-        「Tomorrow」，选中的全新行是更晚的日期，入库成了 Tomorrow）。
-        原价也用它（经 ``_accordion_offer_scopes``）：会员价行的 List / Typical 是
-        相对会员价标的，配上全新行的现价会出现 原价 ≤ 现价。
+        而回落全页又会读到二手行（实测 CA B0CG19X7RN：选中的全新行只有
+        October 16，未选中的二手行有 October 14 / Monday October 12，导出成了
+        October 12）。原价也用它（经 ``_accordion_offer_scopes``）：会员价行的
+        List / Typical 是相对会员价标的，配上全新行的现价会出现 原价 ≤ 现价。
         返回值语义同 ``_accordion_selected_row``；会员价行被选中却找不到全新行时
         给 ``""``（N/A），不猜。
         """
@@ -980,7 +1158,7 @@ class AmazonParser:
 
         * 没选中会员价行（含非 accordion、认不出行）-> ``None``：调用方照旧取，
           选择器逐字节不变。只有会员价这一种情形改行，别的 accordion 页上现价
-          本来就取到选中行（选中行在 DOM 里排第一，抽查的真实页都是）。
+          本来就取到选中行（选中行在 DOM 里排第一，12 张真实页都是）。
         * 选中会员价行、却没有全新行 -> ``[]``：调用方给 N/A。拿会员价顶上
           就是用户否掉的那个值。
 
@@ -1014,10 +1192,10 @@ class AmazonParser:
         * 没有展开行时退到全新行（newAccordionRow_N）：页面主推的就是它。
         * 中栏**没有任何**分行价格块（``apex_desktop_*AccordionRow``）时，再加上
           整个 ``#apex_desktop``：那是较早的 accordion 形状 —— buybox 分行、中栏
-          只有一份价格块，而那一份就是主推 offer 的。抽查的 accordion 页全是分行
-          形状，走不到这里；不加的话这种页上中栏真实的 List / Was 价会被丢成
-          N/A（改动前是取得到的）。分行块存在时不加：整块里还套着二手行，
-          加了就又是这个 bug。选中会员价行时也不加：那时主推的是会员价，
+          只有一份价格块，而那一份就是主推 offer 的。语料里 12 张 accordion 页
+          全是分行形状，走不到这里；不加的话这种页上中栏真实的 List / Was 价
+          会被丢成 N/A（基线是取得到的）。分行块存在时不加：整块里还套着
+          二手行，加了就又是这个 bug。选中会员价行时也不加：那时主推的是会员价，
           中栏那一份就是会员价的（同 ``_member_price_scopes`` 不带它的理由）。
 
         会员价行被选中时**原价读全新行**（用户口径 2026-10-14：原价跟现价同一行，
@@ -1029,8 +1207,8 @@ class AmazonParser:
         结果不变。
 
         已知未覆盖：现价只在「选中会员价行」时改行，卖家仍取页面上第一个。假如某页
-        选中的是**二手行**（抽查页里没有一张是），原价会是二手行的
-        "New Condition Price"、现价却是全新行的价格，又成了 原价 = 现价 ——
+        选中的是**二手行**（语料 66 张里没有一张是），原价会是二手行的
+        "New condition price"、现价却是全新行的价格，又成了 原价 = 现价 ——
         根子在现价不分行，归那几个字段的修复去管，不在这里压掉划线价。
         """
         rid = self._accordion_purchase_row(tree)
@@ -1066,7 +1244,8 @@ class AmazonParser:
             pass
         return "N/A"
 
-    def _slx_parse_buybox_shipping(self, tree, current_price: Optional[str]) -> str:
+    def _slx_parse_buybox_shipping(self, tree, current_price: Optional[str],
+                                   spec=None) -> str:
         try:
             # accordion：每一行 offer 各有一份 #deliveryBlockMessage（id 重复）。
             # 原来把**所有行**的文案拼成一段再判，并取**全页第一个**
@@ -1085,15 +1264,16 @@ class AmazonParser:
                 return "FREE"
 
             # 满额免邮
-            # 金额两侧的空白可有可无：金额包在子标签里（<b>$35.00</b>）时，上面拼的那段
-            # 里父节点的 text(strip=True) 是无分隔符拼接，"over" 与 "$35.00" 之间没有空格；
-            # 写死一个空格就只在 lxml 一侧（逐个文本节点、空格相连）认得出，两条引擎分叉。
-            free_over = re.search(r'free delivery.*?on orders over\s*\$\s*(\d+(?:\.\d+)?)',
-                                  delivery_block, re.IGNORECASE)
+            # F-012：货币符号按站点转义后拼进正则。加拿大站的文案是
+            # "FREE delivery ... on orders over CDN$ 35.00"，用写死的 \$ 会
+            # 匹配不到 —— 匹配不到的后果不是报错，是 buybox_shipping 静默写错。
+            free_over = re.search(
+                r'free delivery.*?on orders over\s*%s\s*(\d+(?:\.\d+)?)' % _sym_re(spec),
+                delivery_block, re.IGNORECASE)
             if free_over:
                 threshold = float(free_over.group(1))
                 if current_price and current_price not in ['N/A', 'See price in cart', '不可售']:
-                    price_match = re.search(r'\$?([\d,]+\.?\d*)', current_price)
+                    price_match = re.search(r'[^\d]*([\d,]+\.?\d*)', current_price)
                     if price_match:
                         price_val = float(price_match.group(1).replace(',', ''))
                         if price_val >= threshold:
@@ -1107,7 +1287,7 @@ class AmazonParser:
                 if dp:
                     return dp.strip()
 
-            # 兜底（2026-10 抽查的真实页上都没有这个节点，不属于 accordion 的行结构，照旧全页取）
+            # 兜底（2026-10 的 66 张真实页上都没有这个节点，不属于 accordion 的行结构，照旧全页取）
             shipping = self._slx_text(tree, [
                 'div#mir-layout-loaded-comparison-row-2 span',
             ])
@@ -1163,7 +1343,7 @@ class AmazonParser:
             pass
         return False
 
-    def _slx_parse_fulfillment(self, tree, html_text: str) -> str:
+    def _slx_parse_fulfillment(self, tree, html_text: str, spec=None) -> str:
         try:
             # 1. 结构化标签
             rows = tree.css('div#tabular-buybox tr')
@@ -1193,7 +1373,14 @@ class AmazonParser:
             match = re.search(r'(ships from|shipper / seller)\s*[:\s]*([a-z0-9\s]+)', blob)
             if match and "amazon" not in match.group(2).strip():
                 return "FBM"
-            if "fulfilled by amazon" in blob or "prime" in blob or "amazon.com" in blob:
+            # F-012：``amazon.com`` 换成按站点的域名。
+            # ⚠ 这一处**改不改结果都一样**，改它是为了别留一条会误导人的字面量：
+            #   上面那条 "ships from X 且 X 不含 amazon -> FBM" 已经把加拿大站的
+            #   "ships from amazon.ca" 正确归到非 FBM，而本行走不到时下面还有
+            #   `return "FBA"` 兜底 —— 三条路都通向 FBA。留着写死的域名，
+            #   下次有人照它推断"站点差异已处理"就会推错。
+            if ("fulfilled by amazon" in blob or "prime" in blob
+                    or _mid(spec) in blob):
                 return "FBA"
         except Exception:
             pass
@@ -1267,11 +1454,9 @@ class AmazonParser:
         try:
             # 语义不变：报**能看到的最快**配送（含 Prime 会员专享，见 _pick_delivery），
             # 只是在 accordion 页上把「能看到」收窄到普通买家下单的那一行
-            # （_accordion_purchase_row）。原来全页取最快，未选中的行更快时就报了别的行的
-            # 日期（用户实测美国 B0CQWZR6L8：二手行 Prime「Tomorrow」入库）。
-            # 拿保存的页面做前后对比时要把时钟钉在抓取时刻：天数按解析当天算，已过去的
-            # 月 + 日会被当成明年（三百多天）、不再是最快，换个日子重解析，「全页最快」
-            # 本身就会变，前后差异里会混进与本改动无关的配送变化。
+            # （_accordion_purchase_row）。原来全页取最快，未选中的二手行更快时
+            # 就报了二手行的日期（CA B0CG19X7RN：选中行 October 16，导出 October 12；
+            # 用户实测 US B0CQWZR6L8：二手行 Prime「Tomorrow」入库）。
             # 认不出行给 N/A；非 accordion：前缀为空，选择器与原来逐字节相同。
             row = self._accordion_purchase_row(tree)
             if row == "":
@@ -1356,22 +1541,31 @@ class AmazonParser:
                     continue
                 clean.append(b)
 
-            # **按顺序去重**。
+            # F-012 实测修复：**按顺序去重**。
             #
-            # 实测（真实页面）六条卖点被采成了十二条 —— 正好两倍。根因是
-            # `#feature-bullets` 里同时存在两份 `ul`：可见的那份，加上 "See more"
-            # 展开区（`div.a-expander-content`）里的同一份副本。上面那条选择器是
-            # `... ul > li span.a-list-item`，两份都命中。
+            # 实测（加拿大站 Gildan 三件装）六条卖点被采成了十二条 —— 正好
+            # 两倍。根因是 `#feature-bullets` 里同时存在两份 `ul`：
+            # 可见的那份，加上 "See more" 展开区（`div.a-expander-content`）
+            # 里的同一份副本。上面那条选择器是 `... ul > li span.a-list-item`，
+            # 两份都命中。
             #
             # ⚠ 为什么是去重而不是"只取第一个 ul"：哪一份在前不由我们决定，
             #   而且有的页面真的把卖点拆在两个 ul 里（不是副本）。
             #   按顺序去重对"真两份"无损，对"副本"正好修掉。
             #
-            # ⚠ 这是一次行为改动：`bullet_points` 在 `_HASH_FIELDS` 与
-            #   `_TITLE_BULLETS_FIELDS` 里，所以任何一个"卖点本来就重复"的 ASIN，
-            #   下一次采集会产出一条**一次性的假变动**（title_bullets 变了）。
-            #   那是修复的代价，不是新缺陷 —— 重复的卖点从来就不是对的数据。
-            return "\n".join(dict.fromkeys(clean))
+            # ⚠ 这条**对美国站也生效**，而且是一次行为改动：
+            #   `bullet_points` 在 `_HASH_FIELDS` 与 `_TITLE_BULLETS_FIELDS` 里，
+            #   所以任何一个"卖点本来就重复"的 ASIN，下一次采集会产出一条
+            #   **一次性的假变动**（title_bullets 变了）。那是修复的代价，
+            #   不是新缺陷 —— 重复的卖点从来就不是对的数据。
+            seen = set()
+            deduped = []
+            for b in clean:
+                if b in seen:
+                    continue
+                seen.add(b)
+                deduped.append(b)
+            return "\n".join(deduped)
         except Exception:
             return ""
 
@@ -1439,11 +1633,12 @@ class AmazonParser:
     #     re.findall('"hiRes":"(https://...)"') or re.findall('"large":"(https://...)"')
     # 第一条**跳过** ``"hiRes":null`` 的条目，而第二条只在"一张 hiRes 都没有"时
     # 才整体启用 —— 不是逐张兜底。于是只要某一张原图不够大（Amazon 不给 hiRes），
-    # 它就从列表里**整张消失**。2026-10 抽查实测（美国页）：
-    #   B0FFGFT343  第 9 张 PT08 51E41zXXguL 只有 714x401，hiRes=null，整张丢了。
-    # 若 hiRes=null 的恰好是 MAIN 图，丢的就是**主图**，"首图即主图"的约定也破了。
+    # 它就从列表里**整张消失**。2026-10 抽查实测两例：
+    #   B09Y3DKJKQ  MAIN 图 4104axN68uL 只有 500x500，hiRes=null —— **主图**丢了，
+    #               列表第 1 张变成了 PT01，"首图即主图"的约定也破了；
+    #   B0FFGFT343  第 9 张 PT08 51E41zXXguL 只有 714x401，hiRes=null。
     #
-    # 页面上 initial 的写法（30 张美国抽查页全部是这一种）：
+    # 页面上 initial 的写法（66 张美 / 加页面全部是这一种）：
     #     'colorImages': { 'initial': A.$.parseJSON('[{"hiRes":null,"large":"...","main":{...},...}, ...]')
     # 条目键：hiRes / large / main{url: [w, h]} / thumb / variant / altText ...
     _COLOR_IMAGES_INITIAL_RE = re.compile(
@@ -1583,13 +1778,11 @@ class AmazonParser:
                     th = row.css_first('th')
                     tds = row.css('td')
                     # ⚠ 值一律用 separator=" " 取。
-                    #   无分隔符拼接会把相邻元素的文字粘在一起，美国页实测（30 张里
-                    #   带 BSR 的全部）产出 "#24,048 in Home & Kitchen (See Top 100 in
-                    #   Home & Kitchen)#36 inChristmas Trees" —— 两条排名之间、in 和
-                    #   类目名之间都没有空格；只是 BSR 这种多元素的值才看得出来。
-                    #   "(See Top 100 ...)" 导航链接由 _map_detail 统一去掉。
+                    #   无分隔符拼接会把相邻元素的文字粘在一起，实测产出
+                    #   "#48 inDesks & Workstations"（in 和类目名之间没有空格）。
+                    #   这条**两个站点都有**，只是 BSR 这种多元素的值才看得出来。
                     # ⚠ 而带分隔符取又有反作用：td 里 span 两侧的缩进文本节点 strip 成
-                    #   空串后仍各贡献一个分隔符 -> ' SHareconn '。所以取完一律过
+                    #   空串后仍各贡献一个分隔符 -> ' MoKitDora '。所以取完一律过
                     #   _squash_ws（首尾去掉、中间连续空白并成一个空格），三个分支都要：
                     #   这里的值喂给 _map_detail，型号 / 制造商 / 重量 / 尺寸 / 品牌全从这走。
                     if th and tds:
@@ -1618,15 +1811,18 @@ class AmazonParser:
                         for i, sp in enumerate(spans):
                             if sp.text(strip=True) == k and i + 1 < len(spans):
                                 v = self._squash_ws(spans[i + 1].text(separator=" ", strip=True))
-                                # **大类排名**（detailBullets 版详情表）。
+                                # F-012 实测修复：**大类排名**。
                                 #
-                                # 这种布局里 BSR 那一行是嵌套的，一个商品有多个排名：
+                                # BSR 那一行的结构是嵌套的，一个商品有多个排名：
                                 #   Best Sellers Rank: #105 in Clothing... (See Top 100...)
                                 #                      #3 in Men's T-Shirts
                                 # 取 spans[i+1] 只拿到**最里层**那个 span，
                                 # 也就是最后一个子类目排名 —— 大类那条（#105）
-                                # 整个丢了；无分隔符拼接还会产出 "#3 inMen's T-Shirts"。
-                                # （th/td 版详情表那条路径的同类问题见上面的 separator 说明。）
+                                # 整个丢了。用户报的「大类排名漏采」就是这条。
+                                #
+                                # 另外 text(strip=True) 无分隔符拼接会产出
+                                # "#3 inMen's T-Shirts"（in 和类目名粘在一起）——
+                                # 这一处同样是**两个站点都有**的老问题。
                                 #
                                 # 所以 BSR 特殊处理：取整个 li 的文本、去掉键名、
                                 # 去掉 "(See Top 100 in ...)" 这类导航链接。
@@ -1649,7 +1845,8 @@ class AmazonParser:
 
     # ==================== lxml 解析路径 (fallback) ====================
 
-    def _parse_with_lxml(self, html_text: str, asin: str, zip_code: str, result: Dict, jsonld: Dict) -> Dict:
+    def _parse_with_lxml(self, html_text: str, asin: str, zip_code: str,
+                         result: Dict, jsonld: Dict, spec=None) -> Dict:
         """使用 lxml 解析（fallback）"""
         # P4-9：同 selectolax 路径，先记引擎。
         result["_parse_engine"] = ENGINE_LXML
@@ -1667,7 +1864,7 @@ class AmazonParser:
             return result
 
         # P4-1 / P4-2：与 selectolax 路径同一份逻辑、同一个位置。
-        self._apply_quality_signals(result, tree, html_text, zip_code)
+        self._apply_quality_signals(result, tree, html_text, zip_code, spec)
 
         # variant 偏移检测（同 selectolax 路径）：从 HTML 提取页面当前 active ASIN
         result["_page_asin"] = self._extract_page_asin(None, html_text)
@@ -1702,8 +1899,8 @@ class AmazonParser:
             result["current_price"] = "See price in cart"
             result["buybox_price"] = "N/A"
             result["original_price"] = self._parse_original_price(tree)
-            result["buybox_shipping"] = self._parse_buybox_shipping(tree, None)
-            result["is_fba"] = self._parse_fulfillment(tree, html_text)
+            result["buybox_shipping"] = self._parse_buybox_shipping(tree, None, spec)
+            result["is_fba"] = self._parse_fulfillment(tree, html_text, spec)
             stock_text = self._get_text(tree, ['//div[@id="availability"]/span/text()'])
             result["stock_status"] = stock_text.strip() if stock_text else "In Stock"
             result["stock_count"] = str(self._parse_stock_count(result["stock_status"], tree))
@@ -1711,13 +1908,13 @@ class AmazonParser:
             result["delivery_date"] = d_date
             result["delivery_time"] = d_time
         else:
-            css_price = self._parse_current_price(tree)
+            css_price = self._parse_current_price(tree, spec)
             result["current_price"] = css_price if css_price != "N/A" else jsonld.get("current_price", "N/A")
             bb = self._parse_buybox_price(tree)
             result["buybox_price"] = bb if bb else result["current_price"]
             result["original_price"] = self._parse_original_price(tree)
-            result["buybox_shipping"] = self._parse_buybox_shipping(tree, result["current_price"])
-            result["is_fba"] = self._parse_fulfillment(tree, html_text)
+            result["buybox_shipping"] = self._parse_buybox_shipping(tree, result["current_price"], spec)
+            result["is_fba"] = self._parse_fulfillment(tree, html_text, spec)
             stock_text = self._get_text(tree, ['//div[@id="availability"]/span/text()'])
             result["stock_status"] = stock_text.strip() if stock_text else jsonld.get("stock_status", "In Stock")
             result["stock_count"] = str(self._parse_stock_count(result["stock_status"], tree))
@@ -1772,7 +1969,7 @@ class AmazonParser:
         # 现在两条路径调用同一组引擎无关的解析器。
         result["rating"] = self._parse_rating(tree, jsonld)
         result["review_count"] = self._parse_review_count(tree, jsonld)
-        seller_id, seller_name = self._parse_seller(tree, html_text)
+        seller_id, seller_name = self._parse_seller(tree, html_text, spec)
         result["seller_id"] = seller_id
         result["seller_name"] = seller_name
         # buybox offer 的品相（二手/翻新）。放在 seller 之后 —— 两者同源于
@@ -1786,9 +1983,19 @@ class AmazonParser:
 
     # ==================== v3 增强: 多层 fallback 方法 ====================
 
-    def _extract_sp_data(self, html_text: str) -> Dict[str, Any]:
+    def _extract_sp_data(self, html_text: str, spec=None) -> Dict[str, Any]:
         """从 JavaScript SP/twister/AAPI 数据中提取字段（v3 新增 fallback 层）
         Amazon 页面经常在 <script> 中嵌入结构化数据，比 CSS 更稳定
+
+        ``spec``（F-012）只有下面第 2 步用得上：twister 给的是**裸数字**
+        （``"priceAmount":32.67``），价格串得我们自己拼，拼哪个符号由站点的
+        注册表字段 ``render_symbol`` 决定。其余几步搬的是页面上已有的串，与站点无关。
+
+        ⚠ 这个形参曾经漏了，而函数体已经在用 ``spec``：第 2 步抛 NameError，
+          内层 except 捕不到、被末尾的 ``except Exception`` 吞掉，整个函数返回
+          ``{}`` —— 与「页面没有这段 JSON」完全同形，美加两站任何含
+          ``priceAmount`` 的页面上这一层四路 fallback 都静默消失。
+          回归由 tests/test_marketplace.py 的 SpDataFallbackLayerIsAlive 守住。
         """
         result = {}
         try:
@@ -1807,7 +2014,7 @@ class AmazonParser:
             if twister_match:
                 try:
                     price_val = float(twister_match.group(1))
-                    result["_twister_price"] = f"${price_val:.2f}"
+                    result["_twister_price"] = f"{_sym(spec)}{price_val:.2f}"
                 except (ValueError, TypeError):
                     pass
 
@@ -2032,10 +2239,11 @@ class AmazonParser:
 
         return "N/A"
 
-    def _parse_seller(self, tree, html_text: str = "") -> Tuple[str, str]:
+    def _parse_seller(self, tree, html_text: str = "", spec=None) -> Tuple[str, str]:
         """返回 (seller_id, seller_name)。
         - 第三方卖家：从 <a id="sellerProfileTriggerId" href="...seller=XXX">Name</a> 提取
-        - Amazon 自营：sellerProfileTriggerId 不存在，但页面有 "Sold by Amazon.com" → 返回 ("AMAZON", "Amazon.com")
+        - Amazon 自营：sellerProfileTriggerId 不存在，但页面有 "Sold by <站点>"
+          → 返回 ("AMAZON", "Amazon.com" / "Amazon.ca"，按站点)
         - 其他无法识别：返回 ("N/A", "N/A")
         """
         # 1) 标准路径：buybox 卖家档案链接
@@ -2051,16 +2259,17 @@ class AmazonParser:
                 return seller_id, name
             if name:
                 # 拿到名字但链接里没有 seller=。不罕见：Warehouse Deals / Amazon
-                # Resale 的二手 buybox，卖家链接指向的是类目节点（真实页面上是
-                # `href="/b?node=8929975011"` 这种），所有走 Warehouse 的二手行都会
-                # 是这个形状。ID 其实就在同一张加购表单的 hidden input 里。
+                # Resale 的二手 buybox，卖家链接指向的是类目节点（实测 CA
+                # B0GKNHN7Q5：`href="/b?node=8929975011"`），所有走 Warehouse 的
+                # 二手行都会是这个形状。ID 其实就在同一张加购表单的 hidden input 里。
                 return (self._seller_link_form_merchant_id(tree) or "N/A"), name
 
         # 2) 备选：任意带 seller= 的链接（href 路径变化时兜底）
         for css, xp in (
-            # 2026 版 buybox 的卖家挂件（2026-10 抽查的 30 张美国真实页 22 张有它，
-            # 其中 15 张没有老的 #merchant-info）。它排在页面级兜底 `a[href*="seller="]`
-            # **之前**是有意的：那条兜底是全页扫描，会把"其它卖家"区块里的链接也捞进来。
+            # F-012 实测补：2026 版 buybox 的卖家挂件。实测两张加拿大站页面上
+            # **老的三个容器一个都不存在**，用的全是这个。
+            # 它排在页面级兜底 `a[href*="seller="]` **之前**是有意的：
+            # 那条兜底是全页扫描，会把"其它卖家"区块里的链接也捞进来。
             ('#merchantInfoFeature_feature_div a[href*="seller="]',
              '//*[@id="merchantInfoFeature_feature_div"]//a[contains(@href, "seller=")]'),
             ('#merchant-info a[href*="seller="]',
@@ -2084,19 +2293,19 @@ class AmazonParser:
         #    selectolax 默认的 `text(strip=True)`（无分隔符拼接），真实页面上的
         #    `Sold by <a>Amazon.com</a>` 会被拼成 `Sold byAmazon.com`，这个子串
         #    判断因此**从来没命中过**，自营页恒返回 ("N/A","N/A")。
-        #
+        site = _mid(spec)                      # 'amazon.com' / 'amazon.ca'
         # ⚠ 两类容器用**两套判据**，不是疏忽：
         #
-        #   merchant_only=True  —— 2026 版 buybox 把卖家和发货方拆成了两个
-        #       feature div，#merchantInfoFeature_feature_div **只装卖家**。
-        #       老的三个容器在这种页面上一个都不存在，只认它们的话自营页恒落 N/A；
-        #       而这个容器里的文案不一定是 "Sold by" / "Ships from"（真实页面上
-        #       见过 "Shipper / Seller Amazon..."），枚举文案是枚举不完的 ——
-        #       它只装卖家，域名出现就等于"卖家是 Amazon 自营"。
+        #   merchant_only=True  —— 这个容器**只装卖家**（2026 版 buybox 把
+        #       卖家和发货方拆成了两个 feature div）。里面出现站点域名就等于
+        #       "卖家是 Amazon 自营"，光凭域名判定是安全的。
+        #       必须这样判，因为加拿大站的文案是 **"Shipper / Seller Amazon.ca"**
+        #       —— 既不是 "Sold by" 也不是 "Ships from"，枚举文案是枚举不完的。
         #
-        #   merchant_only=False —— 老容器把卖家和发货方混在一起，那里不能改成
-        #       光看域名（blob 里常有 "Amazon.com" 的页脚 / 退货链接文字），照旧用
-        #       原来那两条带主语的短语判，判据一个字没动。
+        #   merchant_only=False —— 老容器把卖家和发货方混在一起。那里光看域名
+        #       会把「三方卖家 + Amazon 发货」误判成自营（blob 里有
+        #       "Ships from Amazon.ca" 也有 "Sold by SomeShop"）。所以那些容器
+        #       必须继续用"Sold by <站点>"这种带主语的短语判。
         for css, xp, merchant_only in (
             ('#merchantInfoFeature_feature_div',
              '//*[@id="merchantInfoFeature_feature_div"]', True),
@@ -2108,11 +2317,20 @@ class AmazonParser:
             if not blob:
                 continue
             if merchant_only:
-                if "amazon.com" in blob:
-                    return "AMAZON", "Amazon.com"
+                if site in blob:
+                    return "AMAZON", site.capitalize()
                 continue
-            if "sold by amazon.com" in blob or "ships from amazon.com" in blob:
-                return "AMAZON", "Amazon.com"
+            # F-012：自营文案里的域名**跟着站点变** —— 加拿大站是
+            # "Sold by Amazon.ca" / "Ships from Amazon.ca"。
+            #
+            # 写死 amazon.com 的后果不是解析失败，是**静默走错分支**：
+            # 加拿大站的自营商品匹配不上，掉进下面那条 merchantID 兜底，
+            # seller_id/seller_name（两个导出列）于是变成别的值或 N/A，
+            # 而这条记录看起来完全正常。
+            if f"sold by {site}" in blob or f"ships from {site}" in blob:
+                # 返回值保持**首字母大写的站点域名**（"Amazon.com" / "Amazon.ca"），
+                # 与改造前美国站那个字面量同形。
+                return "AMAZON", site.capitalize()
 
         # 4) HTML 文本最后兜底（脚本数据里偶尔有 merchantID）
         try:
@@ -2133,9 +2351,9 @@ class AmazonParser:
 
         ⚠ 必须是"链接所在的那张"，不能是全页第一个 ``form#addToCart``：
           accordion buybox 每一行 offer 各有一张 ``form#addToCart``（id 重复），
-          全新行和二手行的 merchantID 不同（真实 accordion 页上全新行与二手行
-          是两个卖家）。取错表单就是把 A 的 ID 配上 B 的名字 —— 比 N/A 更糟。
-          链接不在任何表单里时宁可不填。
+          全新行和二手行的 merchantID 不同（实测 CA B09Y3DKJKQ：全新行
+          ADUC3URPUSR5N、二手行 AUJBRIGYRJ3Q8）。取错表单就是把 A 的 ID 配上
+          B 的名字 —— 比 N/A 更糟。链接不在任何表单里时宁可不填。
 
         空值（无推荐报价页上是 ``value=""``）与非 ID 形状的值一律不收，
         判据与 ``seller=`` 那条正则同一个字符集。
@@ -2164,9 +2382,10 @@ class AmazonParser:
             pass
         return None
 
-    def _slx_parse_price_enhanced(self, tree, jsonld: dict, sp_data: dict) -> str:
+    def _slx_parse_price_enhanced(self, tree, jsonld: dict, sp_data: dict,
+                                  spec=None) -> str:
         """增强价格解析：CSS → JSON-LD → JS脚本数据"""
-        css_price = self._slx_parse_current_price(tree)
+        css_price = self._slx_parse_current_price(tree, spec)
         if css_price and css_price != "N/A":
             return css_price
 
@@ -2178,9 +2397,10 @@ class AmazonParser:
         for key in ["_js_display_price", "_twister_price", "_sp_price"]:
             val = sp_data.get(key)
             if val:
-                if "$" not in str(val):
+                # JS 脚本里的裸数字没有货币符号，补上**本站点**的那个。
+                if not _marketplace.has_local_price_symbol(val, _mid(spec)):
                     try:
-                        return f"${float(val):.2f}"
+                        return f"{_sym(spec)}{float(val):.2f}"
                     except (ValueError, TypeError):
                         continue
                 return str(val)
@@ -2256,7 +2476,7 @@ class AmazonParser:
         except (TypeError, ValueError, AttributeError):
             return None
 
-    def parse_offer_listing(self, html_text: str) -> Optional[Dict[str, Any]]:
+    def parse_offer_listing(self, html_text: str, spec=None) -> Optional[Dict[str, Any]]:
         """v3: 解析 /gp/offer-listing/{ASIN} 页面，提取第一个 offer 完整信息
         限定在 #aod-offer / #aod-offer-list 区域内，避免提取到推荐产品的价格
         返回: {'price','shipping','delivery','seller','seller_id','ships_from',
@@ -2302,7 +2522,8 @@ class AmazonParser:
                     offscreen = price_node.css_first('span.a-offscreen')
                     if offscreen:
                         p = offscreen.text(strip=True)
-                        if p and "$" in p:
+                        # F-012：按站点的本地符号定位，口径同 _slx_parse_current_price。
+                        if p and _marketplace.has_local_price_symbol(p, _mid(spec)):
                             best_offer['price'] = p
                             price_found = True
                             break
@@ -2313,7 +2534,7 @@ class AmazonParser:
                         w = whole.text(strip=True).replace('.', '')
                         f = frac.text(strip=True)
                         if w and f:
-                            best_offer['price'] = f"${w}.{f}"
+                            best_offer['price'] = f"{_sym(spec)}{w}.{f}"
                             price_found = True
                             break
 
@@ -2329,7 +2550,10 @@ class AmazonParser:
                     else:
                         sp_text = shipping_node.text(strip=True)
                         # 只取运费部分，不要配送时间
-                        sp_match = re.match(r'(FREE|\$[\d.]+)', sp_text)
+                        # ⚠ re.match 锚在串首：写死 \$ 的话 "CDN$ 5.00" 匹配不上，
+                        #   会掉进下面 sp_text[:20] 的兜底（运费字段混进配送时间）。
+                        sp_match = re.match(
+                            r'(FREE|%s\s?[\d.]+)' % _sym_re(spec), sp_text)
                         if sp_match:
                             best_offer['shipping'] = sp_match.group(1)
                         elif sp_text:
@@ -2373,16 +2597,14 @@ class AmazonParser:
 
                 # 可购数量上限：本 offer 加购按钮上的 data-aod-atc-action JSON 里的 maxQty。
                 #
-                # 为什么是 maxQty 而不是数量下拉：2026-10 抽查时同一时刻抓的商品页与
-                # AOD 响应对照，同一个卖家在商品页 select#quantity 的最大项（正常路径的
-                # stock_count 就取它）与 AOD 的 maxQty **相等**，而 AOD 静态 HTML 的下拉
-                # 恒比它少 1（两组对照：下拉 1..24 / maxQty 24 / AOD 下拉 1..23；
-                # 1..5 / 5 / 1..4。12 份真实 AOD 响应里 32 个带价格的 offer 全都有
-                # maxQty，下拉也全都是 maxQty - 1）。
+                # 为什么是 maxQty 而不是数量下拉：两份能对照的真实样本里，同一个卖家
+                # 在商品页 select#quantity 的最大项（正常路径的 stock_count 就取它）
+                # 与 AOD 的 maxQty **相等**，而 AOD 静态 HTML 的下拉恒比它少 1：
+                #   CA B0CQWZR6L8  商品页下拉 1..24  AOD maxQty 24  AOD 下拉 1..23
+                #   CA B0DJ231D92  商品页下拉 1..5   AOD maxQty 5   AOD 下拉 1..4
+                # （12 份真实 AOD 响应里 32 个带价格的 offer 全都有 maxQty，
+                #   下拉也全都是 maxQty - 1。）
                 # 取下拉会让同一个 offer 走兜底路径比走正常路径少报 1 件。
-                # ⚠ 这些对照与那 12 份响应都来自**加拿大站**（amazon.ca，同一套
-                # aodAjaxMain 模板）；美国站 amazon.com 的 aodAjaxMain 还没拿真实响应
-                # 核对过（沙箱里抓回 503），见 tests/fixtures/offer/README.md。
                 max_qty = self._aod_offer_max_qty(container)
                 if max_qty:
                     best_offer['max_qty'] = max_qty
@@ -2406,8 +2628,12 @@ class AmazonParser:
             logger.debug(f"offer-listing 解析异常: {e}")
             return None
 
-    def _default_result(self, asin: str, zip_code: str) -> Dict[str, Any]:
-        """创建默认结果字典"""
+    def _default_result(self, asin: str, zip_code: str, spec=None) -> Dict[str, Any]:
+        """创建默认结果字典。
+
+        ``spec`` 只影响 ``product_url``（按站点拼）。``None`` -> 美国站，
+        与 F-012 之前逐字节一致。
+        """
         return {
             "asin": asin,
             # P4-7：RFC3339 UTC。历史上是裸 UTC+8，见模块头 _CRAWL_TIME_FMT 的说明。
@@ -2421,7 +2647,10 @@ class AmazonParser:
             # 的记录会悄悄把一个商品的价格序列劈成两组。观测值现在单独放在
             # `_zip_observed`，判定放在 `_zip_verify`。
             "zip_code": zip_code,
-            "product_url": f"https://www.amazon.com/dp/{asin}",
+            # F-012：按站点拼。写死 amazon.com 的话，加拿大站商品的链接会指向
+            # 美国站 —— 这一列是导出列，点进去是**另一个国家的**商品页，
+            # 而且那个页面多半也存在（同一个 ASIN），所以看不出是错的。
+            "product_url": f"{_spec_or_default(spec).base_url}/dp/{asin}",
             # 内部字段（下划线前缀，server 端 _save_result_inner_unlocked
             # 只写 ASIN_DATA_FIELDS 中的字段，不会落库）
             "_page_asin": None,  # variant 偏移检测用
@@ -2576,7 +2805,7 @@ class AmazonParser:
     # ==================== P4-1 邮编观测 / 判定 ====================
 
     @staticmethod
-    def _parse_zip_observed(html_text: str) -> Optional[str]:
+    def _parse_zip_observed(html_text: str, spec=None) -> Optional[str]:
         """从 glow 配送挂件的**第二行**抽出页面上实际生效的邮编；取不到返回 None。
 
         `_slx_parse_zip_code` / `_parse_zip_code` 读的是 ``glow-ingress-line1``，
@@ -2588,6 +2817,13 @@ class AmazonParser:
         这里**不做**「取不到就回退成请求值」的兜底：取不到就是 None。理由与
         ziputil.py:26-28 完全一致 —— 把请求值伪装成观测值，会让 zip_verify
         永远是 confirmed，等于把这个信号变成常量。
+
+        ⚠ F-012：抽取用的是**该站点的邮编形状**，不是写死的 5 位数字。
+        写死 ``_ZIP5_RE`` 的后果是加拿大站恒返回 None —— glow 显示的
+        "Ottawa K1V 7P8" 里根本没有 5 位连续数字，于是 zip_observed 恒空、
+        zip_verify 恒落 ``assumed``。这条是**实测**出来的：真实采集两件加拿大
+        商品，页面明明显示了完整邮编，库里两条的观测值都是空。
+        第一轮改造泛化了 ``worker/ziputil.py``，漏了 parser 里这份独立实现。
         """
         if not html_text:
             return None
@@ -2595,14 +2831,13 @@ class AmazonParser:
             m = _GLOW_INGRESS_LINE2_RE.search(html_text)
             if not m:
                 return None
-            z = _ZIP5_RE.search(m.group(1) or "")
-            return z.group(1) if z else None
+            return _extract_postal(m.group(1) or "", spec)
         except Exception:
             return None
 
     @staticmethod
-    def _norm_zip(z: Any) -> Optional[str]:
-        """邮编归一化到 5 位字符串；无法归一化返回 None。
+    def _norm_zip(z: Any, spec=None) -> Optional[str]:
+        """邮编归一化；无法归一化返回 None。（美国站是 5 位字符串）
 
         ⚠ P4.6：这是仓库里四份邮编归一化之一，**刻意不与另外三份合并**
         （``server/app.py:_normalize_zip``、``common/pgdb/relay.py`` 的
@@ -2614,21 +2849,29 @@ class AmazonParser:
         本函数的数字分支写的是 ``0 < len(head) <= 5``，比真源多允许 ``== 5``，
         而 ``"12345".zfill(5) == "12345"`` ⇒ **结果完全一致**。没有改写成调用
         真源，是因为那要动 worker 侧的解析逻辑（C3 / D-27），4.6 不做。
+
+        F-012：加了 ``spec``。美国站分支**逐字节不变**（下面第一段）；
+        其余站点走注册表的归一化 + 串内抽取。
+        不加的话 ``_judge_zip`` 对加拿大站两边都归不出来，zip_verify 恒落
+        ``unverified`` / ``assumed`` —— 与 zip_observed 恒空是同一个根因。
         """
         s = str(z).strip() if z is not None else ""
         if not s:
             return None
-        head = s.split("-")[0].strip()
-        if head.isdigit() and 0 < len(head) <= 5:
-            return head.zfill(5)
-        m = _ZIP5_RE.search(s)
-        return m.group(1) if m else None
+        if _spec_or_default(spec).postal_zero_fill:
+            # 美国站：原实现，一个字节没改。
+            head = s.split("-")[0].strip()
+            if head.isdigit() and 0 < len(head) <= 5:
+                return head.zfill(5)
+            m = _ZIP5_RE.search(s)
+            return m.group(1) if m else None
+        return _extract_postal(s, spec)
 
     @classmethod
-    def _judge_zip(cls, requested: Any, observed: Any) -> str:
+    def _judge_zip(cls, requested: Any, observed: Any, spec=None) -> str:
         """(请求值, 观测值) -> zip_verify 封闭集之一。"""
-        req = cls._norm_zip(requested)
-        obs = cls._norm_zip(observed)
+        req = cls._norm_zip(requested, spec)
+        obs = cls._norm_zip(observed, spec)
         if obs is None:
             # 页面没挂 glow 挂件：只能**假设**切邮编生效了。
             # 绝不在这里返回 confirmed —— 一个错的 confirmed 比一个诚实的
@@ -2639,11 +2882,11 @@ class AmazonParser:
         return ZIP_VERIFY_CONFIRMED if obs == req else ZIP_VERIFY_MISMATCH
 
     def _apply_quality_signals(self, result: Dict, tree, html_text: str,
-                               zip_code: str) -> None:
+                               zip_code: str, spec=None) -> None:
         """把 P4-1 / P4-2 的质量信号写进 result（两条引擎路径共用）。"""
-        observed = self._parse_zip_observed(html_text)
+        observed = self._parse_zip_observed(html_text, spec)
         result["_zip_observed"] = observed
-        result["_zip_verify"] = self._judge_zip(zip_code, observed)
+        result["_zip_verify"] = self._judge_zip(zip_code, observed, spec)
         result["_completeness"] = self._measure_completeness(tree)
 
     def _check_block(self, html_text: str, tree) -> Optional[str]:
@@ -2711,7 +2954,7 @@ class AmazonParser:
 
         return None
 
-    def _extract_jsonld(self, html_text: str) -> Dict[str, Any]:
+    def _extract_jsonld(self, html_text: str, spec=None) -> Dict[str, Any]:
         """
         从 <script type="application/ld+json"> 中提取 Product 结构化数据。
         Amazon 页面通常包含 Schema.org Product 对象，字段稳定性远高于 CSS class。
@@ -2778,14 +3021,20 @@ class AmazonParser:
             for offer in offers_list:
                 if not isinstance(offer, dict):
                     continue
-                currency = offer.get("priceCurrency", "USD")
-                if currency != "USD":
+                # F-012：期望币种由**站点**决定，不再写死 USD。
+                # 这是全仓库唯一一处能看见真实币种代码的地方（JSON-LD 的
+                # priceCurrency 是 Amazon 自己标的），所以这一条判定也是
+                # 唯一能挡住"加元被当美元"的硬关卡 —— CSS 那几条只看得见
+                # 一个 $ 符号，永远分辨不出来。
+                want = _cur(spec)
+                currency = offer.get("priceCurrency", want)
+                if currency != want:
                     continue
                 price = offer.get("price") or offer.get("lowPrice")
                 if price is not None:
                     try:
                         price_val = float(price)
-                        result["current_price"] = f"${price_val:,.2f}"
+                        result["current_price"] = f"{_sym(spec)}{price_val:,.2f}"
                     except (ValueError, TypeError):
                         pass
 
@@ -2795,7 +3044,7 @@ class AmazonParser:
                     result["stock_status"] = "In Stock"
                 elif "OutOfStock" in avail:
                     result["stock_status"] = "Out of Stock"
-                break  # 只取第一个 USD offer
+                break  # 只取第一个**本站点币种**的 offer
 
             # EAN / GTIN
             gtin13 = product.get("gtin13")
@@ -2968,7 +3217,8 @@ class AmazonParser:
     def _compact_key(k: str) -> str:
         """键名压成**只剩小写字母数字** —— 空格、冒号、双向控制符全部去掉。
 
-        Amazon 同一个字段的标签**空格数不固定**。真实页面上见过：
+        F-012 实测修复：Amazon 同一个字段的标签**空格数不固定**。
+        实测（加拿大站 YATINEY 书桌）页面上写的是：
 
             <tr><td>ManufacturerPartNumber</td><td>DN01UDBBY2</td></tr>
 
@@ -3000,7 +3250,7 @@ class AmazonParser:
         idx = txt.find(key)
         if idx >= 0:
             txt = txt[idx + len(key):]
-        txt = txt.lstrip(": ‎‏")
+        txt = txt.lstrip(": \u200e\u200f")
         # 导航链接的清理交给 _map_detail 统一做（两条来源共用一处）。
         return re.sub(r"\s+", " ", txt).strip()
 
@@ -3017,6 +3267,13 @@ class AmazonParser:
             d['part_number'] = v
         elif 'countryoforigin' in k_flat:
             d['country_of_origin'] = v
+        elif any(w in k_flat for w in _ORIGIN_FALLBACK_KEYS):
+            # 加拿大站的 "Country of Publication"，见 _ORIGIN_FALLBACK_KEYS。
+            # 只填空：上一条 Origin 无条件写、这一条只在空时写，合起来就是
+            # 「Origin 赢」且与两行谁先谁后无关（字典迭代顺序 = 页面行序，
+            # 不能靠先到先得）。
+            if not d.get('country_of_origin'):
+                d['country_of_origin'] = v
         elif 'bestsellersrank' in k_flat:
             # "( See Top 100 in XXX )" 是个**导航链接**，不是排名 —— 去掉。
             # 放在这里（而不是各提取路径里）是因为 BSR 有两条来源：
@@ -3030,11 +3287,34 @@ class AmazonParser:
             d['date_first_available'] = v
         elif 'upc' in k_lower:
             d['upc'] = v
+        elif any(w in k_flat for w in _PRODUCT_ID_KEYS):
+            # 加拿大站的 "ProductIDType"，见 _PRODUCT_ID_KEYS。
+            #
+            # 存成**和美国站 "UPC" 那一格逐字相同**的形状：合格的码用一个空格
+            # 连起来，原样进 d['upc']，再由 _slx_parse_upc / _parse_upc 并进
+            # upc_list。不在这里拆成逗号列表 —— 美国站同一个商品（B07JN24QCB）
+            # 现在导出的就是 "673986005705 196393154472"，这里拆了就是同一件商品
+            # 两站两种形状。多码一格要不要拆，是两站一起改的事。
+            #
+            # 与 Origin / Publication 同理：真有 "UPC" 行时以它为准，这一条只填空。
+            codes = _gtin_codes(v)
+            if codes and not d.get('upc'):
+                d['upc'] = " ".join(codes)
         elif 'weight' in k_flat and 'item' in k_flat:
             d['item_weight'] = v
         elif 'weight' in k_flat and any(w in k_flat for w in _PACKAGE_WORDS):
-            # 认 ``Package Weight`` 与 ``Shipping Weight`` 两种写法，见 _PACKAGE_WORDS。
+            # F-012 实测修复：加上 ``shipping``。
             #
+            # Amazon 这一行的标签有两种写法：``Package Weight`` 与
+            # ``Shipping Weight``。原判据只认前者，后者两个条件都不满足
+            # （既没有 "package" 也没有 "item"），于是**整条 elif 链走空**
+            # —— 不是存错位置，是一个字都没存。
+            # 实测（加拿大站 Gildan 三件装）报的"包装重量漏采"就是这条。
+            #
+            # ⚠ 这条**对美国站同样生效**：美国站页面上出现 "Shipping Weight"
+            #   时，改造前也是一个字没存。所以这是补一个一直空着的字段，
+            #   不是改一个已有的值 —— 但 package_weight 在 _HASH_FIELDS 里，
+            #   受影响的 ASIN 下次采集会产出一条一次性的假变动。
             # ⚠ 这里**不能**直接用 _split_dim_weight 的第二半。
             #   那个函数按分号拆 "尺寸; 重量"，而**重量行本身没有分号**：
             #       Package Weight: 200 g        -> parts = ["200 g"]
@@ -3042,12 +3322,11 @@ class AmazonParser:
             #   原实现写的是 ``_, w = split(v)`` 然后
             #   ``w if w != "N/A" else "N/A"``（后半句恒等于 w，是句废话），
             #   结果是**凡是不带分号的重量行一律存成 N/A**。
-            # ⚠ package_weight 在 _HASH_FIELDS 里，受影响的 ASIN 下次采集会产出
-            #   一条一次性的假变动 —— 是补一个一直空着的字段，不是改坏一个已有值。
+            #   这条与站点无关，美国站一直也是这样 —— F-012 实测顺带发现。
             dim_part, w = self._split_dim_weight(v)
             d['package_weight'] = w if w != "N/A" else dim_part
         elif 'dimensions' in k_flat:
-            # **重量那一半不再丢掉**。
+            # F-012 实测修复：**重量那一半不再丢掉**。
             #
             # Amazon 常把尺寸和重量塞进同一行，用分号分隔：
             #     Product Dimensions: 25 x 20 x 5 cm; 200 g
@@ -3135,7 +3414,7 @@ class AmazonParser:
             pass
         return "N/A"
 
-    def _parse_current_price(self, tree) -> str:
+    def _parse_current_price(self, tree, spec=None) -> str:
         try:
             # 作用域口径同 _slx_parse_current_price（会员价行被选中时只读全新行）。
             scopes = self._member_price_scopes(tree)
@@ -3155,7 +3434,9 @@ class AmazonParser:
             for xp in [pre + x for x in price_xpaths for pre in prefixes]:
                 vals = tree.xpath(xp)
                 for v in vals:
-                    if isinstance(v, str) and "$" in v:
+                    # F-012：口径与 selectolax 孪生实现 _slx_parse_current_price
+                    # 完全一致（按站点的本地符号定位，不按符号推币种）。
+                    if isinstance(v, str) and _marketplace.has_local_price_symbol(v, _mid(spec)):
                         return v.strip()
             # fallback: 拆分整数+小数（限定到价格容器）
             for container_id in ['corePrice_feature_div', 'corePriceDisplay_desktop_feature_div',
@@ -3167,7 +3448,7 @@ class AmazonParser:
                         w = whole[0].strip().replace('.', '')
                         f = frac[0].strip()
                         if w and f:
-                            return f"${w}.{f}"
+                            return f"{_sym(spec)}{w}.{f}"
             # 全局 fallback 已移除，避免匹配推荐区域价格
         except Exception:
             pass
@@ -3214,7 +3495,8 @@ class AmazonParser:
             pass
         return "N/A"
 
-    def _parse_buybox_shipping(self, tree, current_price: Optional[str]) -> str:
+    def _parse_buybox_shipping(self, tree, current_price: Optional[str],
+                               spec=None) -> str:
         try:
             # 作用域口径同 _slx_parse_buybox_shipping（accordion 只读下单那一行）。
             row = self._accordion_purchase_row(tree)
@@ -3227,13 +3509,16 @@ class AmazonParser:
             if "prime members get free delivery" in delivery_block.lower():
                 return "FREE"
 
-            # 金额两侧空白可有可无，判据与 selectolax 一侧相同（为什么见那边）。
-            free_over = re.search(r'free delivery.*?on orders over\s*\$\s*(\d+(?:\.\d+)?)',
-                                  delivery_block, re.IGNORECASE)
+            # F-012：货币符号按站点转义后拼进正则。加拿大站的文案是
+            # "FREE delivery ... on orders over CDN$ 35.00"，用写死的 \$ 会
+            # 匹配不到 —— 匹配不到的后果不是报错，是 buybox_shipping 静默写错。
+            free_over = re.search(
+                r'free delivery.*?on orders over\s*%s\s*(\d+(?:\.\d+)?)' % _sym_re(spec),
+                delivery_block, re.IGNORECASE)
             if free_over:
                 threshold = float(free_over.group(1))
                 if current_price and current_price not in ['N/A', 'See price in cart', '不可售']:
-                    price_match = re.search(r'\$?([\d,]+\.?\d*)', current_price)
+                    price_match = re.search(r'[^\d]*([\d,]+\.?\d*)', current_price)
                     if price_match:
                         price_val = float(price_match.group(1).replace(',', ''))
                         if price_val >= threshold:
@@ -3270,7 +3555,7 @@ class AmazonParser:
         except Exception:
             return False
 
-    def _parse_fulfillment(self, tree, html_text: str) -> str:
+    def _parse_fulfillment(self, tree, html_text: str, spec=None) -> str:
         try:
             rows = tree.xpath('//div[@id="tabular-buybox"]//tr')
             for row in rows:
@@ -3287,7 +3572,14 @@ class AmazonParser:
             match = re.search(r'(ships from|shipper / seller)\s*[:\s]*([a-z0-9\s]+)', blob)
             if match and "amazon" not in match.group(2).strip():
                 return "FBM"
-            if "fulfilled by amazon" in blob or "prime" in blob or "amazon.com" in blob:
+            # F-012：``amazon.com`` 换成按站点的域名。
+            # ⚠ 这一处**改不改结果都一样**，改它是为了别留一条会误导人的字面量：
+            #   上面那条 "ships from X 且 X 不含 amazon -> FBM" 已经把加拿大站的
+            #   "ships from amazon.ca" 正确归到非 FBM，而本行走不到时下面还有
+            #   `return "FBA"` 兜底 —— 三条路都通向 FBA。留着写死的域名，
+            #   下次有人照它推断"站点差异已处理"就会推错。
+            if ("fulfilled by amazon" in blob or "prime" in blob
+                    or _mid(spec) in blob):
                 return "FBA"
         except Exception:
             pass
@@ -3358,9 +3650,13 @@ class AmazonParser:
             # ``@class="a-list-item"`` 要求 class 属性**完全等于**这一个词，
             # 而真实页面上是 ``class="a-list-item a-size-base a-color-base"``
             # —— 于是这条 xpath 在**任何现代 Amazon 页面上都匹配 0 个节点**，
-            # lxml 引擎的 bullet_points 恒为空。selectolax 的 ``span.a-list-item``
-            # 是"包含"语义，两条引擎因此给出完全不同的答案；构造的测试 HTML 里
-            # class 恰好只有一个词，所以一直没被发现。
+            # lxml 引擎的 bullet_points 恒为空。
+            #
+            # 这条与站点无关（美国站也一样），是 F-012 用真实加拿大页面跑
+            # 双引擎一致性（tests/test_ca_real_pages.py:BothEnginesAgree）时
+            # 暴露的 —— selectolax 的 ``span.a-list-item`` 是"包含"语义，
+            # 两条引擎因此给出完全不同的答案，而构造的测试 HTML 里 class 恰好
+            # 只有一个词，所以一直没被发现。
             bullets = self._get_all_text(tree, '//div[@id="feature-bullets"]//ul/li//span[contains(@class,"a-list-item")]//text()')
             if not bullets:
                 bullets = self._get_all_text(tree, '//div[contains(@class,"a-expander-content")]//ul/li//span[contains(@class,"a-list-item")]//text()')
@@ -3374,9 +3670,18 @@ class AmazonParser:
                 if self._is_bullet_boilerplate(txt):
                     continue
                 clean.append(txt)
-            # 按顺序去重，语义与 selectolax 孪生实现 _slx_parse_bullet_points
-            # 完全一致（论证写在那边）。
-            return "\n".join(dict.fromkeys(clean))
+
+            # 去重，语义与 selectolax 孪生实现 _slx_parse_bullet_points
+            # 完全一致（论证写在那边）。两条引擎路径必须给出同样的结果 ——
+            # EngineParity 那条用例会逐字段比对。
+            seen = set()
+            deduped = []
+            for b in clean:
+                if b in seen:
+                    continue
+                seen.add(b)
+                deduped.append(b)
+            return "\n".join(deduped)
         except Exception:
             return ""
 

@@ -510,8 +510,8 @@ X = r.next_after_seq
 | 字段 | 说明 |
 |---|---|
 | `asin` | Amazon ASIN |
-| `marketplace` | **封闭集**，当前值域是单元素集 `{"amazon.com"}`。域名形式，由采集侧 CHECK 约束强制。加站点时会提前通知 |
-| `zip_requested` | worker 实际请求的邮编，5 位补零 |
+| `marketplace` | **封闭集**，值域 = 采集侧站点注册表（`common/core/marketplace.py`），F-012 起是 `{"amazon.com", "amazon.ca"}`。域名形式，由采集侧 CHECK 约束强制（约束从注册表生成）。再加站点时会提前通知 |
+| `zip_requested` | worker 实际请求的邮编。美国站 5 位补零；加拿大站 `A1A 1A1` 形状（大写、中间一个空格）。**按 `(marketplace, zip_requested)` 一起读**，不要单看邮编 |
 | `zip_observed` | 从页面 glow 配送挂件抽出的邮编（**Phase 4 起有值**）。页面没挂那个挂件时是 `null` —— 这是常态，不是错误 |
 | `zip_verify` | `confirmed` / `assumed` / `mismatch` / `unverified`。**Phase 4 起是真实判定**（此前恒为 `unverified`） |
 

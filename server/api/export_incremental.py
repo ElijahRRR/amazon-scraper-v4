@@ -69,6 +69,7 @@ from fastapi import APIRouter, Header, Query
 from fastapi.responses import JSONResponse
 
 from common.core.completeness import completeness_ok
+from common.core import marketplace as _marketplace
 from common.slowhash import parse_variant_attributes, split_multivalue
 from server.api import sync as _sync
 
@@ -91,9 +92,27 @@ DEFAULT_LIMIT = 500          # 契约 v1 定的默认值
 #: 放进 scrape_params.source_marketplace，让两个概念从第一天就是两个字段。
 DEST_MARKETPLACE = "US"
 
-#: 我们不采集币种。amazon.com 恒为美元。
-#: ⚠ 这是本适配器**凭空补出来**的字段，不是采集到的事实。
+#: 币种。**由采集来源站点决定**，不是采集到的事实（我们不采集币种代码）。
+#:
+#: ⚠ F-012 之前这里是写死的 "USD"，注释写着「amazon.com 恒为美元」——
+#:   那句话在只采美国站的时候是对的。开了加拿大站之后它就成了一条**静默
+#:   错误**：加拿大站的 24.99 会被标成 USD 发给下游，数字对、币种错，
+#:   而且下游没有任何办法发现（价格串 "$24.99" 在两个站点上长得一模一样）。
+#:
+#: 现在从 ``scrape_events.marketplace`` 查注册表。查不到（理论上不会发生，
+#: 那一列有 CHECK 约束）时退回美国站 —— 与这个适配器其它地方对缺失值的
+#: 处置一致：给一个确定的值，而不是让整条导出失败。
 DEFAULT_CURRENCY = "USD"
+
+
+def _currency_of(source_marketplace) -> str:
+    """采集来源站点 -> ISO 4217 币种码。"""
+    try:
+        return _marketplace.get(source_marketplace).currency
+    except ValueError:
+        logger.warning("未知的采集来源站点 %r，币种按 %s 处理",
+                       source_marketplace, DEFAULT_CURRENCY)
+        return DEFAULT_CURRENCY
 
 #: 采集侧的库存文案 -> 契约枚举。
 #: ⚠ 枚举取值需与 §5 核对，见交付说明的假设清单第 4 条。
@@ -399,7 +418,11 @@ def _to_record(row: Dict[str, Any]) -> Dict[str, Any]:
         "fast": {
             # ---- 契约必填 ----
             "price": _price(payload.get("current_price")),
-            "currency": DEFAULT_CURRENCY,
+            # F-012：币种跟着**采集来源站点**走，见 DEFAULT_CURRENCY 上方的说明。
+            # 这里读的是 row 的 marketplace（事件流的列），与上面
+            # scrape_params.source_marketplace 同源 —— 两者必须同源，否则
+            # 会出现「来源写着 amazon.ca、币种写着 USD」的自相矛盾记录。
+            "currency": _currency_of(row.get("marketplace")),
             "stock_state": _stock_state(payload),
             # ---- 契约可选 ----
             # stock_count / delivery_days 是**追加**字段（契约 §3.2 允许单方面
